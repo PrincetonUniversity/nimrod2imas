@@ -29,13 +29,17 @@ Extended features, consistent with nimrod2imas.py:
 """
 
 import argparse
+import os
 import numpy as np
 
 import imas
-from imas import imasdef, hli_exception
+from imas import IDSFactory
 
 from omfit_classes.omfit_eqdsk import OMFITgeqdsk
 from omfit_classes.omfit_osborne import OMFITpFile
+
+# Create a global IDS factory for creating IDS objects
+_ids_factory = IDSFactory()
 
 
 # ----------------------------------------------------------------------
@@ -110,30 +114,44 @@ def compute_midplane_geometry_from_geq(geq, psin_target):
 # IMAS read helper
 # ----------------------------------------------------------------------
 
-def load_ids_from_imas(db_name, pulse, run, backend_str="hdf5"):
-    if backend_str == "mdsplus":
-        backend = imasdef.MDSPLUS_BACKEND
+def load_ids_from_imas(db_path, pulse, run, backend_str="hdf5"):
+    """Load IDS from IMAS using the new URI-based API.
+    
+    Parameters
+    ----------
+    db_path : str
+        Path to the IMAS database directory
+    pulse : int
+        IMAS pulse number (unused in new API, kept for compatibility)
+    run : int
+        IMAS run number (unused in new API, kept for compatibility)
+    backend_str : str
+        Backend type: 'hdf5' or 'mdsplus'
+    """
+    db_path = os.path.abspath(db_path)
+    
+    if backend_str == "hdf5":
+        uri = f"imas:hdf5?path={db_path}"
     else:
-        backend = imasdef.HDF5_BACKEND
-
-    db = imas.DBEntry(backend, db_name, pulse, run)
-    db.open()
-
-    eq = imas.equilibrium()
-    eq.get(0, db)
-
-    cp = imas.core_profiles()
+        uri = f"imas:mdsplus?path={db_path}"
+    
+    db = imas.DBEntry(uri, "r")
+    
+    eq = _ids_factory.equilibrium()
+    eq.get(db_entry=db)
+    
+    cp = _ids_factory.core_profiles()
     try:
-        cp.get(0, db)
-    except hli_exception.IDSNotAvailable:
+        cp.get(db_entry=db)
+    except Exception:
         cp = None
-
-    w = imas.wall()
+    
+    w = _ids_factory.wall()
     try:
-        w.get(0, db)
-    except hli_exception.IDSNotAvailable:
+        w.get(db_entry=db)
+    except Exception:
         w = None
-
+    
     db.close()
     return eq, cp, w
 
@@ -155,6 +173,7 @@ def equilibrium_to_geqdsk(eq_ids, geqdsk_template_path, out_path):
         shutil.copyfile(geqdsk_template_path, out_path)
 
     # 2) Work directly on the copy
+    print(f"Loading GEQDSK template from {out_path}")
     geq = OMFITgeqdsk(out_path)
     geq.load(raw=True, add_aux=False)
 

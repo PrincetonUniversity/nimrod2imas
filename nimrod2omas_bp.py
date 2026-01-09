@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-nimrod2imas.py
+nimrod2imas_bp.py
 
-Convert NIMROD input files (GEQDSK + PEQDSK/p-file) to IMAS:
+Convert NIMROD input files (GEQDSK + PEQDSK/p-file) to OMAS ODS and save
+as ADIOS BP format using EFFIS shim layer.
 
-  - equilibrium IDS from GEQDSK (using OMFITgeqdsk, no SciPy aux)
-  - core_profiles IDS from PEQDSK (using OMFITpFile)
-  - wall IDS from GEQDSK limiter outline
+This is a variant of nimrod2imas.py that:
+  - Builds ODS (OMAS Data Structure) directly instead of IMAS IDS
+  - Saves to ADIOS BP format via effis.shim.save_omas_adios()
+
+Data structures populated:
+  - equilibrium ODS from GEQDSK (using OMFITgeqdsk, no SciPy aux)
+  - core_profiles ODS from PEQDSK (using OMFITpFile)
+  - wall ODS from GEQDSK limiter outline
 
 Omega handling:
-
   - If vtor1 is zero/absent, use omeg to reconstruct VTOR:
       VTOR = omeg * R_mid
   - If vpol1 is zero/absent:
@@ -18,50 +23,20 @@ Omega handling:
   - Diamagnetic:
       - If omgpp nonzero: v_dia = omgpp * 1e3 / (2*pi*R_mid)
       - Stored in core_profiles.ion[dia_idx].velocity.diamagnetic
-      - On reconstruction, omgpp = 2*pi * R_mid * v_dia / 1e3  (kRad/s)
 
 This version also stores the NIMROD-related input files as XML using f90nml:
-
   - nimeq.in, oculus.in, fluxgrid.in  -> equilibrium.code.parameters (code.name='fgnimeq')
   - nimrod.in                         -> mhd.code.parameters (code.name='nimrod')
-    * If mhd IDS creation fails, falls back to core_profiles.code.parameters
-
-For the namelists, we do:
-
-  - Parse the Fortran namelist file with f90nml
-  - Build an XML tree with xml.etree.ElementTree, roughly:
-
-      <fgnimeq_inputs>
-        <nimeq_in filename="nimeq.in">
-          <group name="...">
-            <var name="...">value(s)</var>
-          </group>
-          ...
-        </nimeq_in>
-        ...
-      </fgnimeq_inputs>
-
-  - Similarly for nimrod.in:
-
-      <nimrod_inputs>
-        <nimrod_in filename="nimrod.in">
-          ...
-        </nimrod_in>
-      </nimrod_inputs>
 """
 
 import argparse
 import os
 import numpy as np
 
-import imas
-from imas import IDSFactory
+import omas
 
 import f90nml
 import xml.etree.ElementTree as ET
-
-# Create a global IDS factory for creating IDS objects
-_ids_factory = IDSFactory()
 
 from omfit_classes.omfit_eqdsk import OMFITgeqdsk
 from omfit_classes.omfit_osborne import OMFITpFile
@@ -210,23 +185,26 @@ def compute_midplane_geometry_from_geq(geq, psin_target):
 
 
 # ----------------------------------------------------------------------
-# GEQDSK -> equilibrium + wall
+# GEQDSK -> equilibrium ODS + wall ODS
 # ----------------------------------------------------------------------
 
-def geqdsk_to_equilibrium(geqdsk_path, time=0.0):
+def geqdsk_to_equilibrium_ods(ods, geqdsk_path, time=0.0):
     """
-    Read GEQDSK and build an equilibrium IDS using only raw arrays
+    Read GEQDSK and populate equilibrium entries in ODS using only raw arrays
     (no SciPy-dependent aux from OMFITgeqdsk).
+    
+    Returns the loaded geq object for use by other functions.
     """
     geq = OMFITgeqdsk(geqdsk_path)
     geq.load(raw=True, add_aux=False)
 
-    eq = _ids_factory.equilibrium()
-    eq.ids_properties.homogeneous_time = 1
-    eq.time = np.array([time], dtype=float)
-    eq.time_slice.resize(1)
-    ts = eq.time_slice[0]
-    ts.time = time
+    # --- time array ---
+    ods['equilibrium.time'] = np.array([time], dtype=float)
+    ods['equilibrium.ids_properties.homogeneous_time'] = 1
+
+    # time slice prefix
+    ts = 'equilibrium.time_slice.0'
+    ods[f'{ts}.time'] = time
 
     # --- 2D grid and psi(R,Z) ---
     nw = int(geq["NW"])
@@ -240,18 +218,17 @@ def geqdsk_to_equilibrium(geqdsk_path, time=0.0):
     rgrid = rleft + np.arange(nw) * rdim / (nw - 1)
     zgrid = (zmid - 0.5 * zdim) + np.arange(nh) * zdim / (nh - 1)
 
-    ts.profiles_2d.resize(1)
-    p2 = ts.profiles_2d[0]
-    p2.grid_type.index = 1  # 1 = rectangular grid
-    p2.grid.dim1 = rgrid
-    p2.grid.dim2 = zgrid
+    p2 = f'{ts}.profiles_2d.0'
+    ods[f'{p2}.grid_type.index'] = 1  # 1 = rectangular grid
+    ods[f'{p2}.grid.dim1'] = np.ascontiguousarray(rgrid)
+    ods[f'{p2}.grid.dim2'] = np.ascontiguousarray(zgrid)
 
     psirz = np.asarray(geq["PSIRZ"]).reshape((nh, nw))
-    # IMAS: psi(R,Z) with shape (len(R),len(Z))
-    p2.psi = psirz.T
+    # IMAS: psi(R,Z) with shape (len(R),len(Z)), must be C-contiguous for ADIOS
+    ods[f'{p2}.psi'] = np.ascontiguousarray(psirz.T)
 
     # --- 1D profiles vs psi ---
-    p1 = ts.profiles_1d
+    p1 = f'{ts}.profiles_1d'
     pres   = np.asarray(geq["PRES"])
     fpol   = np.asarray(geq["FPOL"])
     ffprim = np.asarray(geq["FFPRIM"])
@@ -263,62 +240,53 @@ def geqdsk_to_equilibrium(geqdsk_path, time=0.0):
     sibry = float(geq["SIBRY"])
     psi_1d = np.linspace(simag, sibry, n_psi)
 
-    p1.psi            = psi_1d
-    p1.f              = fpol
-    p1.pressure       = pres
-    p1.f_df_dpsi      = ffprim
-    p1.dpressure_dpsi = pprime
-    p1.q              = qpsi
+    ods[f'{p1}.psi']            = psi_1d
+    ods[f'{p1}.f']              = fpol
+    ods[f'{p1}.pressure']       = pres
+    ods[f'{p1}.f_df_dpsi']      = ffprim
+    ods[f'{p1}.dpressure_dpsi'] = pprime
+    ods[f'{p1}.q']              = qpsi
 
     # --- global quantities ---
-    gq = ts.global_quantities
-    gq.ip              = float(geq["CURRENT"])
-    gq.psi_axis        = float(geq["SIMAG"])
-    gq.psi_boundary    = float(geq["SIBRY"])
-    gq.magnetic_axis.r = float(geq["RMAXIS"])
-    gq.magnetic_axis.z = float(geq["ZMAXIS"])
+    gq = f'{ts}.global_quantities'
+    ods[f'{gq}.ip']              = float(geq["CURRENT"])
+    ods[f'{gq}.psi_axis']        = float(geq["SIMAG"])
+    ods[f'{gq}.psi_boundary']    = float(geq["SIBRY"])
+    ods[f'{gq}.magnetic_axis.r'] = float(geq["RMAXIS"])
+    ods[f'{gq}.magnetic_axis.z'] = float(geq["ZMAXIS"])
 
     # --- boundary ---
     if int(geq["NBBBS"]) > 0:
-        ts.boundary.outline.r = np.asarray(geq["RBBBS"])
-        ts.boundary.outline.z = np.asarray(geq["ZBBBS"])
-
-    # --- wall/limiter is handled in separate wall IDS ---
+        ods[f'{ts}.boundary.outline.r'] = np.asarray(geq["RBBBS"])
+        ods[f'{ts}.boundary.outline.z'] = np.asarray(geq["ZBBBS"])
 
     # --- vacuum toroidal field ---
-    eq.vacuum_toroidal_field.r0 = float(geq["RCENTR"])
-    eq.vacuum_toroidal_field.b0 = np.array([float(geq["BCENTR"])])
+    ods['equilibrium.vacuum_toroidal_field.r0'] = float(geq["RCENTR"])
+    ods['equilibrium.vacuum_toroidal_field.b0'] = np.array([float(geq["BCENTR"])])
 
-    return eq, geq
+    return geq
 
 
-def geqdsk_to_wall(geq, time=0.0):
+def geqdsk_to_wall_ods(ods, geq, time=0.0):
     """
-    Build wall IDS from GEQDSK limiter outline.
+    Populate wall entries in ODS from GEQDSK limiter outline.
     """
-    wall = _ids_factory.wall()
-    wall.ids_properties.homogeneous_time = 1
-    wall.time = np.array([time], dtype=float)
-
-    wall.description_2d.resize(1)
-    desc = wall.description_2d[0]
+    ods['wall.ids_properties.homogeneous_time'] = 1
+    ods['wall.time'] = np.array([time], dtype=float)
 
     # limiter from RLIM/ZLIM
     if int(geq["LIMITR"]) > 0:
-        desc.limiter.unit.resize(1)
-        lim = desc.limiter.unit[0]
-        lim.outline.r = np.asarray(geq["RLIM"])
-        lim.outline.z = np.asarray(geq["ZLIM"])
-
-    return wall
+        ods['wall.description_2d.0.limiter.unit.0.outline.r'] = np.asarray(geq["RLIM"])
+        ods['wall.description_2d.0.limiter.unit.0.outline.z'] = np.asarray(geq["ZLIM"])
 
 
 # ----------------------------------------------------------------------
-# PEQDSK / p-file -> core_profiles
+# PEQDSK / p-file -> core_profiles ODS
 # ----------------------------------------------------------------------
-def fill_core_profiles_from_pfile(cp_ids, pfile_path, geq, time=0.0):
+
+def fill_core_profiles_ods_from_pfile(ods, pfile_path, geq, time=0.0):
     """
-    Fill core_profiles IDS (cp_ids) from an Osborne p-file, matching the
+    Fill core_profiles entries in ODS from an Osborne p-file, matching the
     NIMROD / p-file species convention:
 
       nspec = len(Z) from the "N Z A" block
@@ -326,51 +294,16 @@ def fill_core_profiles_from_pfile(cp_ids, pfile_path, geq, time=0.0):
       beam_idx = nspec - 1  (if nspec >= 2 else None)
       impurities: indices 0 .. nspec-3
 
-    Mappings:
-
-      electrons:
-        ne  (10^20 m^-3) -> electrons.density_thermal
-        te  (keV)        -> electrons.temperature (eV)
-
-      total pressure:
-        ptot (kPa) -> 3 * pressure_perpendicular (Pa)
-
-      main ion:
-        ni    -> ion[main_idx].density_thermal           (10^20 m^-3 -> m^-3)
-        ti    -> ion[main_idx].temperature               (keV -> eV)
-        vtor1 -> ion[main_idx].velocity.toroidal         (km/s -> m/s)
-        vpol1 -> ion[main_idx].velocity.poloidal         (km/s -> m/s)
-        omeg  -> if vtor1 is all-zero/missing, reconstruct VTOR from omeg
-        kpol, omegp -> if vpol1 is all-zero/missing, reconstruct VPOL
-
-      beam ion:
-        nb -> ion[beam_idx].density_fast                 (10^20 m^-3 -> m^-3)
-        pb -> ion[beam_idx].pressure_fast_perpendicular  (kPa -> Pa/3)
-
-      impurities:
-        nz{k}   -> ion[i_imp].density_thermal
-        vtor{k} -> ion[i_imp].velocity.toroidal
-        vpol{k} -> ion[i_imp].velocity.poloidal
-        (i_imp runs over impurity indices 0..nspec-3)
-
-      diamagnetic velocity:
-        omgpp (kRad/s) -> v_dia stored in ion[dia_idx].velocity.diamagnetic,
-        with v_dia = omgpp * 1e3 / (2*pi*R_mid).  We pick dia_idx as the
-        first impurity species (0) if there is at least one impurity,
-        otherwise the main_idx.
+    Returns the loaded pfile object.
     """
-    from omfit_classes.omfit_osborne import OMFITpFile
-    import numpy as np
-    import math
-
     p = OMFITpFile(pfile_path)
     p.load()
 
-    cp_ids.ids_properties.homogeneous_time = 1
-    cp_ids.time = np.array([time], dtype=float)
-    cp_ids.profiles_1d.resize(1)
-    prof = cp_ids.profiles_1d[0]
-    prof.time = time
+    ods['core_profiles.ids_properties.homogeneous_time'] = 1
+    ods['core_profiles.time'] = np.array([time], dtype=float)
+    
+    prof = 'core_profiles.profiles_1d.0'
+    ods[f'{prof}.time'] = time
 
     # --- radial grid: use ne.psinorm if available ---
     if "ne" in p:
@@ -379,7 +312,7 @@ def fill_core_profiles_from_pfile(cp_ids, pfile_path, geq, time=0.0):
         # fallback: uniform [0,1]
         nw = int(geq["NW"])
         rho = np.linspace(0.0, 1.0, nw)
-    prof.grid.rho_tor_norm = rho
+    ods[f'{prof}.grid.rho_tor_norm'] = rho
     npts = len(rho)
 
     # "pseudo" normalized coordinate for interpolation/geometry
@@ -406,11 +339,11 @@ def fill_core_profiles_from_pfile(cp_ids, pfile_path, geq, time=0.0):
     # ------------------------------------------------------------------
     if "ne" in p:
         ne_20 = map_to_rho(p["ne"]["data"])
-        prof.electrons.density_thermal = ne_20 * 1.0e20  # 10^20 -> m^-3
+        ods[f'{prof}.electrons.density_thermal'] = ne_20 * 1.0e20  # 10^20 -> m^-3
 
     if "te" in p:
         te_keV = map_to_rho(p["te"]["data"])
-        prof.electrons.temperature = te_keV * 1.0e3  # keV -> eV
+        ods[f'{prof}.electrons.temperature'] = te_keV * 1.0e3  # keV -> eV
 
     # ------------------------------------------------------------------
     # total pressure: ptot in kPa, core_profiles.pressure_perpendicular in Pa
@@ -418,7 +351,7 @@ def fill_core_profiles_from_pfile(cp_ids, pfile_path, geq, time=0.0):
     # ------------------------------------------------------------------
     if "ptot" in p:
         ptot_kPa = map_to_rho(p["ptot"]["data"])
-        prof.pressure_perpendicular = ptot_kPa * 1.0e3 / 3.0
+        ods[f'{prof}.pressure_perpendicular'] = ptot_kPa * 1.0e3 / 3.0
 
     # ------------------------------------------------------------------
     # species composition from N Z A (no hard-coded Z/A)
@@ -433,17 +366,13 @@ def fill_core_profiles_from_pfile(cp_ids, pfile_path, geq, time=0.0):
         A_arr = np.array([0.0], dtype=float)
         nspec = 1
 
-    prof.ion.resize(nspec)
-    ions = prof.ion
+    # Set up ion species
     for k in range(nspec):
-        ion = ions[k]
-        if len(ion.element) == 0:
-            ion.element.resize(1)
-        ion.element[0].z_n = float(Z_arr[k])
-        ion.element[0].a   = float(A_arr[k])
-        # optional label; safe even if Z/A are zero
+        ion = f'{prof}.ion.{k}'
+        ods[f'{ion}.element.0.z_n'] = float(Z_arr[k])
+        ods[f'{ion}.element.0.a']   = float(A_arr[k])
         try:
-            ion.element[0].label = f"Z{int(round(Z_arr[k]))}A{A_arr[k]:.4g}"
+            ods[f'{ion}.element.0.label'] = f"Z{int(round(Z_arr[k]))}A{A_arr[k]:.4g}"
         except Exception:
             pass
 
@@ -463,20 +392,18 @@ def fill_core_profiles_from_pfile(cp_ids, pfile_path, geq, time=0.0):
     else:
         dia_idx = main_idx
 
-    ion_main = ions[main_idx]
-    _ = ion_main.velocity.toroidal
-    _ = ion_main.velocity.poloidal
+    ion_main = f'{prof}.ion.{main_idx}'
 
     # ------------------------------------------------------------------
     # main ion: ni, ti, vtor1, vpol1, omeg/kpol/omegp
     # ------------------------------------------------------------------
     if "ni" in p:
         ni_20 = map_to_rho(p["ni"]["data"])
-        ion_main.density_thermal = ni_20 * 1.0e20
+        ods[f'{ion_main}.density_thermal'] = ni_20 * 1.0e20
 
     if "ti" in p:
         ti_keV = map_to_rho(p["ti"]["data"])
-        ion_main.temperature = ti_keV * 1.0e3  # keV -> eV
+        ods[f'{ion_main}.temperature'] = ti_keV * 1.0e3  # keV -> eV
 
     # vtor1: if present and nonzero, use directly; otherwise, reconstruct from omeg
     vtor1_from_file = None
@@ -486,14 +413,14 @@ def fill_core_profiles_from_pfile(cp_ids, pfile_path, geq, time=0.0):
     use_vtor1_file = vtor1_from_file is not None and not all_zero(vtor1_from_file)
 
     if use_vtor1_file:
-        ion_main.velocity.toroidal = vtor1_from_file
+        ods[f'{ion_main}.velocity.toroidal'] = vtor1_from_file
     elif "omeg" in p:
         # omeg in kRad/s: Omega = omeg * 1e3 rad/s
         omeg_kRad = map_to_rho(p["omeg"]["data"])
         omega_rad = omeg_kRad * 1.0e3
         # VTOR = Omega * R_mid
         vtor_m_s = omega_rad * R_mid
-        ion_main.velocity.toroidal = vtor_m_s
+        ods[f'{ion_main}.velocity.toroidal'] = vtor_m_s
 
     # vpol1: if present and nonzero, use directly; else, use kpol or omegp
     vpol1_from_file = None
@@ -503,7 +430,7 @@ def fill_core_profiles_from_pfile(cp_ids, pfile_path, geq, time=0.0):
     use_vpol1_file = vpol1_from_file is not None and not all_zero(vpol1_from_file)
 
     if use_vpol1_file:
-        ion_main.velocity.poloidal = vpol1_from_file
+        ods[f'{ion_main}.velocity.poloidal'] = vpol1_from_file
     else:
         vpol_m_s = np.zeros_like(rho)
 
@@ -521,33 +448,28 @@ def fill_core_profiles_from_pfile(cp_ids, pfile_path, geq, time=0.0):
             vpol_from_omegp = omegp_rad * R_mid * Bp_mid / Bt_safe
             vpol_m_s += vpol_from_omegp
 
-        ion_main.velocity.poloidal = vpol_m_s
+        ods[f'{ion_main}.velocity.poloidal'] = vpol_m_s
 
     # ------------------------------------------------------------------
     # beam ion: nb, pb
     # ------------------------------------------------------------------
     if beam_idx is not None:
-        ion_beam = ions[beam_idx]
-        _ = ion_beam.velocity.toroidal
-        _ = ion_beam.velocity.poloidal
+        ion_beam = f'{prof}.ion.{beam_idx}'
 
         if "nb" in p:
             nb_20 = map_to_rho(p["nb"]["data"])
-            ion_beam.density_fast = nb_20 * 1.0e20
+            ods[f'{ion_beam}.density_fast'] = nb_20 * 1.0e20
 
         if "pb" in p:
             pb_kPa = map_to_rho(p["pb"]["data"])
-            ion_beam.pressure_fast_perpendicular = pb_kPa * 1.0e3 / 3.0
+            ods[f'{ion_beam}.pressure_fast_perpendicular'] = pb_kPa * 1.0e3 / 3.0
 
     # ------------------------------------------------------------------
     # impurities: nz1, nz2, vtor2, vpol2, ...
     # ------------------------------------------------------------------
     n_imp = max(nspec - 2, 0)
     for i_imp in range(n_imp):
-        ion_imp = ions[i_imp]
-        _ = ion_imp.velocity.toroidal
-        _ = ion_imp.velocity.poloidal
-
+        ion_imp = f'{prof}.ion.{i_imp}'
         k = i_imp + 1  # nz1, nz2, ...
 
         nz_key   = f"nz{k}"
@@ -556,15 +478,15 @@ def fill_core_profiles_from_pfile(cp_ids, pfile_path, geq, time=0.0):
 
         if nz_key in p:
             nz_20 = map_to_rho(p[nz_key]["data"])
-            ion_imp.density_thermal = nz_20 * 1.0e20
+            ods[f'{ion_imp}.density_thermal'] = nz_20 * 1.0e20
 
         if vtor_key in p:
             vtor_kms = map_to_rho(p[vtor_key]["data"])
-            ion_imp.velocity.toroidal = vtor_kms * 1.0e3
+            ods[f'{ion_imp}.velocity.toroidal'] = vtor_kms * 1.0e3
 
         if vpol_key in p:
             vpol_kms = map_to_rho(p[vpol_key]["data"])
-            ion_imp.velocity.poloidal = vpol_kms * 1.0e3
+            ods[f'{ion_imp}.velocity.poloidal'] = vpol_kms * 1.0e3
 
     # ------------------------------------------------------------------
     # diamagnetic velocity from omgpp (kRad/s) -> v_dia [m/s]
@@ -575,11 +497,33 @@ def fill_core_profiles_from_pfile(cp_ids, pfile_path, geq, time=0.0):
         R_safe = np.where(np.abs(R_mid) > 1e-6, R_mid, 1e-6)
         v_dia = omega_dia_rad / (2.0 * np.pi) / R_safe
 
-        ion_dia = ions[dia_idx]
-        _ = ion_dia.velocity.diamagnetic
-        ion_dia.velocity.diamagnetic = v_dia
+        ion_dia = f'{prof}.ion.{dia_idx}'
+        ods[f'{ion_dia}.velocity.diamagnetic'] = v_dia
 
-    return cp_ids, p
+    return p
+
+
+# ----------------------------------------------------------------------
+# MHD IDS for NIMROD inputs
+# ----------------------------------------------------------------------
+
+def fill_mhd_ods(ods, nimrod_xml, time=0.0):
+    """
+    Populate mhd entries in ODS with NIMROD input parameters.
+    """
+    if not nimrod_xml:
+        return False
+    
+    try:
+        ods['mhd.ids_properties.homogeneous_time'] = 1
+        ods['mhd.time'] = np.array([time], dtype=float)
+        ods['mhd.time_slice.0.time'] = time
+        ods['mhd.code.name'] = "nimrod"
+        ods['mhd.code.parameters'] = nimrod_xml
+        return True
+    except Exception as exc:
+        print(f"Warning: could not populate mhd ODS for NIMROD input: {exc}")
+        return False
 
 
 # ----------------------------------------------------------------------
@@ -587,7 +531,9 @@ def fill_core_profiles_from_pfile(cp_ids, pfile_path, geq, time=0.0):
 # ----------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Convert NIMROD input files to OMAS ODS and save as ADIOS BP format"
+    )
     parser.add_argument("geqdsk", help="input GEQDSK file")
     parser.add_argument("peqdsk", help="input P-EQDSK (p-file)")
 
@@ -596,92 +542,69 @@ def main():
     parser.add_argument("--fluxgrid", help="fluxgrid.in input file for FGnimeq", default='fluxgrid.in')
     parser.add_argument("--nimrod", help="nimrod.in input file for NIMROD", default='nimrod.in')
 
-    # allow both --dd and --db as alias
-    parser.add_argument("--dd", "--db", dest="dd", default="nimrod",
-                        help="IMAS database name (default: nimrod)")
-    parser.add_argument("--pulse", type=int, default=1, help="IMAS pulse (default: 1)")
-    parser.add_argument("--run", type=int, default=0, help="IMAS run (default: 0)")
-    parser.add_argument("--backend", choices=["hdf5", "mdsplus"], default="hdf5",
-                        help="IMAS backend (default: hdf5)")
-    parser.add_argument("--output-dir", default=".",
-                        help="Output directory for IMAS files (default: current directory)")
+    parser.add_argument("--output", "-o", default="imas.bp",
+                        help="Output BP file path (default: imas.bp)")
+    parser.add_argument("--consistency-check", action="store_true",
+                        help="Enable OMAS consistency checking (default: disabled)")
 
     args = parser.parse_args()
 
     time0 = 0.0
-    mhd_ids = None  # optional NIMROD mhd IDS
+
+    # Create ODS with optional consistency checking
+    ods = omas.ODS(consistency_check=args.consistency_check)
 
     # --- build equilibrium ---
-    eq_ids, geq = geqdsk_to_equilibrium(args.geqdsk, time=time0)
+    print(f"Loading GEQDSK from {args.geqdsk}...")
+    geq = geqdsk_to_equilibrium_ods(ods, args.geqdsk, time=time0)
 
     # --- build core_profiles from p-file ---
-    cp_ids = _ids_factory.core_profiles()
-    cp_ids, pfile = fill_core_profiles_from_pfile(cp_ids, args.peqdsk, geq, time=time0)
+    print(f"Loading p-file from {args.peqdsk}...")
+    pfile = fill_core_profiles_ods_from_pfile(ods, args.peqdsk, geq, time=time0)
+
+    # --- build wall from GEQDSK limiter ---
+    print("Building wall from GEQDSK limiter...")
+    geqdsk_to_wall_ods(ods, geq, time=time0)
 
     # --- attach code metadata and XML inputs ---
     # FGnimeq inputs (nimeq.in / oculus.in / fluxgrid.in) -> equilibrium.code.parameters
     fgnimeq_xml = build_fgnimeq_xml(args.nimeq, args.oculus, args.fluxgrid)
     if fgnimeq_xml:
         try:
-            eq_ids.code.name = "fgnimeq"
-            eq_ids.code.parameters = fgnimeq_xml
+            ods['equilibrium.code.name'] = "fgnimeq"
+            ods['equilibrium.code.parameters'] = fgnimeq_xml
         except Exception as exc:
             print(f"Warning: could not attach FGnimeq XML to equilibrium.code: {exc}")
 
     # NIMROD inputs (nimrod.in) -> prefer dedicated mhd IDS, fall back to core_profiles.code
     nimrod_xml = build_nimrod_xml(args.nimrod)
-    if nimrod_xml:
+    mhd_success = fill_mhd_ods(ods, nimrod_xml, time=time0)
+    
+    if nimrod_xml and not mhd_success:
         try:
-            mhd_ids = _ids_factory.mhd()
-            mhd_ids.ids_properties.homogeneous_time = 1
-            mhd_ids.time = np.array([time0], dtype=float)
-            if hasattr(mhd_ids, "time_slice"):
-                try:
-                    mhd_ids.time_slice.resize(1)
-                    mhd_ids.time_slice[0].time = time0
-                except Exception:
-                    pass
-            mhd_ids.code.name = "nimrod"
-            mhd_ids.code.parameters = nimrod_xml
+            ods['core_profiles.code.name'] = "nimrod"
+            ods['core_profiles.code.parameters'] = nimrod_xml
         except Exception as exc:
-            print(f"Warning: could not populate mhd IDS for NIMROD input: {exc}")
-            mhd_ids = None
-            try:
-                cp_ids.code.name = "nimrod"
-                cp_ids.code.parameters = nimrod_xml
-            except Exception as exc2:
-                print(f"Warning: could not attach NIMROD XML to core_profiles.code: {exc2}")
+            print(f"Warning: could not attach NIMROD XML to core_profiles.code: {exc}")
 
-    # --- build wall from GEQDSK limiter ---
-    wall_ids = geqdsk_to_wall(geq, time=time0)
+    # --- Save to ADIOS BP format using EFFIS shim ---
+    print(f"Saving ODS to ADIOS BP format: {args.output}...")
+    try:
+        import effis.shim
+        effis.shim.save_omas_adios(ods, args.output)
+        print(f"Successfully saved to {args.output}")
+    except ImportError as exc:
+        print(f"Error: Could not import effis.shim: {exc}")
+        print("Please ensure EFFIS is installed: pip install effis")
+        print("Or install from: https://github.com/suchyta1/effis")
+        return 1
+    except Exception as exc:
+        print(f"Error saving to ADIOS BP format: {exc}")
+        return 1
 
-    # --- write to IMAS DBEntry ---
-    # Construct URI for new IMAS API: imas:hdf5?path=<dir>
-    import os
-    output_dir = os.path.abspath(args.output_dir)
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Build URI based on backend
-    if args.backend == "hdf5":
-        uri = f"imas:hdf5?path={output_dir}"
-    else:
-        uri = f"imas:mdsplus?path={output_dir}"
-    
-    # Create or open the database entry with "w" mode (create/overwrite)
-    db = imas.DBEntry(uri, "w")
-
-    eq_ids.put(db_entry=db)
-    cp_ids.put(db_entry=db)
-    wall_ids.put(db_entry=db)
-    if mhd_ids is not None:
-        mhd_ids.put(db_entry=db)
-
-    db.close()
-
-    print(f"Saved equilibrium, core_profiles, wall (and mhd if present) to IMAS:"
-          f" output_dir={output_dir}, backend={args.backend}")
+    print(f"Saved equilibrium, core_profiles, wall (and mhd if present) to ADIOS BP: {args.output}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
-
+    exit(main())

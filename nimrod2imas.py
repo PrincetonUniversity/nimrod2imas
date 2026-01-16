@@ -291,27 +291,92 @@ def geqdsk_to_equilibrium(geqdsk_path, time=0.0):
 
     return eq, geq
 
-
 def geqdsk_to_wall(geq, time=0.0):
     """
     Build wall IDS from GEQDSK limiter outline.
-    """
-    wall = _ids_factory.wall()
-    wall.ids_properties.homogeneous_time = 1
-    wall.time = np.array([time], dtype=float)
 
+    - Uses LIMITR>0 as a switch that limiter data exist.
+    - Enforces RLIM and ZLIM to have identical length by truncating
+      both to the minimum length, to satisfy IMAS coordinate rules.
+    """
+
+    # --- create wall IDS, preferably via IDSFactory if provided ---
+    wall = _ids_factory.wall()
+
+    # homogeneous in time
+    try:
+        wall.ids_properties.homogeneous_time = 1
+    except AttributeError:
+        # Older/newer dd variants may not have ids_properties
+        pass
+
+    # global time array
+    try:
+        wall.time = np.array([time], dtype=float)
+    except AttributeError:
+        pass
+
+    # one 2D description
     wall.description_2d.resize(1)
     desc = wall.description_2d[0]
 
-    # limiter from RLIM/ZLIM
-    if int(geq["LIMITR"]) > 0:
+    # NOTE: DO NOT set desc.time – it does not exist in dd 3.39 / imas-python
+    # If you ever move to a dd where it exists, you can safely guard it:
+    #
+    try:
+        desc.time = time
+        desc.name = "limiter_wall"
+    except AttributeError:
+        pass
+
+    # ----- limiter from RLIM/ZLIM -----
+    try:
+        limitr = int(geq["LIMITR"])
+    except Exception:
+        limitr = 0
+
+    if limitr > 0:
+        try:
+            rlim = np.asarray(geq["RLIM"], dtype=float)
+            zlim = np.asarray(geq["ZLIM"], dtype=float)
+        except KeyError:
+            # No usable limiter arrays; just return wall with empty limiter
+            print(
+                "[nimrod2imas] GEQDSK has LIMITR>0 but missing RLIM/ZLIM; "
+                "leaving wall.limiter empty."
+            )
+            return wall
+
+        if rlim.size == 0 or zlim.size == 0:
+            print(
+                "[nimrod2imas] RLIM/ZLIM arrays are empty; "
+                "leaving wall.limiter empty."
+            )
+            return wall
+
+        # Enforce same length for r and z (IMAS requires same coordinate size)
+        n = min(rlim.size, zlim.size)
+        if rlim.size != zlim.size:
+            print(
+                f"[nimrod2imas] Warning: RLIM({rlim.size}) and ZLIM({zlim.size}) "
+                f"lengths differ; truncating both to {n} points for wall IDS."
+            )
+        rlim = rlim[:n]
+        zlim = zlim[:n]
+
+        # Single limiter unit
         desc.limiter.unit.resize(1)
         lim = desc.limiter.unit[0]
-        lim.outline.r = np.asarray(geq["RLIM"])
-        lim.outline.z = np.asarray(geq["ZLIM"])
+        lim.name = "limiter"
+        lim.outline.r = rlim
+        lim.outline.z = zlim
+    else:
+        # No limiter defined in GEQDSK
+        print(
+            "[nimrod2imas] LIMITR<=0 in GEQDSK; wall.limiter not populated."
+        )
 
     return wall
-
 
 # ----------------------------------------------------------------------
 # PEQDSK / p-file -> core_profiles
@@ -657,7 +722,6 @@ def main():
 
     # --- write to IMAS DBEntry ---
     # Construct URI for new IMAS API: imas:hdf5?path=<dir>
-    import os
     output_dir = os.path.abspath(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
     
@@ -668,7 +732,7 @@ def main():
         uri = f"imas:mdsplus?path={output_dir}"
     
     # Create or open the database entry with "w" mode (create/overwrite)
-    db = imas.DBEntry(uri, "w")
+    db = imas.DBEntry(uri, "a")
 
     eq_ids.put(db_entry=db)
     cp_ids.put(db_entry=db)

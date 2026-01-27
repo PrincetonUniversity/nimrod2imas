@@ -28,6 +28,10 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
+from pathlib import Path
+
+from nimrod2imas import entry_dir as _entry_dir_common
+
 # Optional: IMAS is only needed for IMAS mode
 try:
     import imas
@@ -310,7 +314,14 @@ def _imas_extract_axes(ids) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Plot contours from mhd IDS (GGD)")
-    p.add_argument("--entry", required=True, help="IMAS entry directory (contains master.h5, mhd_*.h5, etc)")
+    p.add_argument("--entry", default=None, help="IMAS entry directory (contains master.h5, mhd_*.h5, etc)")
+    # Consistent alternative to --entry (match dump2imas/input2imas directory logic)
+    p.add_argument("--dbpath", default=".", help="DB root path")
+    p.add_argument("--dd", default=None, help="DB name (directory name), e.g. nstx")
+    p.add_argument("--dd-version-dir", choices=["major", "full"], default="major",
+                   help="Directory component for DD version (default: major, e.g. 3 for 3.42.0)")
+    p.add_argument("--pulse", type=int, default=None)
+    p.add_argument("--run", type=int, default=None)
     p.add_argument("--dd-version", default=None, help="IMAS DD version for IMAS read (required unless --hdf5-only)")
     p.add_argument("--occ", type=int, required=True, help="Occurrence number")
     p.add_argument("--time-index", type=int, default=0, help="Time slice index")
@@ -323,11 +334,28 @@ def main() -> int:
     #    "--swap-rz",
     #    action="store_true",
     #    help="Transpose the R/Z plane after slicing (useful if values were packed with swapped r,z ordering).",
-    )
+    #)
 
     args = p.parse_args()
 
-    entry = args.entry.rstrip("/") + "/"
+    if args.entry:
+        entry = str(Path(args.entry).expanduser().resolve()).rstrip("/") + "/"
+    else:
+        if args.dd is None or args.pulse is None or args.run is None or not args.dd_version:
+            raise SystemExit(
+                "Provide either --entry, or (--dbpath --dd --dd-version --pulse --run). "
+                "Note: --dd-version is also required for IMAS mode."
+            )
+        entry = str(
+            _entry_dir_common(
+                args.dbpath,
+                str(args.dd),
+                str(args.dd_version),
+                int(args.pulse),
+                int(args.run),
+                dd_version_dir=str(args.dd_version_dir),
+            )
+        ).rstrip("/") + "/"
 
     # ----------------------------
     # First: try IMAS (unless forced)

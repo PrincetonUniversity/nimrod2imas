@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-plot_mhd_linear_contours_fixed.py
+plot_mhd_linear.py
 
 Contour plotting utility for IMAS mhd_linear IDS produced by dump2imas.py.
 
@@ -28,6 +28,15 @@ from typing import Any, List, Optional, Tuple
 import numpy as np
 
 import matplotlib.pyplot as plt
+
+from pathlib import Path
+
+from nimrod2imas import (
+    entry_dir as _entry_dir_common,
+    open_dbentry as _open_db_common,
+    ids_factory as _ids_factory_common,
+    get_ids as _get_ids_common,
+)
 
 
 
@@ -466,13 +475,18 @@ def _print_info(mhd: Any, occ: int):
 def main():
     ap = argparse.ArgumentParser(description="Contour plot fields from IMAS mhd_linear IDS (RZ plane).")
 
-    ap.add_argument("--backend", default="hdf5")
-    ap.add_argument("--dbpath", default=".")
     ap.add_argument("--dd", required=True)
     ap.add_argument("--dd-version", dest="dd_version", required=True)
+    ap.add_argument("--dd-version-dir", choices=["major", "full"], default="major",
+                    help="Directory component for DD version (default: major, e.g. 3 for 3.42.0)")
     ap.add_argument("--pulse", type=int, required=True)
     ap.add_argument("--run", type=int, required=True)
     ap.add_argument("--occ", type=int, default=0)
+    ap.add_argument("--backend", default="hdf5")
+    ap.add_argument("--dbpath", default=".")
+
+    ap.add_argument("--entry", default=None,
+                    help="Optional explicit entry directory (overrides --dbpath/--dd/--dd-version/--pulse/--run)")
 
     ap.add_argument("--time-index", type=int, default=0)
     ap.add_argument("--raw-time-index", action="store_true")
@@ -513,15 +527,24 @@ def main():
     if args.n_tor is None and args.keff is not None:
         args.n_tor = int(args.keff)
 
-    root = os.path.abspath(args.dbpath)
-    entry_dir = os.path.join(root, str(args.dd), str(args.dd_version)[0], str(args.pulse), str(args.run))
+    if args.entry:
+        entry_dir = Path(args.entry).expanduser().resolve()
+    else:
+        entry_dir = _entry_dir_common(
+            args.dbpath,
+            str(args.dd),
+            str(args.dd_version),
+            int(args.pulse),
+            int(args.run),
+            dd_version_dir=str(args.dd_version_dir),
+        )
     print(f"IMAS entry directory: {entry_dir}")
 
-    db, uri, imas = _open_dbentry(args.backend, entry_dir, mode="r", dd_version=str(args.dd_version))
+    db, uri, imas = _open_db_common(args.backend, entry_dir, mode="r", dd_version=str(args.dd_version))
     print(f"IMAS URI: {uri}")
 
-    factory = imas.IDSFactory(str(args.dd_version))
-    mhd = _get_ids(db, factory, "mhd_linear", int(args.occ))
+    factory = _ids_factory_common(imas, str(args.dd_version))
+    mhd = _get_ids_common(db, factory, "mhd_linear", int(args.occ))
 
     if args.info:
         _print_info(mhd, int(args.occ))

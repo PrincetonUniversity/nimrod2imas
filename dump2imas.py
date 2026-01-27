@@ -23,7 +23,7 @@ Notes:
 
 Example:
   python dump2imas.py dumpgll.00000.h5 dumpgll.00010.h5 \
-      --backend hdf5 --dbpath . --dd nimrod --dd-version 3.42.0 --pulse 201991 --run 1 \
+      --backend hdf5 --dbpath . --dd nstx --dd-version 3.42.0 --pulse 201991 --run 1 \
       --occ-base 1 \
       --dens-pert-order species_major
 """
@@ -35,6 +35,7 @@ import math
 import os
 import re
 import sys
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -48,6 +49,15 @@ try:
 except Exception:
     f90nml = None  # type: ignore
 import xml.etree.ElementTree as ET
+
+from nimrod2imas import (
+    entry_dir as _entry_dir_common,
+    dd_version_dirname as _dd_version_dirname,
+    open_dbentry as _open_db_common,
+    ids_factory as _ids_factory_common,
+    value_to_string as _value_to_string_common,
+    namelist_file_to_xml as _namelist_file_to_xml_common,
+)
 
 
 # -----------------------------
@@ -67,30 +77,24 @@ def _as_f64(a: np.ndarray) -> np.ndarray:
     return np.asarray(a, dtype=np.float64)
 
 def _value_to_string(v: Any) -> str:
-    if isinstance(v, (list, tuple, np.ndarray)):
-        return " ".join(_value_to_string(x) for x in list(v))
-    if isinstance(v, (bool, np.bool_)):
-        return "T" if bool(v) else "F"
-    return str(v)
+    """Serialize values to XML text consistently across tools."""
+    return _value_to_string_common(v)
+
 
 
 def _build_nimrod_xml(nimrod_path: Optional[str]) -> str:
-    """Build an XML string for nimrod.in using f90nml when available; falls back to raw text."""
+    """Build an XML string for nimrod.in, matching input2imas semantics.
+
+    Prefer f90nml; fall back to a lightweight parser instead of embedding raw text.
+    """
     if nimrod_path is None:
         return ""
     nimrod_path = os.path.expanduser(nimrod_path)
     if not os.path.isfile(nimrod_path):
         return ""
-    if f90nml is None:
-        # Fallback: embed raw text
-        try:
-            raw = Path(nimrod_path).read_text(errors="ignore")
-        except Exception:
-            return ""
-        root = ET.Element("nimrod_inputs")
-        el = ET.SubElement(root, "nimrod_in", filename=os.path.basename(nimrod_path))
-        el.text = raw
-        return ET.tostring(root, encoding="unicode")
+    xml = _namelist_file_to_xml_common('nimrod_inputs', nimrod_path)
+    return xml or ""
+
 
     try:
         nml = f90nml.read(nimrod_path)
@@ -304,41 +308,27 @@ def _normalize_mode(mode: str) -> str:
     return mode
 
 
-def _entry_dir(dbpath: Path, dd: str, dd_version: str, pulse: int, run: int) -> Path:
-    return dbpath / dd / str(dd_version) / str(pulse) / str(run)
+def _entry_dir(dbpath: Path, dd: str, dd_version: str, pulse: int, run: int, dd_version_dir: str = 'major') -> Path:
+    return _entry_dir_common(dbpath, dd, dd_version, pulse, run, dd_version_dir=dd_version_dir)
 
 
 def _open_db(imas: Any, backend: str, entry_dir: Path, mode: str, dd_version: str) -> Any:
-    if backend != "hdf5":
-        _die("Only --backend hdf5 is supported in this script version.")
-    entry_dir.mkdir(parents=True, exist_ok=True)
-    uri = f"imas:hdf5?path={entry_dir.resolve()}"
+    """Open an IMAS DBEntry using the shared helper.
 
-    # Ensure that the DBEntry and the IDS objects use the SAME DD major version.
-    # By default IMAS-Python follows IMAS_VERSION (or latest), which can mismatch
-    # the --dd-version used to build IDSs.
-    try:
-        return imas.DBEntry(uri, mode, dd_version=dd_version)
-    except TypeError:
-        # Backwards compatibility: fall back to IMAS_VERSION environment variable.
-        old = os.environ.get("IMAS_VERSION")
-        os.environ["IMAS_VERSION"] = str(dd_version)
-        try:
-            return imas.DBEntry(uri, mode)
-        finally:
-            if old is None:
-                os.environ.pop("IMAS_VERSION", None)
-            else:
-                os.environ["IMAS_VERSION"] = old
+    Note: we keep the function signature for backward compatibility inside this script.
+    """
+    db, _uri, _imas_mod = _open_db_common(
+        backend,
+        str(entry_dir),
+        mode=mode,
+        dd_version=str(dd_version) if dd_version else None,
+    )
+    return db
 
 
 def _ids_factory(imas: Any, dd_version: str) -> Any:
-    # In modern IMAS Python, IDSFactory takes DD version.
-    try:
-        return imas.IDSFactory(dd_version)
-    except Exception:
-        # Some builds allow IDSFactory() without args.
-        return imas.IDSFactory()
+    """Return IDSFactory with the best-compatible constructor."""
+    return _ids_factory_common(imas, str(dd_version))
 
 def estimate_psi_axis_and_lcfs_from_psi(psi2d: np.ndarray, qsep: float = 0.98) -> tuple[float, float]:
     """
@@ -2894,12 +2884,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("dumpgll", nargs="+", help="Input dumpgll HDF5 file(s)")
 
-    p.add_argument("--backend", default="hdf5", choices=("hdf5",), help="IMAS backend")
-    p.add_argument("--dbpath", default=".", help="DB root path (output directory)")
-    p.add_argument("--dd", required=True, help="DB name (directory name), e.g. nimrod")
-    p.add_argument("--dd-version", default=None, help="IMAS data dictionary version, e.g. 3.42.0")
+    p.add_argument("--dd", required=True, help="DB name (directory name), e.g. nstx")
     p.add_argument("--pulse", type=int, required=True)
     p.add_argument("--run", type=int, required=True)
+    p.add_argument("--backend", default="hdf5", choices=("hdf5",), help="IMAS backend")
+    p.add_argument("--dbpath", default=".", help="DB root path (output directory)")
+    p.add_argument("--dd-version-dir", choices=["major", "full"], default="major",
+                   help="Directory component for DD version (default: major, e.g. 3 for 3.42.0)")
+    p.add_argument("--dd-version", default=None, help="IMAS data dictionary version, e.g. 3.42.0")
 
     p.add_argument("--mode", default="a", help="DBEntry open mode: r/a/w/x (r+/rw accepted and mapped to a)")
 
@@ -3031,7 +3023,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     mode = _normalize_mode(str(args.mode))
 
     dbpath = Path(args.dbpath).expanduser().resolve()
-    entry_dir = _entry_dir(dbpath, str(args.dd), str(dd_version)[0], int(args.pulse), int(args.run))
+    entry_dir = _entry_dir(dbpath, str(args.dd), str(dd_version), int(args.pulse), int(args.run), dd_version_dir=str(args.dd_version_dir))
 
     _log(f"IMAS DB root: {dbpath}", args.quiet)
     _log(f"IMAS entry directory: {entry_dir}", args.quiet)
@@ -3174,6 +3166,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if write_mhd and (mhd is not None):
             try:
                 populate_mhd_ggd(mhd, data, args)
+                # Store nimrod.in XML in mhd IDS as well (for nonlinear simulations)
+                try:
+                    if nimrod_in_path:
+                        try:
+                            mhd.code.name = "NIMROD"
+                        except Exception:
+                            pass
+                        mhd.code.parameters = _build_nimrod_xml(nimrod_in_path)
+                except Exception:
+                    pass
                 _db_put_slice(db, mhd, occ_base)
                 # Optional: store unstructured node coordinates/connectivity for faster and unambiguous reconstruction.
                 if getattr(args, 'ggd_unstructured', False) and getattr(args, 'ggd_h5py_direct', False):

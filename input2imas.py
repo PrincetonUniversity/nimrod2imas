@@ -55,6 +55,7 @@ import os
 import numpy as np
 
 import imas
+from nimrod2imas import entry_dir, open_dbentry, put_ids, value_to_string as _nimrod_value_to_string
 from imas import IDSFactory
 
 import f90nml
@@ -84,19 +85,8 @@ def all_zero(arr, tol=1e-12):
 
 
 def value_to_string(val):
-    """Convert Python value (scalar or list) to a string for XML."""
-    import numpy as _np
-    if isinstance(val, _np.ndarray):
-        val = val.tolist()
-    if isinstance(val, (list, tuple)):
-        parts = [value_to_string(v) for v in val]
-        return " ".join(parts)
-    if isinstance(val, bool):
-        # Fortran-like logical
-        return ".true." if val else ".false."
-    return str(val)
-
-
+    """Convert Python value to token string for XML (delegates to nimrod2imas.value_to_string)."""
+    return _nimrod_value_to_string(val)
 def build_namelist_xml(tag, path):
     """Read Fortran namelist file with f90nml and return an XML element.
 
@@ -667,17 +657,37 @@ def main():
     parser.add_argument("--fluxgrid", help="fluxgrid.in input file for FGnimeq", default='fluxgrid.in')
     parser.add_argument("--nimrod", help="nimrod.in input file for NIMROD", default='nimrod.in')
 
-    # allow both --dd and --db as alias
-    parser.add_argument("--dd", "--db", dest="dd", default="nimrod",
-                        help="IMAS database name (default: nimrod)")
-    parser.add_argument("--pulse", type=int, default=1, help="IMAS pulse (default: 1)")
-    parser.add_argument("--run", type=int, default=0, help="IMAS run (default: 0)")
+    # IMAS entry selection (consistent with dump2imas)
+    parser.add_argument("--dd", required=True, help="IMAS database name (tokamak name)")
+    parser.add_argument("--pulse", type=int, required=True, help="IMAS pulse")
+    parser.add_argument("--run", type=int, required=True, help="IMAS run")
     parser.add_argument("--backend", choices=["hdf5", "mdsplus"], default="hdf5",
                         help="IMAS backend (default: hdf5)")
-    parser.add_argument("--output-dir", default=".",
-                        help="Output directory for IMAS files (default: current directory)")
+    parser.add_argument("--dbpath", default=".", help="DB root path (output directory)")
+    parser.add_argument("--dd-version", default=None, help="IMAS DD version (defaults to $IMAS_VERSION)")
+    parser.add_argument("--dd-version-dir", choices=["major","full"], default="major",
+                        help="Directory component for DD version (major or full)")
+    parser.add_argument("--entry", default=None,
+                        help="Explicit entry directory override (otherwise use dbpath/dd/dd-version-dir/pulse/run)")
+    parser.add_argument("--mode", default="a", help="DBEntry open mode: r/a/w/x")
+    parser.add_argument("--occ", type=int, default=0, help="Occurrence to write")
+    parser.add_argument("--occ-base", dest="occ", type=int, help="Alias for --occ")
 
     args = parser.parse_args()
+
+
+    # Resolve DD version early and align IDSFactory
+    dd_version = (args.dd_version or os.environ.get('IMAS_VERSION') or '').strip()
+    if not dd_version:
+        raise SystemExit('ERROR: dd_version is not set. Provide --dd-version or set IMAS_VERSION.')
+    global _ids_factory
+    _ids_factory = IDSFactory(dd_version)
+
+    # Resolve entry path (match dump2imas layout)
+    if args.entry:
+        entry_path = os.path.abspath(os.path.expanduser(args.entry))
+    else:
+        entry_path = str(entry_dir(args.dbpath, args.dd, dd_version, args.pulse, args.run, args.dd_version_dir))
 
     time0 = 0.0
     mhd_ids = None  # optional NIMROD mhd IDS
@@ -726,30 +736,24 @@ def main():
     # --- build wall from GEQDSK limiter ---
     wall_ids = geqdsk_to_wall(geq, time=time0)
 
-    # --- write to IMAS DBEntry ---
-    # Construct URI for new IMAS API: imas:hdf5?path=<dir>
-    output_dir = os.path.abspath(args.output_dir)
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Build URI based on backend
-    if args.backend == "hdf5":
-        uri = f"imas:hdf5?path={output_dir}"
-    else:
-        uri = f"imas:mdsplus?path={output_dir}"
-    
-    # Create or open the database entry with "w" mode (create/overwrite)
-    db = imas.DBEntry(uri, "a")
+    # --- write to IMAS DBEntry (same directory layout as dump2imas.py) ---
 
-    eq_ids.put(db_entry=db)
-    cp_ids.put(db_entry=db)
-    wall_ids.put(db_entry=db)
+    db, uri, _ = open_dbentry(args.backend, entry_path, mode=args.mode, dd_version=dd_version)
+    print(f"IMAS entry directory: {entry_path}")
+    print(f"IMAS URI: {uri}")
+
+    put_ids(db, eq_ids, args.occ)
+    put_ids(db, cp_ids, args.occ)
+    put_ids(db, wall_ids, args.occ)
     if mhd_ids is not None:
-        mhd_ids.put(db_entry=db)
+        put_ids(db, mhd_ids, args.occ)
 
-    db.close()
+    try:
+        db.close()
+    except Exception:
+        pass
 
-    print(f"Saved equilibrium, core_profiles, wall (and mhd if present) to IMAS:"
-          f" output_dir={output_dir}, backend={args.backend}")
+    print(f"Saved equilibrium, core_profiles, wall (and mhd if present) to IMAS entry: {entry_path} (occ={args.occ})")
 
 
 if __name__ == "__main__":

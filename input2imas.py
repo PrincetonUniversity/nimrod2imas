@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-nimrod2imas.py
+input2imas.py
 
 Convert NIMROD input files (GEQDSK + PEQDSK/p-file) to IMAS:
 
@@ -66,6 +66,12 @@ _ids_factory = IDSFactory()
 from omfit_classes.omfit_eqdsk import OMFITgeqdsk
 from omfit_classes.omfit_osborne import OMFITpFile
 
+import scipy.integrate as integrate
+
+# SciPy >= 1.11 removed cumtrapz; OMFIT still expects it
+if not hasattr(integrate, "cumtrapz"):
+    from scipy.integrate import cumulative_trapezoid
+    integrate.cumtrapz = cumulative_trapezoid
 
 # ----------------------------------------------------------------------
 # small helpers
@@ -342,14 +348,14 @@ def geqdsk_to_wall(geq, time=0.0):
         except KeyError:
             # No usable limiter arrays; just return wall with empty limiter
             print(
-                "[nimrod2imas] GEQDSK has LIMITR>0 but missing RLIM/ZLIM; "
+                "[input2imas] GEQDSK has LIMITR>0 but missing RLIM/ZLIM; "
                 "leaving wall.limiter empty."
             )
             return wall
 
         if rlim.size == 0 or zlim.size == 0:
             print(
-                "[nimrod2imas] RLIM/ZLIM arrays are empty; "
+                "[input2imas] RLIM/ZLIM arrays are empty; "
                 "leaving wall.limiter empty."
             )
             return wall
@@ -358,7 +364,7 @@ def geqdsk_to_wall(geq, time=0.0):
         n = min(rlim.size, zlim.size)
         if rlim.size != zlim.size:
             print(
-                f"[nimrod2imas] Warning: RLIM({rlim.size}) and ZLIM({zlim.size}) "
+                f"[input2imas] Warning: RLIM({rlim.size}) and ZLIM({zlim.size}) "
                 f"lengths differ; truncating both to {n} points for wall IDS."
             )
         rlim = rlim[:n]
@@ -373,7 +379,7 @@ def geqdsk_to_wall(geq, time=0.0):
     else:
         # No limiter defined in GEQDSK
         print(
-            "[nimrod2imas] LIMITR<=0 in GEQDSK; wall.limiter not populated."
+            "[input2imas] LIMITR<=0 in GEQDSK; wall.limiter not populated."
         )
 
     return wall

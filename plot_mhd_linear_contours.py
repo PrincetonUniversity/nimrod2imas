@@ -30,10 +30,125 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
+
+# Optional: cmasher colormaps (https://cmasher.readthedocs.io/)
+# If installed, importing cmasher registers its colormaps with Matplotlib (names like 'cmr.gothic').
+_HAS_CMASher = False
+try:
+    import cmasher as cmr  # type: ignore  # noqa: F401
+    _HAS_CMASher = True
+except Exception:
+    cmr = None  # type: ignore
 # IMAS integer placeholder commonly used for "not set" in many DDs
 PLACEHOLDER_INT = -999999999
 
 
+def _leaf_value(x: Any) -> Any:
+    """Return primitive value for IMAS leaf wrappers (IDS*0D), or x itself."""
+    try:
+        return x.value  # type: ignore[attr-defined]
+    except Exception:
+        return x
+
+
+def _leaf_as_int(x: Any) -> Optional[int]:
+    """Best-effort conversion of an IMAS leaf (possibly wrapped) to int."""
+    try:
+        x = _leaf_value(x)
+        if x is None:
+            return None
+        # Some IMAS leaves come back as numpy scalars
+        if isinstance(x, (np.integer,)):
+            return int(x)
+        if isinstance(x, (np.floating,)):
+            return int(round(float(x)))
+        return int(x)
+    except Exception:
+        return None
+
+
+def _leaf_as_float(x: Any) -> Optional[float]:
+    """Best-effort conversion of an IMAS leaf (possibly wrapped) to float."""
+    try:
+        x = _leaf_value(x)
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+
+# --------------------------- Plotting helpers ---------------------------
+
+
+def _mode_number(tm: Any) -> Optional[int]:
+    """Return toroidal mode number from a toroidal_mode entry.
+
+    DD 4.x may use n_phi instead of n_tor. Fall back to identifier.index if needed.
+    """
+    for name in ("n_phi", "n_tor"):
+        if hasattr(tm, name):
+            v = _leaf_as_int(getattr(tm, name))
+            if v is not None:
+                return v
+    # Fallback: identifier.index
+    if hasattr(tm, "identifier"):
+        try:
+            v = _leaf_as_int(tm.identifier.index)
+            if v is not None:
+                return v
+        except Exception:
+            pass
+    return None
+
+def _available_cmaps() -> List[str]:
+    """Return available Matplotlib colormap names (sorted).
+
+    If cmasher is installed, its colormaps are included automatically once imported.
+    """
+    try:
+        return sorted(list(plt.colormaps()))
+    except Exception:
+        # Older Matplotlib (<3.6) fallback.
+        try:
+            return sorted(list(plt.cm.cmap_d.keys()))  # type: ignore[attr-defined]
+        except Exception:
+            return []
+
+
+def _default_cmap_for_part(part: str) -> str:
+    """Reasonable defaults: diverging for signed fields, sequential for amplitudes."""
+    part = (part or "").lower()
+    if part in ("real", "imag"):
+        return "RdBu_r"
+    return "viridis"
+
+
+def _resolve_cmap(cmap: Optional[str], part: str) -> str:
+    """Validate/resolve the colormap name, with helpful diagnostics."""
+    if cmap is None or str(cmap).strip() == "":
+        return _default_cmap_for_part(part)
+
+    cmap = str(cmap).strip()
+
+    # If user selected a cmasher map explicitly, ensure cmasher is available.
+    if cmap.lower().startswith("cmr.") and not _HAS_CMASher:
+        raise RuntimeError(
+            f"Requested colormap {cmap!r}, but cmasher is not available in this Python environment. "
+            "Install it (e.g. 'pip install cmasher') or choose a Matplotlib colormap."
+        )
+
+    avail = _available_cmaps()
+    if avail and cmap not in avail:
+        # Try a case-insensitive match as a convenience.
+        lower_map = {c.lower(): c for c in avail}
+        if cmap.lower() in lower_map:
+            return lower_map[cmap.lower()]
+        raise RuntimeError(
+            f"Unknown colormap {cmap!r}. Use --list-cmaps to see available names."
+        )
+    return cmap
 # ----------------------------- IMAS helpers -----------------------------
 
 def _open_dbentry(backend: str, entry_dir: str, mode: str = "r", dd_version: str | None = None):
@@ -179,7 +294,7 @@ def _select_mode_index(ts: Any, n_tor: Optional[int], mode_index: Optional[int])
     nvals: List[int] = []
     for i in range(nm):
         try:
-            nvals.append(int(ts.toroidal_mode[i].n_tor))
+            nvals.append((_mode_number(ts.toroidal_mode[i])))
         except Exception:
             nvals.append(PLACEHOLDER_INT)
     for i, nv in enumerate(nvals):
@@ -331,7 +446,7 @@ def _print_info(mhd: Any, occ: int):
         nm = _mode_count(ts)
         for j in range(nm):
             try:
-                v = int(ts.toroidal_mode[j].n_tor)
+                v = _mode_number(ts.toroidal_mode[j])
                 if v != PLACEHOLDER_INT:
                     n_tor_union.add(v)
             except Exception:
@@ -362,7 +477,7 @@ def main():
     ap.add_argument("--time-index", type=int, default=0)
     ap.add_argument("--raw-time-index", action="store_true")
     ap.add_argument("--mode-index", type=int, default=None)
-    ap.add_argument("--keff", type=int, default=None, help="alias for --n-tor")
+    ap.add_argument("--keff", type=int, default=None, help="DEPRECATED alias for --n-tor (kept for backward compatibility)")
     ap.add_argument("--n-tor", dest="n_tor", type=int, default=None)
 
     ap.add_argument("--info", action="store_true")
@@ -370,16 +485,36 @@ def main():
     ap.add_argument("--part", default="real", choices=["real", "imag", "amp"])
     ap.add_argument("--component", default=None, choices=["r", "z", "phi"])
     ap.add_argument("--levels", type=int, default=80)
+    ap.add_argument("--cmap", default=None, help="Matplotlib colormap name (e.g. viridis, RdBu_r, cmr.gothic)")
+    ap.add_argument("--list-cmaps", action="store_true", help="List available colormap names and exit")
     ap.add_argument("--title", default=None)
     ap.add_argument("--out", default="X11", help="X11/show to display, or filename to save")
 
     args = ap.parse_args()
 
+    # Backward compatibility: --keff is an alias for --n-tor.
+    # If both are provided, they must agree.
+    if args.keff is not None and args.n_tor is not None and int(args.keff) != int(args.n_tor):
+        raise RuntimeError(f"Conflicting inputs: --keff={args.keff} and --n-tor={args.n_tor}. Provide only one.")
+
+    if args.list_cmaps:
+        avail = _available_cmaps()
+        if _HAS_CMASher:
+            print("cmasher: available (colormaps with prefix 'cmr.')")
+        else:
+            print("cmasher: not available (install with 'pip install cmasher' to enable 'cmr.*' colormaps)")
+        if not avail:
+            print("No colormaps discovered (unexpected).")
+        else:
+            print("Available colormaps:")
+            for name in avail:
+                print(f"  {name}")
+        return 0
     if args.n_tor is None and args.keff is not None:
         args.n_tor = int(args.keff)
 
     root = os.path.abspath(args.dbpath)
-    entry_dir = os.path.join(root, str(args.dd), str(args.dd_version), str(args.pulse), str(args.run))
+    entry_dir = os.path.join(root, str(args.dd), str(args.dd_version)[0], str(args.pulse), str(args.run))
     print(f"IMAS entry directory: {entry_dir}")
 
     db, uri, imas = _open_dbentry(args.backend, entry_dir, mode="r", dd_version=str(args.dd_version))
@@ -401,16 +536,31 @@ def main():
 
     R2d, Z2d, F2d, title = _extract_rz_and_field(ts, mi, args.field, args.part, args.component)
 
+    # Prefer the stored toroidal mode number when present; otherwise show the requested selection.
+    stored_n_tor = None
     try:
-        n_tor_val = int(ts.toroidal_mode[mi].n_tor)
+        v = _mode_number(ts.toroidal_mode[mi])
+        if v != PLACEHOLDER_INT:
+            stored_n_tor = v
     except Exception:
-        n_tor_val = None
+        stored_n_tor = None
+
+    requested_n_tor = args.n_tor if args.n_tor is not None else args.keff
+
+    if stored_n_tor is not None and requested_n_tor is not None and int(stored_n_tor) != int(requested_n_tor):
+        n_tor_label = f"{stored_n_tor} (requested {requested_n_tor})"
+    elif stored_n_tor is not None:
+        n_tor_label = f"{stored_n_tor}"
+    elif requested_n_tor is not None:
+        n_tor_label = f"{requested_n_tor} (not stored in IDS)"
+    else:
+        n_tor_label = f"mode_index={mi}"
 
     if args.title is None:
-        args.title = f"occ={args.occ} raw_ts={raw_i} time={_ts_time(ts):.6g} n_tor={n_tor_val} {title} ({args.part})"
+        args.title = f"occ={args.occ} raw_ts={raw_i} time={_ts_time(ts):.6g} n_tor={n_tor_label} {title} ({args.part})"
 
     fig, ax = plt.subplots()
-    cf = ax.contourf(R2d, Z2d, F2d, levels=int(args.levels))
+    cf = ax.contourf(R2d, Z2d, F2d, levels=int(args.levels), cmap=_resolve_cmap(args.cmap, args.part))
     fig.colorbar(cf, ax=ax)
     ax.set_xlabel("R")
     ax.set_ylabel("Z")

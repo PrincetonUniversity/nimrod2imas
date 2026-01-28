@@ -139,6 +139,8 @@ def build_nimrod_xml(nimrod_path=None):
 
 
 def compute_midplane_geometry_from_geq(geq, psin_target):
+    # Robust access to psi(R,Z) grid for midplane geometry calculations
+    psirz_raw = _geq_get(geq, "PSIRZ", _geq_get(geq, "psirz", None))
     """
     Compute midplane geometry R_mid, Bp_mid, Bt_mid as functions of
     normalized flux psin_target in [0,1].
@@ -163,7 +165,9 @@ def compute_midplane_geometry_from_geq(geq, psin_target):
     rgrid = rleft + np.arange(nw) * rdim / (nw - 1)
     zgrid = (zmid - 0.5 * zdim) + np.arange(nh) * zdim / (nh - 1)
 
-    psirz = np.asarray(geq["PSIRZ"]).reshape((nh, nw))
+    if psirz_raw is None:
+        psirz_raw = _geq_get(geq, "PSIRZ", _geq_get(geq, "psirz", None))
+    psirz = np.asarray(psirz_raw).reshape((nh, nw))
     simag = float(geq["SIMAG"])
     sibry = float(geq["SIBRY"])
     dpsi  = sibry - simag if sibry != simag else 1.0
@@ -209,6 +213,50 @@ def compute_midplane_geometry_from_geq(geq, psin_target):
 # GEQDSK -> equilibrium + wall
 # ----------------------------------------------------------------------
 
+# ----------------------------------------------------------------------
+# Small helpers for robust GEQDSK parsing (some files / OMFIT versions use different key casing)
+def _geq_get(geq, key, default=None):
+    try:
+        return geq[key]
+    except Exception:
+        return default
+
+def _geq_get_int(geq, *keys):
+    for k in keys:
+        v = _geq_get(geq, k, None)
+        if v is not None:
+            try:
+                return int(v)
+            except Exception:
+                pass
+    return None
+
+def _geq_get_float(geq, *keys):
+    for k in keys:
+        v = _geq_get(geq, k, None)
+        if v is not None:
+            try:
+                return float(v)
+            except Exception:
+                pass
+    return None
+
+def _parse_geqdsk_header_nwnh(geqdsk_path):
+    # GEQDSK header (first line) ends with NW NH for standard g-files.
+    # For nonstandard variants (q-eqdsk), this may fail; return (None, None).
+    try:
+        with open(geqdsk_path, "r") as f:
+            line1 = f.readline()
+        parts = line1.strip().split()
+        if len(parts) >= 2:
+            nw = int(parts[-2])
+            nh = int(parts[-1])
+            return nw, nh
+    except Exception:
+        pass
+    return None, None
+
+
 def geqdsk_to_equilibrium(geqdsk_path, time=0.0):
     """
     Read GEQDSK and build an equilibrium IDS using only raw arrays
@@ -225,13 +273,48 @@ def geqdsk_to_equilibrium(geqdsk_path, time=0.0):
     ts.time = time
 
     # --- 2D grid and psi(R,Z) ---
-    nw = int(geq["NW"])
-    nh = int(geq["NH"])
+    # Some GEQDSK-like files (e.g. q-eqdsk variants) and/or OMFIT versions may not expose
+    # NW/NH with uppercase keys. Fall back to PSIRZ shape or header parsing.
+    psirz_raw = _geq_get(geq, "PSIRZ", _geq_get(geq, "psirz", None))
+    nw = _geq_get_int(geq, "NW", "nw", "NR", "nr")
+    nh = _geq_get_int(geq, "NH", "nh", "NZ", "nz")
+    if (nw is None) or (nh is None):
+        if psirz_raw is not None:
+            arr = np.asarray(psirz_raw)
+            if arr.ndim == 2:
+                nh2, nw2 = arr.shape
+                nw = nw if nw is not None else int(nw2)
+                nh = nh if nh is not None else int(nh2)
+    if (nw is None) or (nh is None):
+        nw_h, nh_h = _parse_geqdsk_header_nwnh(geqdsk_path)
+        nw = nw if nw is not None else nw_h
+        nh = nh if nh is not None else nh_h
+    if (nw is None) or (nh is None):
+        keys_preview = []
+        try:
+            keys_preview = list(geq.keys())
+        except Exception:
+            pass
+        raise KeyError(
+            "Could not determine NW/NH from GEQDSK. "
+            "Missing keys like NW/NH and PSIRZ shape unavailable. "
+            f"Keys present (first 80): {keys_preview[:80]}"
+        )
 
-    rdim  = float(geq["RDIM"])
-    zdim  = float(geq["ZDIM"])
-    rleft = float(geq["RLEFT"])
-    zmid  = float(geq["ZMID"])
+    rdim  = _geq_get_float(geq, "RDIM", "rdim")
+    zdim  = _geq_get_float(geq, "ZDIM", "zdim")
+    rleft = _geq_get_float(geq, "RLEFT", "rleft")
+    zmid  = _geq_get_float(geq, "ZMID", "zmid")
+    if None in (rdim, zdim, rleft, zmid):
+        keys_preview = []
+        try:
+            keys_preview = list(geq.keys())
+        except Exception:
+            pass
+        raise KeyError(
+            "Missing one of RDIM/ZDIM/RLEFT/ZMID in GEQDSK. "
+            f"Keys present (first 80): {keys_preview[:80]}"
+        )
 
     rgrid = rleft + np.arange(nw) * rdim / (nw - 1)
     zgrid = (zmid - 0.5 * zdim) + np.arange(nh) * zdim / (nh - 1)
@@ -242,7 +325,9 @@ def geqdsk_to_equilibrium(geqdsk_path, time=0.0):
     p2.grid.dim1 = rgrid
     p2.grid.dim2 = zgrid
 
-    psirz = np.asarray(geq["PSIRZ"]).reshape((nh, nw))
+    if psirz_raw is None:
+        psirz_raw = _geq_get(geq, "PSIRZ", _geq_get(geq, "psirz", None))
+    psirz = np.asarray(psirz_raw).reshape((nh, nw))
     # IMAS: psi(R,Z) with shape (len(R),len(Z))
     p2.psi = psirz.T
 
@@ -658,7 +743,7 @@ def main():
     parser.add_argument("--nimrod", help="nimrod.in input file for NIMROD", default='nimrod.in')
 
     # IMAS entry selection (consistent with dump2imas)
-    parser.add_argument("--dd", required=True, help="IMAS database name (tokamak name)")
+    parser.add_argument("--dd", required=True, help="IMAS database name (directory name)")
     parser.add_argument("--pulse", type=int, required=True, help="IMAS pulse")
     parser.add_argument("--run", type=int, required=True, help="IMAS run")
     parser.add_argument("--backend", choices=["hdf5", "mdsplus"], default="hdf5",

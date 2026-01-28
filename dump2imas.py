@@ -96,21 +96,6 @@ def _build_nimrod_xml(nimrod_path: Optional[str]) -> str:
     return xml or ""
 
 
-    try:
-        nml = f90nml.read(nimrod_path)
-    except Exception:
-        return ""
-
-    root = ET.Element("nimrod_inputs")
-    nml_el = ET.SubElement(root, "nimrod_in", filename=os.path.basename(nimrod_path))
-    for group_name, group in nml.items():
-        g_el = ET.SubElement(nml_el, "group", name=str(group_name))
-        for var_name, value in group.items():
-            v_el = ET.SubElement(g_el, "var", name=str(var_name))
-            v_el.text = _value_to_string(value)
-    return ET.tostring(root, encoding="unicode")
-
-
 def _nimrod_in_nonlinear(nimrod_path: Optional[str]) -> Optional[bool]:
     """Return nonlinear flag from nimrod.in if available, else None."""
     if nimrod_path is None:

@@ -1,0 +1,21 @@
+name: Release Please
+
+on:
+  push:
+    branches:
+      - main
+      - master  # Added master just in case, based on your git config
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: google-github-actions/release-please-action@v4
+        with:
+          # "simple" is best for repositories that are collections of scripts
+          # rather than a formal Python package (PyPI).
+          release-type: simple

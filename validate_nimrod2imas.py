@@ -29,17 +29,21 @@ Extended features, consistent with nimrod2imas.py:
 """
 
 import argparse
-import os
 import numpy as np
+import os
+
+from pathlib import Path
 
 import imas
-from imas import IDSFactory
+from nimrod2imas import (
+    IMASContext,
+    open_dbentry as _open_db_common,
+    ids_factory as _ids_factory_common,
+    get_ids as _get_ids_common,
+)
 
 from omfit_classes.omfit_eqdsk import OMFITgeqdsk
 from omfit_classes.omfit_osborne import OMFITpFile
-
-# Create a global IDS factory for creating IDS objects
-_ids_factory = IDSFactory()
 
 
 # ----------------------------------------------------------------------
@@ -114,46 +118,98 @@ def compute_midplane_geometry_from_geq(geq, psin_target):
 # IMAS read helper
 # ----------------------------------------------------------------------
 
-def load_ids_from_imas(db_path, pulse, run, backend_str="hdf5"):
-    """Load IDS from IMAS using the new URI-based API.
-    
-    Parameters
-    ----------
-    db_path : str
-        Path to the IMAS database directory
-    pulse : int
-        IMAS pulse number (unused in new API, kept for compatibility)
-    run : int
-        IMAS run number (unused in new API, kept for compatibility)
-    backend_str : str
-        Backend type: 'hdf5' or 'mdsplus'
+def load_ids_from_imas(db_name, pulse, run, backend_str="hdf5"):
+    """Legacy IMAS-Core database access (db_name/pulse/run).
+
+    This mode requires an IMAS-Core (HLI) installation that provides:
+      - imasdef (backend constants)
+      - hli_exception (IDSNotAvailable)
+      - constructors like imas.equilibrium()
+
+    If you are using filesystem-backed entries produced by input2imas/dump2imas,
+    use the --entry / --dbpath/--dd/--dd-version/--pulse/--run options instead,
+    which rely on IMASContext + URI-style DBEntry open.
     """
-    db_path = os.path.abspath(db_path)
-    
-    if backend_str == "hdf5":
-        uri = f"imas:hdf5?path={db_path}"
+    try:
+        # IMAS-Core style (not provided by IMAS-Python-only installs)
+        from imas import imasdef, hli_exception  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "IMAS-Core (HLI) components are not available (cannot import imasdef/hli_exception). "
+
+            "Use the filesystem-backed mode: --entry or --dbpath/--dd/--dd-version/--pulse/--run."
+        ) from e
+
+    if backend_str == "mdsplus":
+        backend = imasdef.MDSPLUS_BACKEND
     else:
-        uri = f"imas:mdsplus?path={db_path}"
-    
-    db = imas.DBEntry(uri, "r")
-    
-    eq = _ids_factory.equilibrium()
-    eq.get(db_entry=db)
-    
-    cp = _ids_factory.core_profiles()
+        backend = imasdef.HDF5_BACKEND
+
+    db = imas.DBEntry(backend, db_name, int(pulse), int(run))
+    db.open()
+
+    eq = imas.equilibrium()
+    eq.get(0, db)
+
+    cp = imas.core_profiles()
     try:
-        cp.get(db_entry=db)
+        cp.get(0, db)
     except Exception:
+        # IDSNotAvailable in IMAS-Core, but keep broad for compatibility
         cp = None
-    
-    w = _ids_factory.wall()
+
+    w = imas.wall()
     try:
-        w.get(db_entry=db)
+        w.get(0, db)
     except Exception:
         w = None
-    
+
     db.close()
     return eq, cp, w
+
+
+def load_ids_from_ctx(ctx: IMASContext, occ: int = 0):
+    """Load equilibrium/core_profiles/wall from a filesystem-backed IMAS entry.
+
+    In practice, different tools may store different occurrences (e.g. input2imas
+    often writes occ=0; dump2imas may write occ=1). We therefore try the requested
+    occurrence first, then fall back to common defaults.
+    """
+    # Unique candidate list preserving order
+    occ_candidates = []
+    for o in (int(occ), 0, 1, 2):
+        if o not in occ_candidates:
+            occ_candidates.append(o)
+
+    db, _uri, _imas_mod, factory = ctx.open(mode="r")
+    try:
+        last_err = None
+        for o in occ_candidates:
+            try:
+                eq = _get_ids_common(db, factory, "equilibrium", int(o))
+                if eq is None:
+                    continue
+                try:
+                    cp = _get_ids_common(db, factory, "core_profiles", int(o))
+                except Exception:
+                    cp = None
+                try:
+                    w = _get_ids_common(db, factory, "wall", int(o))
+                except Exception:
+                    w = None
+                return eq, cp, w
+            except Exception as e:
+                last_err = e
+                continue
+        raise RuntimeError(
+            f"No non-empty equilibrium IDS found in any of occurrences {occ_candidates} "
+            f"for entry {ctx.entry_dir()}"
+        ) from last_err
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 # ----------------------------------------------------------------------
@@ -166,14 +222,12 @@ def equilibrium_to_geqdsk(eq_ids, geqdsk_template_path, out_path):
       - OMFITgeqdsk to load and save geqdsk
     """
     import shutil
-    import os
 
     # 1) Make sure out_path exists as a copy of the template
     if os.path.abspath(out_path) != os.path.abspath(geqdsk_template_path):
         shutil.copyfile(geqdsk_template_path, out_path)
 
     # 2) Work directly on the copy
-    print(f"Loading GEQDSK template from {out_path}")
     geq = OMFITgeqdsk(out_path)
     geq.load(raw=True, add_aux=False)
 
@@ -503,11 +557,20 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("geqdsk", help="original GEQDSK template file")
     parser.add_argument("peqdsk", help="original PEQDSK (p-file)")
-    parser.add_argument("--db", default="nimrod", help="IMAS database name")
+    # Consistent with dump2imas/input2imas: filesystem-backed entry layout
+    parser.add_argument("--dd-version-dir", choices=["major", "full"], default="major",
+                        help="Directory component for DD version (default: major, e.g. 3 for 3.42.0)")
+    parser.add_argument("--dd", "--db", dest="dd", default="nstx", help="DB name (directory name), e.g. nstx")
     parser.add_argument("--pulse", type=int, default=1, help="IMAS pulse number")
     parser.add_argument("--run", type=int, default=0, help="IMAS run number")
+    parser.add_argument("--dd-version", dest="dd_version", default=os.environ.get("IMAS_VERSION"),
+                        help="IMAS DD version (e.g. 3.42.0). If omitted, uses $IMAS_VERSION when set.")
     parser.add_argument("--backend", choices=["mdsplus", "hdf5"], default="hdf5",
                         help="IMAS backend (default: hdf5)")
+    parser.add_argument("--dbpath", default=".", help="DB root path")
+    parser.add_argument("--occ", type=int, default=0, help="Preferred occurrence for equilibrium/core_profiles/wall (fallbacks tried)")
+    parser.add_argument("--entry", default=None,
+                        help="Optional explicit entry directory (overrides --dbpath/--dd/--dd-version/--pulse/--run)")
     parser.add_argument("--out-geqdsk", default="geqdsk_from_imas",
                         help="output GEQDSK filename")
     parser.add_argument("--out-peqdsk", default="peqdsk_from_imas",
@@ -515,7 +578,37 @@ def main():
 
     args = parser.parse_args()
 
-    eq_ids, cp_ids, wall_ids = load_ids_from_imas(args.db, args.pulse, args.run, args.backend)
+    # Resolve entry directory and load IDSs
+    if args.entry:
+        # Make an IMASContext for consistent fallback behavior
+        entry_dir = Path(args.entry).expanduser().resolve()
+        ctx = IMASContext(
+            backend=args.backend,
+            dbpath=entry_dir.parents[4] if len(entry_dir.parents) >= 5 else entry_dir.parent,
+            dd=entry_dir.parents[3].name if len(entry_dir.parents) >= 4 else str(args.dd),
+            dd_version=entry_dir.parents[2].name if len(entry_dir.parents) >= 3 else (str(args.dd_version) if args.dd_version else ""),
+            pulse=int(entry_dir.parents[1].name) if len(entry_dir.parents) >= 2 and entry_dir.parents[1].name.isdigit() else int(args.pulse),
+            run=int(entry_dir.name) if entry_dir.name.isdigit() else int(args.run),
+            dd_version_dir=str(args.dd_version_dir),
+        )
+        # Override entry_dir() to use the explicit path if it doesn't match computed layout
+        # (keeps --entry robust even if layout differs)
+        ctx_entry = entry_dir
+        def _fixed_entry_dir():
+            return ctx_entry
+        ctx.entry_dir = _fixed_entry_dir  # type: ignore
+        eq_ids, cp_ids, wall_ids = load_ids_from_ctx(ctx, occ=int(args.occ))
+    else:
+        ctx = IMASContext(
+            backend=args.backend,
+            dbpath=args.dbpath,
+            dd=str(args.dd),
+            dd_version=str(args.dd_version) if args.dd_version else "",
+            pulse=int(args.pulse),
+            run=int(args.run),
+            dd_version_dir=str(args.dd_version_dir),
+        )
+        eq_ids, cp_ids, wall_ids = load_ids_from_ctx(ctx, occ=int(args.occ))
 
     print(f"Reconstructing GEQDSK -> {args.out_geqdsk}")
     equilibrium_to_geqdsk(eq_ids, args.geqdsk, args.out_geqdsk)

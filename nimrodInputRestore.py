@@ -1,307 +1,285 @@
 #!/usr/bin/env python3
 """
-nimrodInputRestore.py
+nimrodInputRestore.py  (patched v4)
 
-Restore FGnimeq (nimeq.in, oculus.in, fluxgrid.in) and NIMROD (nimrod.in)
-Fortran namelist files from IMAS, assuming they were stored by
-nimrod2imas.py as:
-
-- equilibrium.code.parameters: XML like
-
-    <fgnimeq_inputs>
-      <nimeq_in filename="nimeq.in">
-        <group name="...">
-          <var name="...">value(s)</var>
-        </group>
-        ...
-      </nimeq_in>
-      <oculus_in filename="oculus.in"> ... </oculus_in>
-      <fluxgrid_in filename="fluxgrid.in"> ... </fluxgrid_in>
-    </fgnimeq_inputs>
-
-- mhd.code.parameters (or fallback core_profiles.code.parameters): XML like
-
-    <nimrod_inputs>
-      <nimrod_in filename="nimrod.in">
-        <group name="...">
-          <var name="...">value(s)</var>
-        </group>
-        ...
-      </nimrod_in>
-    </nimrod_inputs>
-
-We parse those XML blobs back into f90nml.Namelist objects and rewrite
-Fortran namelist files, which you can compare to the originals.
-
-Usage example:
-
-  python3 restore_nimrod_namelists.py \
-      --dd nimrod --pulse 1 --run 0 --backend hdf5 \
-      --out-nimeq  nimeq_from_imas.in \
-      --out-oculus oculus_from_imas.in \
-      --out-fluxgrid fluxgrid_from_imas.in \
-      --out-nimrod nimrod_from_imas.in
+Improvements over v3:
+  * Restores with customized filenames: <orig>_from_imas.<ext>
+      e.g. nimrod_from_imas.in, nimeq_from_imas.in, ...
+    If multiple <namelist> blocks exist in XML, writes one file per namelist.
+  * Fixes double-quoting artifacts:
+      init_type = '"shear alf   mult"'  -> init_type = "shear alf   mult"
+      eta_model = '"braginskii n=0"'    -> eta_model = "braginskii n=0"
+  * Better heuristic to distinguish scalar strings-with-spaces vs arrays-of-strings:
+      - comma-separated => list
+      - whitespace-separated tokens that are all numeric/bool => list
+      - whitespace-separated tokens that are all identical => list (string array / repetition)
+      - otherwise => scalar string (preserve internal spacing)
+  * For repeated string arrays, emits Fortran repetition syntax:
+      ds_function = 4*'ds_diff'
 """
+
+from __future__ import annotations
 
 import argparse
 import os
+import re
+import shlex
+from pathlib import Path
 import xml.etree.ElementTree as ET
+from typing import Any, List, Tuple, Optional
 
-import imas
-from imas import imasdef, hli_exception
+import numpy as np
 
-import f90nml
+try:
+    from imas import IDSFactory
+except Exception as exc:  # pragma: no cover
+    raise SystemExit(f"ERROR: cannot import IDSFactory from imas: {exc}")
+
+# Shared helpers from your package (original nimrod2imas.py)
+from nimrod2imas import entry_dir, open_dbentry, get_ids
 
 
-# ----------------------------------------------------------------------
-# parsing utilities (inverse of nimrod2imas4 value_to_string)
-# ----------------------------------------------------------------------
+_num_re = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eEdD][+-]?\d+)?$")
 
-def _parse_scalar(token):
-    """Parse a single scalar token into bool/int/float/string."""
-    token = token.strip()
-    if not token:
-        return None
 
-    low = token.lower()
+def _is_bool_token(tok: str) -> bool:
+    t = tok.strip().lower()
+    return t in ("t", "f", "true", "false", ".true.", ".false.", "1", "0")
 
-    # logicals
-    if low in (".true.", "true", ".t.", "t"):
+
+def _is_number_token(tok: str) -> bool:
+    return bool(_num_re.match(tok.strip()))
+
+
+def _split_commas_preserving_quotes(s: str) -> List[str]:
+    parts, cur = [], []
+    in_s = in_d = False
+    for ch in s:
+        if ch == "'" and not in_d:
+            in_s = not in_s
+        elif ch == '"' and not in_s:
+            in_d = not in_d
+        if ch == "," and (not in_s) and (not in_d):
+            parts.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        parts.append("".join(cur).strip())
+    return [p for p in parts if p != ""]
+
+
+def _parse_scalar_token(tok: str) -> Any:
+    t = tok.strip()
+    tl = t.lower()
+    if tl in (".true.", "true", "t", "1"):
         return True
-    if low in (".false.", "false", ".f.", "f"):
+    if tl in (".false.", "false", "f", "0"):
         return False
-
-    # quoted string
-    if len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
-        return token[1:-1]
-
-    # int
-    try:
-        return int(token)
-    except ValueError:
-        pass
-
-    # float
-    try:
-        return float(token)
-    except ValueError:
-        pass
-
-    # fallback: bare string
-    return token
+    if _is_number_token(t):
+        try:
+            if "d" in t.lower():
+                t2 = re.sub(r"[dD]", "E", t)
+            else:
+                t2 = t
+            if "." in t2 or "e" in t2.lower():
+                return float(t2)
+            return int(t2)
+        except Exception:
+            return t
+    # strip outer quotes
+    if (t.startswith("'") and t.endswith("'")) or (t.startswith('"') and t.endswith('"')):
+        return t[1:-1]
+    return t
 
 
-def _parse_value(text):
-    """Parse XML var text back into a Python value suitable for f90nml."""
-    if text is None:
-        return None
-    s = text.strip()
-    if not s:
-        return None
-
-    # space-separated list?
-    if " " in s:
-        tokens = [t for t in s.split() if t]
-        vals = [_parse_scalar(t) for t in tokens]
-        return vals
-
-    # single scalar
-    return _parse_scalar(s)
-
-
-def xml_tag_to_namelist(tag_element):
+def _parse_xml_value(text: str) -> Any:
     """
-    Convert an element like:
-
-      <nimeq_in filename="nimeq.in">
-        <group name="g1">
-          <var name="a">1.0</var>
-          <var name="b">.true.</var>
-        </group>
-        <group name="g2">
-          ...
-        </group>
-      </nimeq_in>
-
-    into a f90nml.Namelist instance:
-
-      &g1
-        a = 1.0
-        b = .true.
-      &g2
-        ...
+    Parse XML <var> text into scalar or list using heuristics.
     """
-    nml = f90nml.Namelist()
-    if tag_element is None:
-        return nml
+    raw = "" if text is None else text
+    s = raw.strip()
 
-    for g_el in tag_element.findall("group"):
-        gname = g_el.get("name")
-        if gname is None:
-            continue
-        group_dict = {}
-        for v_el in g_el.findall("var"):
-            vname = v_el.get("name")
-            if vname is None:
-                continue
-            value = _parse_value(v_el.text or "")
-            group_dict[vname] = value
-        nml[gname] = group_dict
+    if s == "":
+        return ""
 
-    return nml
+    # comma-separated -> list
+    if "," in s:
+        tokens = _split_commas_preserving_quotes(s)
+        return [_parse_xml_value(tok) for tok in tokens]
+
+    # shlex respects quotes and keeps internal multiple spaces inside quotes
+    try:
+        toks = shlex.split(s)
+    except Exception:
+        toks = s.split()
+
+    if len(toks) == 0:
+        return ""
+
+    if len(toks) == 1:
+        # If the raw value was quoted as a whole, prefer the shlex token (it strips the quotes cleanly)
+        if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+            return toks[0]
+        # otherwise preserve raw (keeps internal spacing if present)
+        return raw
+
+    # Multiple tokens:
+    # 1) all numeric/bool => list
+    if all(_is_number_token(t) or _is_bool_token(t) for t in toks):
+        return [_parse_scalar_token(t) for t in toks]
+
+    # 2) all identical => list of strings (enables repetition syntax on output)
+    if all(t == toks[0] for t in toks):
+        return [toks[0] for _ in toks]
+
+    # 3) otherwise treat as a single scalar string (preserve original spacing)
+    return raw
 
 
-def _write_namelist(nml, path):
-    """Write a f90nml.Namelist to file path, creating dirs as needed."""
-    if not path:
-        return
-    path = os.path.abspath(path)
-    d = os.path.dirname(path)
-    if d and not os.path.isdir(d):
-        os.makedirs(d, exist_ok=True)
-    with open(path, "w") as f:
-        nml.write(f)
+def _quote_string(s: str) -> str:
+    """
+    Emit Fortran string literal.
+    Rule:
+      - If string contains whitespace or '=' or ',' -> use double quotes
+      - Else use single quotes
+    """
+    ss = str(s)
+    if (ss.startswith('"') and ss.endswith('"')) or (ss.startswith("'") and ss.endswith("'")):
+        # strip accidental outer quotes that may have survived
+        ss = ss[1:-1]
+    if re.search(r"\s|,|=", ss):
+        esc = ss.replace('"', '""')
+        return f"\"{esc}\""
+    esc = ss.replace("'", "''")
+    return f"'{esc}'"
 
 
-# ----------------------------------------------------------------------
-# main logic
-# ----------------------------------------------------------------------
+def _format_fortran_value(v: Any) -> str:
+    # list output with repetition if possible
+    if isinstance(v, list):
+        if len(v) == 0:
+            return ""
+        if all(isinstance(x, str) for x in v) and all(x == v[0] for x in v):
+            return f"{len(v)}*{_quote_string(v[0])}"
+        return ", ".join(_format_fortran_value(x) for x in v)
+
+    if isinstance(v, bool):
+        return ".true." if v else ".false."
+    if isinstance(v, (int, np.integer)):
+        return str(int(v))
+    if isinstance(v, (float, np.floating)):
+        return repr(float(v))
+    # scalar string (or fallback)
+    return _quote_string(str(v))
+
+
+def _add_suffix(filename: str, suffix: str = "_from_imas") -> str:
+    p = Path(filename)
+    if p.suffix:
+        return p.with_name(p.stem + suffix + p.suffix).name
+    return p.name + suffix
+
+
+def xml_to_namelists(xml_str: str, *, filename_fallback: str = "restored.in") -> List[Tuple[str, str]]:
+    """
+    Return list of (filename, namelist_text), one per <namelist> block if present.
+    """
+    if not xml_str or not str(xml_str).strip():
+        return []
+
+    root = ET.fromstring(xml_str)
+
+    namelists = root.findall(".//namelist")
+    if not namelists:
+        # legacy: treat root as the container
+        namelists = [root]
+
+    outputs: List[Tuple[str, str]] = []
+    for nml in namelists:
+        fname = (nml.get("filename") if isinstance(nml, ET.Element) else None) or filename_fallback
+        fname = _add_suffix(fname, "_from_imas")
+
+        groups = nml.findall(".//group")
+        out_lines: List[str] = []
+        for g in groups:
+            gname = g.get("name") or "group"
+            out_lines.append(f"&{gname}")
+            for v_el in g.findall("var"):
+                vname = v_el.get("name") or "var"
+                val = _parse_xml_value(v_el.text or "")
+                out_lines.append(f"  {vname} = {_format_fortran_value(val)}")
+            out_lines.append("/")
+            out_lines.append("")
+        txt = "\n".join(out_lines).rstrip() + "\n"
+        outputs.append((fname, txt))
+    return outputs
+
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Restore NIMROD / FGnimeq namelist files from IMAS XML."
+    p = argparse.ArgumentParser(
+        description="Restore NIMROD namelist text file(s) from IMAS IDS code.parameters XML",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--backend", choices=["hdf5", "mdsplus"], default="hdf5")
+    p.add_argument("--dbpath", default=".")
+    p.add_argument("--dd", required=True)
+    p.add_argument("--dd-version", default=None, help="IMAS DD version (defaults to $IMAS_VERSION)")
+    p.add_argument("--dd-version-dir", choices=["major", "full"], default="major")
+    p.add_argument("--pulse", type=int, required=True)
+    p.add_argument("--run", type=int, required=True)
+    p.add_argument("--entry", default=None, help="Explicit entry directory override")
+    p.add_argument("--mode", default="r")
+    p.add_argument("--occ", type=int, default=0)
+    p.add_argument("--ids", choices=["mhd_linear", "mhd", "equilibrium", "core_profiles"], default="mhd_linear",
+                   help="IDS to read code.parameters from")
+    p.add_argument("--outdir", default=".", help="Write restored file(s) here")
+    p.add_argument("--overwrite", action="store_true")
+
+    args = p.parse_args()
+
+    ddv = (args.dd_version or os.environ.get("IMAS_VERSION") or "").strip()
+    if not ddv:
+        raise SystemExit("ERROR: dd_version is not set. Provide --dd-version or set IMAS_VERSION.")
+
+    entry_path = os.path.abspath(os.path.expanduser(args.entry)) if args.entry else str(
+        entry_dir(args.dbpath, args.dd, ddv, args.pulse, args.run, args.dd_version_dir)
     )
 
-    parser.add_argument("--dd", "--db", dest="dd", default="nimrod",
-                        help="IMAS database name (default: nimrod)")
-    parser.add_argument("--pulse", type=int, default=1,
-                        help="IMAS pulse number (default: 1)")
-    parser.add_argument("--run", type=int, default=0,
-                        help="IMAS run number (default: 0)")
-    parser.add_argument("--backend", choices=["hdf5", "mdsplus"], default="hdf5",
-                        help="IMAS backend (default: hdf5)")
+    db, uri, _ = open_dbentry(args.backend, entry_path, mode=args.mode, dd_version=ddv)
+    print(f"IMAS entry directory: {entry_path}")
+    print(f"IMAS URI: {uri}")
 
-    parser.add_argument("--out-nimeq", help="output nimeq.in", default="nimeq_from_imas.in")
-    parser.add_argument("--out-oculus", help="output oculus.in", default="oculus_from_imas.in")
-    parser.add_argument("--out-fluxgrid", help="output fluxgrid.in", default="fluxgrid_from_imas.in")
-    parser.add_argument("--out-nimrod", help="output nimrod.in", default="nimrod_from_imas.in")
+    fac = IDSFactory(ddv)
+    ids_obj = get_ids(db, fac, args.ids, args.occ)
 
-    args = parser.parse_args()
-
-    backend = imasdef.HDF5_BACKEND if args.backend == "hdf5" else imasdef.MDSPLUS_BACKEND
-
-    db = imas.DBEntry(backend, args.dd, args.pulse, args.run)
-    db.open()
-
-    # ------------------------------------------------------------------
-    # 1. FGnimeq namelists from equilibrium.code.parameters
-    # ------------------------------------------------------------------
     try:
-        eq_ids = imas.equilibrium()
-        eq_ids.get(0, db)
+        xml = ids_obj.code.parameters
+    except Exception:
+        xml = ""
 
-        xml_eq = getattr(eq_ids.code, "parameters", "") or ""
-        if xml_eq.strip():
-            try:
-                root_eq = ET.fromstring(xml_eq)
-            except Exception as exc:
-                print(f"[warn] Could not parse equilibrium.code.parameters XML: {exc}")
-                root_eq = None
-        else:
-            root_eq = None
+    if not xml or not str(xml).strip():
+        raise SystemExit(f"ERROR: {args.ids}.code.parameters is empty (occ={args.occ}).")
 
-        if root_eq is not None and root_eq.tag == "fgnimeq_inputs":
-            # nimeq.in
-            nimeq_el = root_eq.find("nimeq_in")
-            if nimeq_el is not None:
-                fname_xml = nimeq_el.get("filename") or "nimeq_from_imas.in"
-                out_nimeq = args.out_nimeq or fname_xml
-                nml_nimeq = xml_tag_to_namelist(nimeq_el)
-                _write_namelist(nml_nimeq, out_nimeq)
-                print(f"[info] Wrote nimeq namelist to: {out_nimeq}")
+    outs = xml_to_namelists(str(xml), filename_fallback=f"{args.ids}.in")
+    if not outs:
+        raise SystemExit("ERROR: Could not parse any <namelist> blocks from code.parameters.")
 
-            # oculus.in
-            oculus_el = root_eq.find("oculus_in")
-            if oculus_el is not None:
-                fname_xml = oculus_el.get("filename") or "oculus_from_imas.in"
-                out_oculus = args.out_oculus or fname_xml
-                nml_oculus = xml_tag_to_namelist(oculus_el)
-                _write_namelist(nml_oculus, out_oculus)
-                print(f"[info] Wrote oculus namelist to: {out_oculus}")
+    outdir = Path(args.outdir).expanduser().resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
 
-            # fluxgrid.in
-            fluxgrid_el = root_eq.find("fluxgrid_in")
-            if fluxgrid_el is not None:
-                fname_xml = fluxgrid_el.get("filename") or "fluxgrid_from_imas.in"
-                out_flux = args.out_fluxgrid or fname_xml
-                nml_flux = xml_tag_to_namelist(fluxgrid_el)
-                _write_namelist(nml_flux, out_flux)
-                print(f"[info] Wrote fluxgrid namelist to: {out_flux}")
+    for fname, txt in outs:
+        outpath = outdir / fname
+        if outpath.exists() and (not args.overwrite):
+            raise SystemExit(f"ERROR: {outpath} exists. Use --overwrite to replace.")
+        outpath.write_text(txt)
+        print(f"Wrote: {outpath}")
 
-            if (nimeq_el is None and oculus_el is None and fluxgrid_el is None):
-                print("[info] equilibrium.code.parameters XML has no "
-                      "<nimeq_in>/<oculus_in>/<fluxgrid_in> tags.")
-        else:
-            print("[info] No FGnimeq XML found in equilibrium.code.parameters.")
-    except hli_exception.IDSNotAvailable:
-        print("[info] equilibrium IDS not available; skipping FGnimeq restoration.")
-
-    # ------------------------------------------------------------------
-    # 2. NIMROD namelist from mhd.code.parameters or core_profiles.code.parameters
-    # ------------------------------------------------------------------
-    nimrod_xml = ""
-    source_label = None
-
-    # try mhd first
     try:
-        mhd_ids = imas.mhd()
-        mhd_ids.get(0, db)
-        nimrod_xml = getattr(mhd_ids.code, "parameters", "") or ""
-        if nimrod_xml.strip():
-            source_label = "mhd"
-    except hli_exception.IDSNotAvailable:
-        nimrod_xml = ""
-        source_label = None
-
-    # fallback: core_profiles.code.parameters
-    if not nimrod_xml.strip():
-        try:
-            cp_ids = imas.core_profiles()
-            cp_ids.get(0, db)
-            nimrod_xml = getattr(cp_ids.code, "parameters", "") or ""
-            if nimrod_xml.strip():
-                source_label = "core_profiles"
-        except hli_exception.IDSNotAvailable:
-            nimrod_xml = ""
-            source_label = None
-
-    if nimrod_xml.strip():
-        try:
-            root_mhd = ET.fromstring(nimrod_xml)
-        except Exception as exc:
-            print(f"[warn] Could not parse {source_label}.code.parameters XML: {exc}")
-            root_mhd = None
-
-        if root_mhd is not None and root_mhd.tag == "nimrod_inputs":
-            nimrod_el = root_mhd.find("nimrod_in")
-            if nimrod_el is not None:
-                fname_xml = nimrod_el.get("filename") or "nimrod_from_imas.in"
-                out_nimrod = args.out_nimrod or fname_xml
-                nml_nimrod = xml_tag_to_namelist(nimrod_el)
-                _write_namelist(nml_nimrod, out_nimrod)
-                print(f"[info] Wrote NIMROD namelist to: {out_nimrod} "
-                      f"(source: {source_label}.code.parameters)")
-            else:
-                print(f"[info] nimrod_inputs XML from {source_label}.code.parameters "
-                      "has no <nimrod_in> tag.")
-        else:
-            print(f"[info] No nimrod_inputs XML found in {source_label}.code.parameters.")
-    else:
-        print("[info] No NIMROD XML found in mhd/core_profiles code.parameters.")
-
-    db.close()
+        db.close()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
     main()
-

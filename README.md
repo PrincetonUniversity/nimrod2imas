@@ -4,6 +4,7 @@ This repository provides a small, script-oriented Python toolkit for:
 - Converting NIMROD inputs (GEQDSK + p-file and selected namelists) to IMAS (`input2imas.py`)
 - Converting NIMROD dump files to IMAS (`dump2imas.py`)
 - Restoring NIMROD-style input files from IMAS entries (`nimrodInputRestore.py`)
+- Plotting IMAS **profiles** (`plot_profiles_1d.py`)
 - Plotting IMAS `mhd` and `mhd_linear` content (`plot_mhd.py`, `plot_mhd_linear.py`)
 - Validating round-trip reconstruction of GEQDSK / p-file from IMAS (`validate_nimrod2imas.py`)
 - Shared helpers for consistent IMAS entry handling and namelist XML encoding/decoding (`nimrod2imas.py`)
@@ -14,10 +15,10 @@ The design goal is **workflow consistency**: all scripts can target the same fil
 
 ## Requirements
 
-Install the Python dependencies listed in `requirement.txt`:
+Install the Python dependencies listed in `requirements.txt`:
 
 ```bash
-python -m pip install -r requirement.txt
+python -m pip install -r requirements.txt
 ```
 
 `omfit-classes` must be available to read/write GEQDSK and p-files (Osborne format).
@@ -83,25 +84,67 @@ python input2imas.py GEQDSK PEQDSK \
 
 **Namelist input paths**
 ```bash
+python input2imas.py GEQDSK PEQDSK \
+  --dd mast --dd-version 4.1.1 --pulse 45272 --run 8 \
   --nimeq nimeq.in --oculus oculus.in --fluxgrid fluxgrid.in --nimrod nimrod.in
 ```
 
 ---
 
-### 2) `dump2imas.py` — dump files → IMAS (`mhd` and/or `mhd_linear`)
+### 2) `dump2imas.py` — dump files → IMAS (equilibrium/core_profiles/edge_profiles + `mhd_linear` / `mhd`)
 
 **What it does**
 - Reads NIMROD dump files (e.g. `dumpgll.*.h5`) and writes:
-  - `mhd_linear` IDS for linear perturbations (toroidal modes)
-  - `mhd` IDS for nonlinear / full-field content (depending on your workflow and script settings)
+  - `equilibrium` (2D stitched grid: R, Z, ψ, B, …)
+  - `core_profiles` **profiles_1d** (flux-surface averages in the closed-flux region)
+  - `edge_profiles` **profiles_1d** (flux-surface averages including SOL/PF when present)
+  - `mhd_linear` (linear perturbations by toroidal mode) and/or `mhd` (full-field content / GGD for nonlinear runs)
 - Stores the parsed `nimrod.in` namelist as XML in IMAS code parameters:
-  - For linear runs: in `mhd_linear.code.parameters` (code.name=`nimrod`)
+  - For linear runs: `mhd_linear.code.parameters` (code.name=`nimrod`)
   - For nonlinear runs: also store in `mhd.code.parameters`
+
+#### LCFS / separatrix identification (recent change)
+
+When building 1D profiles, the converter needs **ψ_axis** and **ψ_LCFS** to construct normalized coordinates.
+The logic is:
+
+1. **`contours.h5` (preferred)**  
+   If present, LCFS is determined from the LCFS polyline in the file by sampling the NIMROD ψ(R,Z) on the polyline points.
+2. **`peqdsk` (fallback)**  
+   If present, Te at normalized poloidal flux **ψ_N≈1** is read from the p-file and used to locate ψ_LCFS on the NIMROD fields.
+3. **IMAS occ=0 fallback**  
+   If neither file is available, the converter attempts to use ψ_axis/ψ_boundary from `equilibrium` and/or `core_profiles` (occurrence 0).
+4. **User-provided Te at separatrix (last resort)**  
+   If nothing else is available, a user-provided `--te-sep-ev` is used, with explicit logging. Default: **60 eV**.
+
+**Optional inputs (defaults match common filenames)**
+- `--contours contours.h5`
+- `--peqdsk peqdsk`
+- `--te-sep-ev 60.0`
+
+File resolution order is:
+1) explicit CLI value (absolute, or relative to the dump directory), 2) `<dump_dir>/<default_name>`, 3) `./<default_name>`.
+
+#### 1D profile coordinate conventions (recent change)
+
+- **core_profiles.profiles_1d.grid**  
+  Stored primarily as a function of **normalized toroidal flux** via `rho_tor_norm` (0 at axis, 1 at LCFS).  
+  The converter may also store auxiliary normalized poloidal coordinates (`psi_norm`, `rho_pol_norm`) for plotting/debug if the DD supports them.
+
+- **edge_profiles.profiles_1d.grid**  
+  Stored as a function of **normalized poloidal flux** (`psi_norm` / `rho_pol_norm`), with:
+  - 0 at the magnetic axis
+  - 1 at the LCFS
+  - **>1 allowed** to represent **SOL/PF** data (not truncated to 1 and not forced to zeros)
+
+To control how far outside the LCFS the 1D grid extends:
+- `--edge-psi-norm-max <float>` (explicit maximum ψ_pol_norm)
+- `--edge-psi-norm-quantile <float>` (robust auto-detection from 2D ψ_pol_norm distribution; default 0.9995)
 
 **Usage (typical)**
 ```bash
 python dump2imas.py dumpgll.0000*.h5 \
-  --dd mast --dd-version 4.1.1 --pulse 45272 --run 8 \
+  --dd d3d --dd-version 4.1.1 --pulse 163518 --run 1 \
   --backend hdf5 --dbpath /path/to/dbroot \
   --dd-version-dir major
 ```
@@ -162,7 +205,24 @@ Fix this in the shared `nimrod2imas.value_to_string(...)` and the corresponding 
 
 ---
 
-### 4) `plot_mhd_linear.py` — contour plots from `mhd_linear`
+### 4) `plot_profiles_1d.py` — 1D profile plots from `core_profiles` / `edge_profiles`
+
+Plots `profiles_1d` from IMAS:
+- `core_profiles`: x-axis = **ρ_tor_norm** (normalized toroidal flux coordinate)
+- `edge_profiles`: x-axis = **ψ_pol_norm** (normalized poloidal flux coordinate, can exceed 1)
+
+The script also applies human-friendly axis labels (aliases) for common quantities (e.g. `Te`, `ne`, `Ti`, `j_tor`, …).
+
+**Example**
+```bash
+python plot_profiles_1d.py \
+  --dd d3d --dd-version 4.1.1 --pulse 163518 --run 1 --occ 1 \
+  --ids core_profiles --quantity te --show
+```
+
+---
+
+### 5) `plot_mhd_linear.py` — contour plots from `mhd_linear`
 
 Provides R–Z contour plots of:
 - scalar perturbations: `p`, `t`, `n`
@@ -180,7 +240,7 @@ Optional: `cmasher` colormaps can be used via `--cmap cmr.gothic` if installed.
 
 ---
 
-### 5) `plot_mhd.py` — contour plots from `mhd` (GGD) with HDF5 fallback
+### 6) `plot_mhd.py` — contour plots from `mhd` (GGD) with HDF5 fallback
 
 Attempts to read axes from IMAS `mhd.grid_ggd`; if not possible, falls back to auxiliary HDF5 datasets written by the conversion pipeline (when present).
 
@@ -192,7 +252,7 @@ python plot_mhd.py --entry mast/4/45272/8/ \
 
 ---
 
-### 6) `validate_nimrod2imas.py` — validate GEQDSK/p-file round trip
+### 7) `validate_nimrod2imas.py` — validate GEQDSK/p-file round trip
 
 Reads `equilibrium` and `core_profiles` from IMAS and regenerates:
 - a GEQDSK (using an original template)

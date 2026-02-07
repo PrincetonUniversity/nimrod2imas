@@ -145,8 +145,7 @@ To control how far outside the LCFS the 1D grid extends:
 ```bash
 python dump2imas.py dumpgll.0000*.h5 \
   --dd d3d --dd-version 4.1.1 --pulse 163518 --run 1 \
-  --backend hdf5 --dbpath /path/to/dbroot \
-  --dd-version-dir major
+  --backend hdf5  
 ```
 
 ---

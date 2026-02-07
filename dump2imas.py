@@ -42,6 +42,7 @@ import h5py
 import numpy as np
 import imas
 
+__version__ = "0.1.0"
 
 try:
     import f90nml  # type: ignore

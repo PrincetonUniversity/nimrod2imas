@@ -1,0 +1,14 @@
+{
+  "packages": {
+    ".": {
+      "release-type": "python",
+      "package-name": "nimrod2imas-suite",
+      "version-file": "nimrod2imas.py", 
+      "extra-files": [
+        "nimrod2imas.py",
+        "dump2imas.py",
+        "input2imas.py"
+      ]
+    }
+  }
+}

@@ -16,4 +16,6 @@ jobs:
     steps:
       - uses: googleapis/release-please-action@v4
         with:
-          release-type: simple
+          # This tells it to look for your custom rules
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

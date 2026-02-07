@@ -5053,7 +5053,6 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
     # after db.put_slice(). Keep the in-memory IDS minimal to avoid schema validation issues.
     if (
         bool(getattr(args, "ggd_unstructured", False))
-        and bool(getattr(args, "ggd_h5py_direct", False))
         and bool(getattr(args, "ggd_unstructured_fe_nodes", False))
         and conn_kind in ("fe_tri", "fe_wedge", "fe_pointcloud")
     ):
@@ -6866,7 +6865,6 @@ def build_parser() -> argparse.ArgumentParser:
     # GGD output style: structured (default) vs unstructured-with-connectivity.
     # NOTE: The unstructured option is primarily meant to support robust downstream reconstruction
     # of 3D array shapes and connectivity in environments where the backend stores packed value arrays.
-    
 
     p.add_argument(
         "--ggd-unstructured",
@@ -6881,7 +6879,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument(
         "--ggd-unstructured-fe-nodes",
-        "--ggd-unstructured-fe-node",
         dest="ggd_unstructured_fe_nodes",
         action="store_true",
         help=(
@@ -6905,30 +6902,6 @@ def build_parser() -> argparse.ArgumentParser:
             "in phi (legacy/regular-grid mode). 'fe_pointcloud' writes nodes only and omits connectivity/cells (recommended for very large meshes). Default: fe_tri."
         ),
     )
-    p.add_argument(
-        "--ggd-h5py",
-        dest="ggd_h5py_direct",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    p.add_argument(
-        "--ggd-h5py-direct",
-        dest="ggd_h5py_direct",
-        action="store_true",
-        help="When --ggd-unstructured is enabled, write node coordinates/connectivity directly into the IDS HDF5 file using h5py after IMAS put(). This avoids slow per-element IDS population. Recommended for large grids.",
-    )
-
-    p.add_argument(
-        "--ggd-gridggd-packed",
-        dest="ggd_gridggd_packed",
-        action="store_true",
-        help=(
-            "When --ggd-unstructured is enabled, also populate the *official* IDS grid_ggd tree (grid_subset/element/object) using a packed HDF5 writer. "
-            "This populates the official IDS grid_ggd tree (grid_subset/element/object) in addition to grid_ggd.space geometry. Validate with IMAS readers. "
-            "Implementation is best-effort across DD/bindings; validate with h5dump/IMAS readers."
-        ),
-    )
-
 
     p.add_argument(
         "--ggd-reuse-grid",
@@ -6942,9 +6915,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--mem-limit-gb",
         type=float,
-        default=64.0,
+        default=32.0,
         help=(
-            "Best-effort hard memory cap for this process in GB (Linux RLIMIT_AS). Default 64. "
+            "Best-effort hard memory cap for this process in GB (Linux RLIMIT_AS). Default 32. "
             "Use to reduce risk of OS-level OOM/reboots on very large GGD exports."
         ),
     )
@@ -7168,7 +7141,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     # Ensure edge_profiles includes GGD node geometry and electrons.temperature values
                     # in standard IMAS backend paths (needed by plot_mhd.py).
 
-                    if bool(getattr(args, 'ggd_unstructured', False)) and bool(getattr(args, 'ggd_h5py_direct', False)):
+                    if bool(getattr(args, 'ggd_unstructured', False)):
                         conn_kind_ep = str(getattr(args, 'ggd_connectivity', 'none')).lower()
                         use_unstructured_nodes = bool(getattr(args, 'ggd_unstructured_fe_nodes', False)) and conn_kind_ep in ('fe_tri', 'fe_wedge', 'fe_pointcloud')
                         use_fe_hex = (conn_kind_ep == 'hex')
@@ -7416,9 +7389,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
                             except Exception as e:
                                 log.warning('edge_profiles GGD required leaves (h5py direct) write failed: %s', e)
-# If unstructured GGD is requested, we'll mirror edge_profiles electrons.temperature from the mhd GGD
+                    # If unstructured GGD is requested, we'll mirror edge_profiles electrons.temperature from the mhd GGD
                     # after the mhd IDS is written (see below). This avoids fragile interpolation and keeps node ordering identical.
-                    edge_profiles_need_mirror = bool(getattr(args, 'ggd_unstructured', False) and getattr(args, 'ggd_h5py_direct', False) and getattr(args, 'edge_ggd_values', None))
+                    edge_profiles_need_mirror = bool(getattr(args, 'ggd_unstructured', False) and getattr(args, 'edge_ggd_values', None))
             except Exception:
                 pass
         # mhd_linear/mhd per-species occurrence:
@@ -7525,7 +7498,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         bool(getattr(args, 'ggd_unstructured', False))
                         and bool(getattr(args, 'ggd_unstructured_fe_nodes', False))
                         and conn_kind in ('fe_tri', 'fe_wedge', 'fe_pointcloud')
-                        and bool(getattr(args, 'ggd_h5py_direct', False))
                     )
                     if use_fe_nodes:
                         import numpy as _np
@@ -7548,7 +7520,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 # Optional: store unstructured node coordinates/connectivity into a NIMROD-specific
                 # auxiliary group. This is used by the packed grid_ggd writer and by lightweight
                 # downstream tools.
-                if getattr(args, 'ggd_unstructured', False) and getattr(args, 'ggd_h5py_direct', False):
+                if getattr(args, 'ggd_unstructured', False):
                     try:
                         for _s in range(nspec_mhd):
                             _occ_s = occ_base + int(_s)
@@ -7563,7 +7535,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 _edge_mode = str(getattr(args, "edge_ggd_values", "")).strip().lower()
                 if (
                     getattr(args, "ggd_unstructured", False)
-                    and getattr(args, "ggd_h5py_direct", False)
                     and _edge_mode in ("full", "mhd", "mirror")
                 ):
                     try:

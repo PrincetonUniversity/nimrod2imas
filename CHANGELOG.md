@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.1](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-suite-v0.2.0...nimrod2imas-suite-v0.2.1) (2026-02-08)
+
+
+### Bug Fixes
+
+* Script that computes the growth rates and frequencies ([16cc6f9](https://github.com/PrincetonUniversity/nimrod2imas/commit/16cc6f96eee694befffc9d2a2ffbe212efeb45aa))
+* Script that computes the growth rates and frequencies ([f7d4cd5](https://github.com/PrincetonUniversity/nimrod2imas/commit/f7d4cd5f817ab384e033c5684555d1d8310b07ab))
+
 ## [0.2.0](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-suite-v0.1.0...nimrod2imas-suite-v0.2.0) (2026-02-07)
 
 

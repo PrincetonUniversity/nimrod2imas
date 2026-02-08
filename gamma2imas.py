@@ -39,6 +39,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
+__version__ = "0.2.1"
 
 # ------------------------- Fortran sequential record reader -------------------------
 

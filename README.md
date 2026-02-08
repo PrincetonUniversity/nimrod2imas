@@ -3,6 +3,7 @@
 This repository provides a small, script-oriented Python toolkit for:
 - Converting NIMROD inputs (GEQDSK + p-file and selected namelists) to IMAS (`input2imas.py`)
 - Converting NIMROD dump files to IMAS (`dump2imas.py`)
+- Computing NIMROD linear growth rates (and optional frequency) from `energy.bin`/`logen.bin` and storing them in IMAS `mhd_linear` (`gamma2imas.py`)
 - Restoring NIMROD-style input files from IMAS entries (`nimrodInputRestore.py`)
 - Plotting IMAS **profiles** (`plot_profiles_1d.py`)
 - Plotting IMAS `mhd` and `mhd_linear` content (`plot_mhd.py`, `plot_mhd_linear.py`)
@@ -148,9 +149,121 @@ python dump2imas.py dumpgll.0000*.h5 \
   --backend hdf5  
 ```
 
+
+#### Additional flags (profiles, units, time, and GGD)
+
+**Occurrences**
+- `--occ-base <int>`: base occurrence used for `equilibrium`, `core_profiles`, `edge_profiles`, and `mhd`/`mhd_linear` written by this script.
+  - For multi-species content, species occurrences use `occ_base + species_index` (see log messages in the script for the exact mapping used).
+
+**1D profile resolution**
+- `--nbins <int>`: number of bins used for 1D profile construction (flux-surface averages are accumulated into this number of radial bins).
+
+**Unit / scaling factors**
+NIMROD inputs can be in code units or device-dependent units. The following multiplicative factors are applied when mapping dump quantities into IMAS:
+- `--p-scale <float>`: pressure-like quantities (example: kPa → Pa uses `1e3`)
+- `--T-scale <float>`: temperature-like quantities (example: keV → eV uses `1e3`)
+- `--n-scale <float>`: number-density-like quantities (example: cm^-3 → m^-3 uses `1e6`)
+- `--B-scale <float>`: magnetic field (example: Gauss → Tesla uses `1e-4`)
+- `--L-scale <float>`: length (example: cm → m uses `1e-2`)
+- `--v-scale <float>`: velocity (example: cm/s → m/s uses `1e-2`)
+- `--j-scale <float>`: current density (example: A/cm^2 → A/m^2 uses `1e4`)
+
+**Time handling**
+- `--time <float>`: override time written into IDS time slices (single value applied to all dumps). If not set, the converter uses `dumpTime.vsTime` when available.
+
+**Density perturbation packing and assumptions (linear runs)**
+Some dumps store density perturbations packed as `(ny, nx, nspec*nmodes)`.
+- `--dens-pert-order {species_major, mode_major}`: how `rend/imnd` are packed.
+- `--ion-mass-amu <float>`: ion mass used to convert **number density** perturbation to **mass density** perturbation.
+- `--electrons-index <int>`: species index in `nq/rend/imnd` corresponding to electrons (used to pair density with Te perturbation).
+
+**MHD GGD output controls (nonlinear runs)**
+These flags control how `mhd.grid_ggd` is constructed when the nonlinear pathway is active.
+- `--ggd-nbins <int>`: downsample poloidal-plane fields onto a regular R–Z grid with this many bins in each direction.
+- `--ggd-nphi <int>`: number of toroidal angle samples (uniform in `[0,2π)`) used to reconstruct full 3D fields from Fourier modes.
+  - Set `--ggd-nphi 1` to store a single toroidal cut at `φ=0`.
+
+**edge_profiles GGD content controls**
+- `--edge-ggd-values {equilibrium,full}`:
+  - `equilibrium` (default): write equilibrium-like fields.
+  - `full`: include perturbations when available.
+- `--edge-eq-add-pert`: if set, `edge_profiles.ggd` is constructed as *equilibrium + scaled perturbation* (when perturbations exist).
+- `--pert-scale <float>`: scale factor applied to perturbations when `--edge-eq-add-pert` is enabled (primarily for visualization/debug).
+- `--edge-pert-phi <float>`: toroidal angle (radians) at which perturbations are sampled when constructing `edge_profiles.ggd` in **structured** mode.
+
+#### Unstructured `ggd` mode (recommended for robust downstream consumption)
+
+By default, the converter may rely on **implicit structured axes** (regular R–Z resampling and toroidal replication).
+For workflows that need explicit node coordinates and explicit connectivity (e.g., robust reconstruction of array shapes, ML pipelines, or backends that store packed value arrays), enable **unstructured GGD**:
+
+- `--ggd-unstructured`
+  - Stores explicit per-node coordinates `(R,Z,φ)` in `grid_ggd.space`.
+  - Optionally stores explicit connectivity in `grid_ggd.grid_subset`.
+
+- `--ggd-unstructured-fe-nodes`
+  - With `--ggd-unstructured`, export the native stitched NIMROD finite-element node locations `(R,Z)` as the node set (no poloidal resampling).
+
+- `--ggd-connectivity {none,fe_pointcloud,hex,fe_tri,fe_wedge}` (default: `fe_tri`)
+  - `none`: do not write connectivity.
+  - `fe_pointcloud`: write nodes only and omit connectivity/cells (good for very large meshes).
+  - `fe_tri`: triangulated 2D connectivity on the native stitched `(R,Z)` node lattice (two triangles per valid quad cell); replicated per toroidal plane when `--ggd-nphi > 1`.
+  - `fe_wedge`: volumetric wedge (triangular-prism) connectivity obtained by extruding the `fe_tri` connectivity between adjacent toroidal planes (periodic in φ).
+  - `hex`: hexahedral connectivity on the reconstructed `(R,Z,φ)` product grid with periodicity in φ (legacy/regular-grid mode).
+
+- `--ggd-reuse-grid`
+  - Assume grid and connectivity are invariant over time.
+  - Write `grid_ggd` geometry/connectivity only for the first dump and reuse it for subsequent time slices (subsequent values reference `grid_index=1`).
+
+**Safety / resource control**
+- `--mem-limit-gb <float>`: best-effort memory cap for the process in GB (Linux `RLIMIT_AS`). Use to reduce the risk of OS-level OOM for large GGD exports.
+- `--quiet`: reduce logging.
+
+
 ---
 
-### 3) `nimrodInputRestore.py` — IMAS → NIMROD-style inputs
+### 3) `gamma2imas.py` — growth rates (and optional frequency) → IMAS `mhd_linear`
+
+**What it does**
+- Reads NIMROD linear energy diagnostics (`energy.bin` or `logen.bin`) and computes a scalar growth rate per toroidal mode (reported as `keff` in the diagnostic file).
+- Writes the results into `mhd_linear.time_slice[*].toroidal_mode[*].growthrate` in IMAS.
+- Optionally computes a mode frequency from a NIMROD history/nimhist binary (second positional argument) and writes `mhd_linear...frequency`.
+
+**Computation details (matching the script)**
+- Growth rate uses: \( \gamma = \frac{1}{2}\, d\ln(E)/dt \) computed on a tail window, with invalid intervals ignored.
+- If `logen.bin` is used, the script converts `log10(E)` back to `ln(E)` internally.
+- Frequency uses complex magnetic components and Dalton’s symmetric formula to estimate \(\omega\), then converts to Hz.
+
+**CLI options**
+Dump2imas-compatible entry selection:
+- `--dd`, `--pulse`, `--run`, `--backend`, `--dbpath`, `--dd-version`, `--dd-version-dir`, `--mode`
+
+Gamma2imas-specific controls:
+- `--occ <int>`: occurrence for the `mhd_linear` IDS to update (default: 1)
+- `-n/--nsteps <int>`: number of tail time points used for statistics (growth and frequency)
+- `--component {total,magnetic,kinetic}`: which energy component is used to compute growth rate
+- `--endian {>,<}`: endianness for Fortran record markers and float payloads
+- `--file-kind {energy,logen}`: override autodetection of file kind (otherwise inferred from filename containing `logen`)
+
+**Usage examples**
+Compute growth rates from `energy.bin` and write to `mhd_linear` occurrence 1:
+```bash
+python gamma2imas.py --dd mast --dd-version 4.1.1 --pulse 45272 --run 1 --occ 1 energy.bin
+```
+
+Compute growth rates from `logen.bin`:
+```bash
+python gamma2imas.py --dd mast --dd-version 4.1.1 --pulse 45272 --run 1 --occ 1 logen.bin
+```
+
+Compute growth rate + frequency (second positional file is a history/nimhist binary):
+```bash
+python gamma2imas.py --dd mast --dd-version 4.1.1 --pulse 45272 --run 1 --occ 1 energy.bin nimhist01.bin
+```
+
+---
+
+### 4) `nimrodInputRestore.py` — IMAS → NIMROD-style inputs
 
 **What it does**
 - Opens an existing filesystem-backed IMAS entry and reconstructs:
@@ -204,7 +317,7 @@ Fix this in the shared `nimrod2imas.value_to_string(...)` and the corresponding 
 
 ---
 
-### 4) `plot_profiles_1d.py` — 1D profile plots from `core_profiles` / `edge_profiles`
+### 5) `plot_profiles_1d.py` — 1D profile plots from `core_profiles` / `edge_profiles`
 
 Plots `profiles_1d` from IMAS:
 - `core_profiles`: x-axis = **ρ_tor_norm** (normalized toroidal flux coordinate)
@@ -221,7 +334,7 @@ python plot_profiles_1d.py \
 
 ---
 
-### 5) `plot_mhd_linear.py` — contour plots from `mhd_linear`
+### 6) `plot_mhd_linear.py` — contour plots from `mhd_linear`
 
 Provides R–Z contour plots of:
 - scalar perturbations: `p`, `t`, `n`
@@ -239,7 +352,7 @@ Optional: `cmasher` colormaps can be used via `--cmap cmr.gothic` if installed.
 
 ---
 
-### 6) `plot_mhd.py` — contour plots from `mhd` (GGD) with HDF5 fallback
+### 7) `plot_mhd.py` — contour plots from `mhd` (GGD) with HDF5 fallback
 
 Attempts to read axes from IMAS `mhd.grid_ggd`; if not possible, falls back to auxiliary HDF5 datasets written by the conversion pipeline (when present).
 
@@ -251,7 +364,7 @@ python plot_mhd.py --entry mast/4/45272/8/ \
 
 ---
 
-### 7) `validate_nimrod2imas.py` — validate GEQDSK/p-file round trip
+### 8) `validate_nimrod2imas.py` — validate GEQDSK/p-file round trip
 
 Reads `equilibrium` and `core_profiles` from IMAS and regenerates:
 - a GEQDSK (using an original template)

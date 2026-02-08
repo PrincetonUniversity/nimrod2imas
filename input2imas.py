@@ -61,7 +61,7 @@ from imas import IDSFactory
 import f90nml
 import xml.etree.ElementTree as ET
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 # Create a global IDS factory for creating IDS objects
 _ids_factory = IDSFactory()

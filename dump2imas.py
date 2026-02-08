@@ -80,6 +80,194 @@ def _die(msg: str) -> None:
 def _as_f64(a: np.ndarray) -> np.ndarray:
     return np.asarray(a, dtype=np.float64)
 
+
+# -----------------------------
+# COCOS handling
+# -----------------------------
+#
+# NIMROD uses an R–Z–phi cylindrical ordering ("RZPhi"), which corresponds to COCOS=12
+# in the Sauter coordinate-conventions table: sigma_{R\phi Z} = -1 (toroidal angle
+# increases clockwise when viewed from +Z).
+#
+# IMAS expects COCOS=11 (sigma_{R\phi Z} = +1), which is the standard right-handed
+# (R,phi,Z) cylindrical system.
+#
+# The 12->11 conversion requires:
+#   * flip sign of absolute poloidal flux psi (so that B_R/B_Z remain unchanged when
+#     sigma_{R\phi Z} changes sign)
+#   * flip sign of *toroidal* (phi) components of equilibrium vectors (B_phi, V_phi, J_phi)
+#   * for Fourier-mode perturbations stored as (re, im): complex conjugation for scalars
+#     (Im -> -Im) and -conjugation for toroidal vector components (Re_phi -> -Re_phi,
+#     Im_phi unchanged)
+#
+# This script assumes NIMROD dump inputs are COCOS=12 and converts all dump2imas outputs
+# to be COCOS=11-consistent.
+
+COCOS_IN_DEFAULT = 12
+COCOS_OUT_DEFAULT = 11
+
+
+def _set_ids_cocos(ids_obj: Any, cocos: int) -> None:
+    """Best-effort setter for IMAS COCOS metadata across DD versions."""
+    try:
+        ip = getattr(ids_obj, "ids_properties", None)
+        if ip is None:
+            return
+        # Common DD4+ location
+        cs = getattr(ip, "coordinate_system", None)
+        if cs is not None and hasattr(cs, "cocos"):
+            cs.cocos = int(cocos)
+            return
+        # Some DDs expose cocos directly under ids_properties
+        if hasattr(ip, "cocos"):
+            ip.cocos = int(cocos)
+            return
+    except Exception:
+        return
+
+
+def _apply_cocos_12_to_11_inplace(data: Dict[str, Any], log: logging.Logger) -> None:
+    """In-place COCOS=12 -> COCOS=11 conversion for stitched NIMROD dump data."""
+    if bool(data.get("_cocos_12_to_11_applied", False)):
+        return
+
+    # 1) Absolute poloidal flux (psi): flip sign
+    if data.get("psi_eq", None) is not None:
+        data["psi_eq"] = -np.asarray(data["psi_eq"], dtype=float)
+        log.info("COCOS 12->11: flipped sign of psi_eq (absolute poloidal flux)")
+
+    # 2) Equilibrium vectors: flip toroidal component
+    for k in ("bq", "vq", "jq"):
+        A = data.get(k, None)
+        if A is None:
+            continue
+        AA = np.asarray(A)
+        if AA.ndim >= 3 and AA.shape[-1] >= 3:
+            AA = AA.copy()
+            AA[..., 2] *= -1.0
+            data[k] = AA
+            log.info("COCOS 12->11: flipped sign of %s[...,phi]", k)
+
+    # 3) Perturbations: conjugate mode coefficients for phi-reversal
+    fields = data.get("fields", None)
+    if isinstance(fields, dict) and fields:
+
+        def _flip_vec_modes(re_key: str, im_key: str) -> None:
+            # arrays are typically (Nx,Ny,nmodes,3)
+            if re_key in fields:
+                A = np.asarray(fields[re_key])
+                if A.ndim >= 4 and A.shape[-1] == 3:
+                    A = A.copy()
+                    A[..., 2] *= -1.0  # Re_phi -> -Re_phi (toroidal basis flip)
+                    fields[re_key] = A
+            if im_key in fields:
+                A = np.asarray(fields[im_key])
+                if A.ndim >= 4 and A.shape[-1] == 3:
+                    A = A.copy()
+                    A[..., 0] *= -1.0  # Im_R  -> -Im_R  (conjugation)
+                    A[..., 1] *= -1.0  # Im_Z  -> -Im_Z  (conjugation)
+                    # Im_phi unchanged for -conjugation of toroidal component
+                    fields[im_key] = A
+
+        # Vector perturbations
+        _flip_vec_modes("rebe", "imbe")
+        _flip_vec_modes("reve", "imve")
+        _flip_vec_modes("reja", "imja")
+
+        # Scalar perturbations: Im -> -Im (complex conjugation)
+        for k in list(fields.keys()):
+            if not k.startswith("im"):
+                continue
+            if k in ("imbe", "imve", "imja"):
+                continue
+            try:
+                fields[k] = -np.asarray(fields[k])
+            except Exception:
+                pass
+
+        data["fields"] = fields
+        log.info(
+            "COCOS 12->11: applied conjugation to perturbations (scalar Im->-Im; vector components adjusted)"
+        )
+
+    data["_cocos_12_to_11_applied"] = True
+
+
+
+def _sanity_print_cocos(tag: str, src_name: str, t: float, payload: Dict[str, Any], args: Any) -> None:
+    """Print lightweight sanity statistics before/after COCOS conversion.
+
+    Intended for quick verification that the 12->11 sign flips are being applied:
+      - psi flips sign
+      - Bphi/Jphi/Vphi flip sign (equilibrium)
+      - scalar-mode imaginary parts flip sign; vector-mode rules for phi reversal hold
+    """
+    if not getattr(args, "sanity_print", False):
+        return
+
+    def _sample_finite(a: Optional[np.ndarray], max_n: int = 200000) -> np.ndarray:
+        if a is None:
+            return np.asarray([], dtype=float)
+        x = np.asarray(a, dtype=float).ravel()
+        if x.size == 0:
+            return np.asarray([], dtype=float)
+        if x.size > max_n:
+            # deterministic strided subsample
+            idx = np.linspace(0, x.size - 1, max_n, dtype=np.int64)
+            x = x[idx]
+        x = x[np.isfinite(x)]
+        return x
+
+    def _fmt_stats(name: str, a: Optional[np.ndarray]) -> str:
+        x = _sample_finite(a)
+        if x.size == 0:
+            return f"{name}: (missing)"
+        q = np.quantile(x, [0.0, 0.01, 0.5, 0.99, 1.0])
+        mean = float(np.mean(x))
+        return (
+            f"{name}: min={q[0]:+.3e} q01={q[1]:+.3e} med={q[2]:+.3e} "
+            f"q99={q[3]:+.3e} max={q[4]:+.3e} mean={mean:+.3e}"
+        )
+
+    def _phi_comp(v: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if v is None:
+            return None
+        a = np.asarray(v)
+        if a.ndim >= 3 and a.shape[-1] >= 3:
+            return a[..., 2]
+        return None
+
+    psi = payload.get("psi_eq", None)
+    bq = payload.get("bq", None)
+    vq = payload.get("vq", None)
+    jq = payload.get("jq", None)
+    fields = payload.get("fields", {}) if isinstance(payload.get("fields", None), dict) else {}
+
+    lines = []
+    lines.append(f"SANITY[{tag}] {src_name}  t={t:.6g}  (COCOS12->11 check)")
+    lines.append("  " + _fmt_stats("psi_eq", psi))
+    lines.append("  " + _fmt_stats("Bphi(eq)", _phi_comp(bq)))
+    lines.append("  " + _fmt_stats("Jphi(eq)", _phi_comp(jq)))
+    lines.append("  " + _fmt_stats("Vphi(eq)", _phi_comp(vq)))
+
+    # Representative perturbation checks (if present)
+    if isinstance(fields, dict) and fields:
+        if "impr" in fields:
+            lines.append("  " + _fmt_stats("impr(mode)", fields.get("impr")))
+        if "rebe" in fields:
+            lines.append("  " + _fmt_stats("rebe_phi(mode)", _phi_comp(fields.get("rebe"))))
+        if "imbe" in fields:
+            # For vector Im: R/Z should flip under conjugation, phi should not (per our 12->11 rule)
+            imbe = np.asarray(fields.get("imbe"))
+            try:
+                lines.append("  " + _fmt_stats("imbe_R(mode)", imbe[..., 0]))
+                lines.append("  " + _fmt_stats("imbe_Z(mode)", imbe[..., 1]))
+                lines.append("  " + _fmt_stats("imbe_phi(mode)", imbe[..., 2]))
+            except Exception:
+                pass
+
+    print("\n".join(lines), flush=True)
+
 def _value_to_string(v: Any) -> str:
     """Serialize values to XML text consistently across tools."""
     return _value_to_string_common(v)
@@ -2142,6 +2330,30 @@ def read_and_stitch_dump(fn: Path, args) -> Dict[str, Any]:
             except Exception:
                 pass
 
+        # Convert from NIMROD's native COCOS=12 convention to IMAS COCOS=11.
+        # This is applied only within dump2imas outputs (input2imas preserves original PEQDSK signs).
+        try:
+            _cocos_log = logging.getLogger("dump2imas")
+            _cocos_payload = dict(
+                psi_eq=psi_eq_imas,
+                bq=bq_imas,
+                vq=vq_imas,
+                jq=jq_imas,
+                fields=fields_imas,
+            )
+            
+            _sanity_print_cocos("PRE", fn.name, float(t0), _cocos_payload, args)
+            _apply_cocos_12_to_11_inplace(_cocos_payload, _cocos_log)
+
+            _sanity_print_cocos("POST", fn.name, float(t0), _cocos_payload, args)
+            psi_eq_imas = _cocos_payload.get("psi_eq", psi_eq_imas)
+            bq_imas = _cocos_payload.get("bq", bq_imas)
+            vq_imas = _cocos_payload.get("vq", vq_imas)
+            jq_imas = _cocos_payload.get("jq", jq_imas)
+            fields_imas = _cocos_payload.get("fields", fields_imas)
+        except Exception:
+            pass
+
         return dict(
             time=float(t0),
             keff=_as_f64(keff),
@@ -2184,6 +2396,14 @@ def _reconstruct_psi_from_bq(R: np.ndarray, Z: np.ndarray, bq: np.ndarray) -> Op
     Assumes cylindrical coordinates where (B_R, B_Z) relate to poloidal flux as:
         B_R = -(1/R) * dpsi/dZ
         B_Z =  (1/R) * dpsi/dR
+
+    This corresponds to the COCOS=12 sign convention (sigma_{R\phi Z}=-1). The
+    surrounding dump2imas workflow will subsequently convert the reconstructed
+    psi to COCOS=11 by flipping its sign.
+
+    NOTE: this relation corresponds to sigma_{R\phi Z} = -1 (COCOS=12-type) in the Sauter
+    coordinate-convention definitions. dump2imas enforces COCOS=11 output by flipping the
+    sign of psi after stitching/reconstruction.
 
     We reconstruct psi on a logically-rectangular grid by:
       1) selecting a reference point near the magnetic axis (min |B_p|)
@@ -2428,6 +2648,10 @@ def _psi_axis_and_sign(psi: np.ndarray) -> Tuple[float, float]:
 
 def populate_equilibrium(eq: Any, data: Dict[str, Any], t_index: int, quiet: bool) -> None:
     t = float(data["time"])
+
+    # IMAS output convention (dump2imas enforces COCOS=11)
+
+    _set_ids_cocos(eq, COCOS_OUT_DEFAULT)
     R = data["R"]
     Z = data["Z"]
     psi = data["psi_eq"]
@@ -2498,6 +2722,10 @@ def populate_core_profiles(cp: Any, data: Dict[str, Any], t_index: int, args) ->
     """
     log = logging.getLogger(__name__)
     t = float(data.get("time", 0.0))
+
+    # IMAS output convention (dump2imas enforces COCOS=11)
+
+    _set_ids_cocos(cp, COCOS_OUT_DEFAULT)
 
     psi2d = data.get("psi_eq", None)
     if psi2d is None:
@@ -6513,6 +6741,7 @@ def populate_mhd_linear(
     include_common_fields: bool,
 ) -> None:
     t = float(data["time"])
+
     fields: Dict[str, np.ndarray] = data["fields"]
     nmodes = int(data["nmodes"])
     keff = data["keff"]
@@ -6968,7 +7197,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--j-scale", type=float, default=1.0,
                    help="Scale factor applied to current-density-like quantities from dump -> IMAS (e.g., A/cm^2->A/m^2: 1e4).")
 
+
+    p.add_argument(
+        "--sanity-print",
+        dest="sanity_print",
+        action="store_true",
+        help=(
+            "Print sanity statistics before and after the internal COCOS=12 -> COCOS=11 conversion "
+            "(psi_eq, Bphi/Jphi/Vphi and representative perturbation components). Useful for quick sign checks."
+        ),
+    )
+
     p.add_argument("--quiet", action="store_true")
+
 
     return p
 
@@ -7441,10 +7682,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             try:
                 mhd_ids.ids_properties.comment = (
                     f"dump2imas: stitched grid; ids={ids_name}; occurrence={occ}; species_index={s}; "
-                    f"dens_pert_order={args.dens_pert_order}; common_fields={include_common}; nonlinear={nonlinear_flag}"
+                    f"dens_pert_order={args.dens_pert_order}; common_fields={include_common}; nonlinear={nonlinear_flag}; "
+                    "COCOS: converted NIMROD COCOS=12 -> IMAS COCOS=11 (psi sign flipped; toroidal components flipped; "
+                    "modal perturbations mapped for phi-reversal)"
                 )
             except Exception:
                 pass
+
+            # Best-effort: tag IDS with output COCOS metadata when supported by this DD
+            _set_ids_cocos(mhd_ids, COCOS_OUT_DEFAULT)
 
             _db_put_slice(db, mhd_ids, occ)
         # For nonlinear runs, also write the GGD-based mhd IDS (full fields) alongside mhd_linear.
@@ -7482,6 +7728,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             mhd_s.code.parameters = _build_nimrod_xml(nimrod_in_path)
                     except Exception:
                         pass
+                    # annotate COCOS conversion provenance (dump2imas enforces COCOS=11 output)
+                    try:
+                        mhd_s.ids_properties.comment = (
+                            f"dump2imas: ggd full-field snapshot; ids={ids_name}; occurrence={occ}; species_index={s}; "
+                            "COCOS: converted NIMROD COCOS=12 -> IMAS COCOS=11 (psi sign flipped; toroidal components flipped; "
+                            "modal perturbations mapped for phi-reversal)"
+                        )
+                    except Exception:
+                        pass
+                    # Best-effort: tag IDS with output COCOS metadata when supported by this DD
+                    _set_ids_cocos(mhd_s, COCOS_OUT_DEFAULT)
+
                     _db_put_slice(db, mhd_s, occ)
                     if s == 0:
                         mhd0 = mhd_s

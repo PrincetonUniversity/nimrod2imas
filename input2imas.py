@@ -786,6 +786,24 @@ def main():
     cp_ids = _ids_factory.core_profiles()
     cp_ids, pfile = fill_core_profiles_from_pfile(cp_ids, args.peqdsk, geq, time=time0)
 
+    # NOTE on sign conventions / COCOS:
+    # input2imas preserves the original signs from the kinetic PEQDSK (p-file) input.
+    # PEQDSK files are device/discharge specific and do not necessarily enforce a single
+    # global COCOS convention. Any COCOS normalization/sign handling is performed in
+    # dump2imas (for NIMROD dump outputs) rather than here.
+    if int(getattr(args, "occ", 0) or 0) == 0:
+        try:
+            msg = (
+                "input2imas: core_profiles(occ=0) preserves the original sign conventions "
+                "from the input PEQDSK (kinetic profiles); no COCOS sign normalization is applied."
+            )
+            ip = getattr(cp_ids, "ids_properties", None)
+            if ip is not None and hasattr(ip, "comment"):
+                prev = str(getattr(ip, "comment", "") or "").strip()
+                ip.comment = (prev + "\n" + msg).strip() if prev else msg
+        except Exception:
+            pass
+
     # --- attach code metadata and XML inputs ---
     # FGnimeq inputs (nimeq.in / oculus.in / fluxgrid.in) -> equilibrium.code.parameters
     fgnimeq_xml = build_fgnimeq_xml(args.nimeq, args.oculus, args.fluxgrid)

@@ -32,7 +32,7 @@ import numpy as np
 import xml.etree.ElementTree as ET
 import scipy.integrate as integrate
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 # SciPy >= 1.11 removed cumtrapz; OMFIT still expects it
 if not hasattr(integrate, "cumtrapz"):

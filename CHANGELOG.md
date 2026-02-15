@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.3.0...nimrod2imas-v0.3.1) (2026-02-15)
+
+
+### Bug Fixes
+
+* Plotting options are updated ([2487e94](https://github.com/PrincetonUniversity/nimrod2imas/commit/2487e9498d8e80ca0c0109a5d78777f08ea4287e))
+
 ## [0.3.0](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.2.1...nimrod2imas-v0.3.0) (2026-02-08)
 
 

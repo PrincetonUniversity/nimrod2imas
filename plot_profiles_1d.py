@@ -44,6 +44,7 @@ try:
 except Exception as e:
     raise SystemExit(f"h5py is required for this script: {e}")
 
+__version__ = "0.3.0"
 
 # ----------------------------
 # HDF5 dataset candidates

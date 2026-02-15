@@ -32,7 +32,15 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from nimrod2imas import entry_dir as _entry_dir_common
+from nimrod2imas import (
+    add_entry_args as _add_entry_args_common,
+    resolve_entry_path as _resolve_entry_common,
+    infer_ids_h5_path as _infer_ids_h5_path_common,
+    open_ids_h5 as _open_ids_h5_common,
+    h5_get_first_existing as _h5_get_first_existing_common,
+    h5_list_keys as _h5_list_keys_common,
+    normalize_out_and_show as _normalize_out_and_show_common,
+)
 
 try:
     import imas
@@ -44,7 +52,6 @@ try:
 except Exception as e:
     raise SystemExit(f"h5py is required for this script: {e}")
 
-__version__ = "0.3.0"
 
 # ----------------------------
 # HDF5 dataset candidates
@@ -127,66 +134,17 @@ def _q_pretty(q: str, with_unit: bool = True) -> str:
 
 
 def _infer_ids_h5_path(entry: str, ids_name: str, occ: int) -> str:
-    """Infer IDS HDF5 filename for an entry.
-
-    Note: Many IMAS HDF5 backends store occurrence 0 without an "_0" suffix:
-      - file: <ids>.h5  group: /<ids>
-    while occurrences >0 typically use:
-      - file: <ids>_<occ>.h5 group: /<ids>_<occ>
-
-    We therefore try a small ordered set of candidates and return the first that exists.
-    """
-    entry = entry.rstrip("/")
-    ids_name = str(ids_name).strip()
-
-    cands = []
-    if int(occ) == 0:
-        cands += [
-            os.path.join(entry, f"{ids_name}.h5"),
-            os.path.join(entry, f"{ids_name}_0.h5"),
-            os.path.join(entry, f"{ids_name}_{occ}.h5"),
-        ]
-    else:
-        cands += [
-            os.path.join(entry, f"{ids_name}_{occ}.h5"),
-            os.path.join(entry, f"{ids_name}.h5"),
-        ]
-
-    for fp in cands:
-        if os.path.exists(fp):
-            return fp
-
-    # Fall back to the conventional name to produce a clear error message upstream.
-    return os.path.join(entry, f"{ids_name}_{occ}.h5")
+    """Infer IDS HDF5 filename for an entry and occurrence (robust for occ=0)."""
+    return str(_infer_ids_h5_path_common(entry, ids_name, int(occ)))
 
 
-def _h5_open_group(h5_path: str, ids_name: str, occ: int) -> Tuple[h5py.File, h5py.Group]:
-    f = h5py.File(h5_path, "r")
-
-    ids_name = str(ids_name).strip()
-    occ = int(occ)
-
-    # Occurrence 0 is often stored without a suffix.
-    if occ == 0:
-        group_candidates = [ids_name, f"{ids_name}_0", f"{ids_name}_{occ}"]
-    else:
-        group_candidates = [f"{ids_name}_{occ}", ids_name]
-
-    for grp_name in group_candidates:
-        if grp_name in f:
-            return f, f[grp_name]
-
-    f.close()
-    raise RuntimeError(
-        f"Group not found in {h5_path}. Tried: " + ", ".join([f"/{g}" for g in group_candidates])
-    )
+def _h5_open_group(entry: str, ids_name: str, occ: int) -> Tuple[h5py.File, h5py.Group]:
+    f, g, _h5_path, _grp = _open_ids_h5_common(entry, ids_name, int(occ))
+    return f, g
 
 
 def _h5_get_first_existing(g: h5py.Group, names: Sequence[str]) -> Optional[str]:
-    for nm in names:
-        if nm in g:
-            return nm
-    return None
+    return _h5_get_first_existing_common(g, list(names))
 
 
 def _h5_read_1d(g: h5py.Group, ds_name: str, time_index: int, ion_index: int = 0) -> np.ndarray:
@@ -232,21 +190,7 @@ def _h5_read_1d(g: h5py.Group, ds_name: str, time_index: int, ion_index: int = 0
 
 
 def _h5_list_available_profiles(g: h5py.Group) -> List[str]:
-    """List available profile datasets under the current IDS group.
-
-    We return dataset names (relative to the group) that start with 'profiles_1d[]&'
-    and exclude bookkeeping datasets such as '*_SHAPE' and 'AOS_SHAPE'.
-    """
-    out: List[str] = []
-    for k in g.keys():
-        if not isinstance(k, str):
-            continue
-        if not k.startswith("profiles_1d[]&"):
-            continue
-        if k.endswith("_SHAPE") or k.endswith("AOS_SHAPE"):
-            continue
-        out.append(k)
-    return sorted(out)
+    return _h5_list_keys_common(g, prefix='profiles_1d[]&', exclude_shape=True)
 
 
 def _print_quantity_help(ids_name: str, occ: int, time_index: int, entry: str, g: h5py.Group) -> None:
@@ -260,8 +204,8 @@ def _print_quantity_help(ids_name: str, occ: int, time_index: int, entry: str, g
             print(f"  - {k}")
     print("")
     print("How to plot:")
-    print("  - Use --quantities with one or more aliases (comma-separated), e.g.:")
-    print("      --quantities ne,te,ni,ti,ptot,jtor")
+    print("  - Use --quantity with one or more aliases (comma-separated), e.g.:")
+    print("      --quantity ne,te,ni,ti,ptot,jtor")
     print("  - Aliases supported by this script:")
     print(f"      {', '.join(sorted(_H5_Q_DS.keys()))}")
     print("")
@@ -535,6 +479,7 @@ def _plot(
     y_label: Optional[str] = None,
     legend_labels: Optional[Dict[str, str]] = None,
     out: Optional[str] = None,
+    show: bool = False,
     xlim: Optional[Tuple[float, float]] = None,
     vline1: bool = False,
 ) -> None:
@@ -570,48 +515,41 @@ def _plot(
 
     ax.grid(True, which="both", alpha=0.3)
 
-    if out:
-        fig.savefig(out, dpi=150, bbox_inches="tight")
-    else:
+    out_path, do_show = _normalize_out_and_show_common(out, show=show)
+
+    if out_path:
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        print(f"Wrote {out_path}")
+    if do_show:
         plt.show()
+    plt.close(fig)
 def main() -> int:
     p = argparse.ArgumentParser(description="Plot profiles_1d from core_profiles / edge_profiles")
-    p.add_argument("--entry", default=None, help="IMAS entry directory (contains master.h5, core_profiles_*.h5, etc)")
-    p.add_argument("--dbpath", default=".", help="DB root path")
-    p.add_argument("--dd", default=None, help="DB name (directory name), e.g. nstx")
-    p.add_argument("--pulse", type=int, default=None)
-    p.add_argument("--run", type=int, default=None)
-    p.add_argument("--dd-version", default=None, help="IMAS DD version for IMAS read (required unless --hdf5-only)")
-    p.add_argument("--ids", choices=["core_profiles", "edge_profiles"], required=True)
-    p.add_argument("--occ", type=int, required=True, help="Occurrence number")
+    _add_entry_args_common(p, include_backend=False, include_ids=True, ids_default='core_profiles', ids_choices=['core_profiles','edge_profiles'], include_occ=True, occ_default=0)
     p.add_argument("--time-index", type=int, default=0, help="Time slice index")
     p.add_argument("--ion-index", type=int, default=0, help="Ion species index for ni/ti/pi/omega when applicable")
-    p.add_argument("--quantities", required=True, help="Comma-separated list (e.g. te,ne,ptot,jtor)")
+    p.add_argument("--quantity", default=None, help="Comma-separated list (e.g. te,ne,ptot,jtor)")
     p.add_argument("--hdf5-only", action="store_true", help="Force direct HDF5 mode (bypass IMAS)")
-    p.add_argument("--output", default=None, help="Output image path (if omitted, show interactively)")
+    p.add_argument("--out", default="X11", help="Output image path or 'X11' for interactive")
+    p.add_argument("--show", action="store_true", help="Show plot interactively (even if --out is set)")
+    p.add_argument("--help-quantities", action="store_true", help="Print available HDF5 profile datasets and supported aliases, then exit")
     p.add_argument("--info", action="store_true", help="Print resolved dataset paths/shapes and exit")
 
     args = p.parse_args()
+    entry = str(_resolve_entry_common(args)).rstrip('/') + '/'
+    if args.help_quantities:
+        f_tmp, g_tmp, _h5p, _grp = _open_ids_h5_common(entry, args.ids, args.occ)
+        try:
+            _print_quantity_help(args.ids, args.occ, args.time_index, entry, g_tmp)
+        finally:
+            f_tmp.close()
+        return 0
 
-    if args.entry:
-        entry = str(Path(args.entry).expanduser().resolve()).rstrip("/") + "/"
-    else:
-        if args.dd is None or args.pulse is None or args.run is None or not args.dd_version:
-            raise SystemExit("Provide either --entry, or (--dbpath --dd --dd-version --pulse --run).")
-        entry = str(
-            _entry_dir_common(
-                args.dbpath,
-                str(args.dd),
-                str(args.dd_version),
-                int(args.pulse),
-                int(args.run),
-                dd_version_dir=str(args.dd_version[0]),
-            )
-        ).rstrip("/") + "/"
-
-    qlist = [q.strip().lower() for q in str(args.quantities).split(",") if q.strip()]
+    if not args.quantity:
+        raise SystemExit('No quantity requested. Use --quantity ... (or --help-quantities).')
+    qlist = [q.strip().lower() for q in str(args.quantity).split(',') if q.strip()]
     if not qlist:
-        raise SystemExit("No quantities requested.")
+        raise SystemExit('No quantity requested. Use --quantity ... (or --help-quantities).')
 
     # Try IMAS first (optional)
     ids_obj = None
@@ -622,13 +560,9 @@ def main() -> int:
             ids_obj = _try_imas_read(entry, args.dd_version, args.ids, args.occ)
         except Exception:
             ids_obj = None
-
     # Always support direct HDF5 read
-    h5_path = _infer_ids_h5_path(entry, args.ids, args.occ)
-    if not os.path.exists(h5_path):
-        raise SystemExit(f"Cannot find {h5_path}")
-
-    f, g = _h5_open_group(h5_path, args.ids, args.occ)
+    f, g, _h5_path_obj, grp_name = _open_ids_h5_common(entry, args.ids, args.occ)
+    h5_path = str(_h5_path_obj)
     # Read IDS time array (if available) to align equilibrium time slices for normalization
     t_arr, t_src = _read_ids_time_from_h5(entry, args.ids, args.occ)
     target_time = None
@@ -745,7 +679,7 @@ def main() -> int:
 
         if args.info:
             print(f"HDF5: {h5_path}")
-            print(f"Group: /{args.ids}_{args.occ}")
+            print(f"Group: /{grp_name}")
             print(f"x: {x_ds} kind={x_kind} label={x_label} shape={x.shape}")
             for q in qlist:
                 qk = q.strip().lower()
@@ -772,7 +706,18 @@ def main() -> int:
             xlim = (0.0, xmax)
             vline1 = True
 
-        _plot(x, ys, title=title, x_label=x_label, y_label=y_label, legend_labels=legend_labels, out=args.output, xlim=xlim, vline1=vline1)
+        _plot(
+            x,
+            ys,
+            title=title,
+            x_label=x_label,
+            y_label=y_label,
+            legend_labels=legend_labels,
+            out=args.out,
+            show=bool(args.show),
+            xlim=xlim,
+            vline1=vline1,
+        )
         return 0
 
     finally:

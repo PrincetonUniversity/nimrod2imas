@@ -629,3 +629,212 @@ def update_workflow_and_dataset_fair(
         put_ids(db, df, int(dataset_fair_occ))
     except Exception:
         pass
+
+
+# --------------------------- Plotting / CLI utilities ---------------------------
+
+def add_entry_args(
+    ap: Any,
+    *,
+    include_backend: bool = False,
+    backend_default: str = "hdf5",
+    include_ids: bool = False,
+    ids_default: Optional[str] = None,
+    ids_choices: Optional[List[str]] = None,
+    include_occ: bool = True,
+    occ_default: int = 0,
+) -> None:
+    """Add standard entry-location CLI args to an argparse parser.
+
+    Conventions:
+      - Either provide --entry, OR provide (--dbpath, --dd, --dd-version, --pulse, --run).
+      - These args are shared across plotting utilities and converters.
+
+    Parameters
+    ----------
+    include_backend:
+        If True, add --backend (used by IMAS-Python access).
+    include_ids:
+        If True, add --ids with optional choices/default.
+    include_occ:
+        If True, add --occ.
+    """
+    import argparse  # local import to keep converter deps light
+
+    if not isinstance(ap, argparse.ArgumentParser):
+        # argparse subparsers/groups also satisfy add_argument; keep it generic.
+        pass
+
+    ap.add_argument(
+        "--entry",
+        default=None,
+        help=(
+            "Explicit IMAS entry directory (contains master.h5, <ids>*.h5, etc.). "
+            "Overrides --dbpath/--dd/--dd-version/--pulse/--run."
+        ),
+    )
+    ap.add_argument("--dbpath", default=".", help="DB root path (default: current directory)")
+    ap.add_argument("--dd", default=None, help="DB name / top directory, e.g. d3d, nstx")
+    ap.add_argument("--dd-version", dest="dd_version", default=None, help="IMAS DD version, e.g. 4.1.1")
+    ap.add_argument("--pulse", type=int, default=None, help="Pulse number")
+    ap.add_argument("--run", type=int, default=None, help="Run number")
+
+    if include_occ:
+        ap.add_argument("--occ", type=int, default=int(occ_default), help="IDS occurrence number")
+
+    if include_ids:
+        if ids_choices:
+            ap.add_argument("--ids", default=ids_default, choices=ids_choices, help="IDS name")
+        else:
+            ap.add_argument("--ids", default=ids_default, help="IDS name")
+
+    if include_backend:
+        ap.add_argument("--backend", default=backend_default, help="IMAS backend (usually 'hdf5')")
+
+
+def resolve_entry_path(args: Any) -> Path:
+    """Resolve entry directory from parsed args (see add_entry_args)."""
+    if getattr(args, "entry", None):
+        return Path(str(args.entry)).expanduser().resolve()
+
+    dd = getattr(args, "dd", None)
+    ddv = getattr(args, "dd_version", None)
+    pulse = getattr(args, "pulse", None)
+    run = getattr(args, "run", None)
+    dbpath = getattr(args, "dbpath", ".")
+
+    missing = [k for k, v in (("dd", dd), ("dd_version", ddv), ("pulse", pulse), ("run", run)) if v is None]
+    if missing:
+        raise SystemExit(
+            "Provide either --entry, or all of: --dbpath --dd --dd-version --pulse --run. "
+            f"Missing: {', '.join(missing)}"
+        )
+
+    dd_dir = dd_version_dirname(str(ddv))
+    return entry_dir(dbpath, str(dd), str(ddv), int(pulse), int(run), dd_version_dir=dd_dir)
+
+
+def infer_ids_h5_path(entry: str | Path, ids_name: str, occ: int) -> Path:
+    """Infer IDS HDF5 filename for an entry and occurrence (robust for occ=0)."""
+    entry = Path(entry).expanduser().resolve()
+    ids_name = str(ids_name).strip()
+    occ = int(occ)
+
+    cands: List[Path] = []
+    if occ == 0:
+        cands += [
+            entry / f"{ids_name}.h5",
+            entry / f"{ids_name}_0.h5",
+            entry / f"{ids_name}_{occ}.h5",
+        ]
+    else:
+        cands += [
+            entry / f"{ids_name}_{occ}.h5",
+            entry / f"{ids_name}.h5",
+        ]
+
+    for fp in cands:
+        if fp.exists():
+            return fp
+
+    # Fall back to conventional name to make downstream errors readable
+    return entry / f"{ids_name}_{occ}.h5"
+
+
+def open_ids_h5(entry: str | Path, ids_name: str, occ: int, mode: str = "r"):
+    """Open an IDS HDF5 file and return (h5file, group, h5_path, group_name).
+
+    Handles the common occ=0 convention where the group is '/<ids>' rather than '/<ids>_0'.
+    """
+    try:
+        import h5py  # type: ignore
+    except Exception as e:
+        raise SystemExit(f"h5py is required for HDF5 access: {e}")
+
+    h5_path = infer_ids_h5_path(entry, ids_name, occ)
+    f = h5py.File(str(h5_path), mode)
+
+    ids_name = str(ids_name).strip()
+    occ = int(occ)
+
+    if occ == 0:
+        group_candidates = [ids_name, f"{ids_name}_0", f"{ids_name}_{occ}"]
+    else:
+        group_candidates = [f"{ids_name}_{occ}", ids_name]
+
+    for grp_name in group_candidates:
+        if grp_name in f:
+            return f, f[grp_name], h5_path, grp_name
+
+    f.close()
+    tried = ", ".join([f"/{g}" for g in group_candidates])
+    raise RuntimeError(f"Group not found in {h5_path}. Tried: {tried}")
+
+
+def h5_get_first_existing(g: Any, names: List[str]) -> Optional[str]:
+    """Return first dataset/group name that exists in group g (relative key)."""
+    for nm in names:
+        try:
+            if nm in g:
+                return nm
+        except Exception:
+            continue
+    return None
+
+
+def normalize_out_and_show(out: Optional[str], show: bool = False) -> Tuple[Optional[str], bool]:
+    """Normalize plotting output arguments.
+
+    Conventions used across plotting utilities:
+      - out is None or 'X11' (case-insensitive) => interactive display
+      - otherwise out is treated as a file path to save
+      - --show forces interactive display even when saving
+
+    Returns
+    -------
+    (out_path, do_show)
+      out_path: None if no file should be saved
+      do_show : True if plt.show() should be called
+    """
+    if out is None:
+        return None, True
+
+    s = str(out).strip()
+    if s == "":
+        return None, True
+
+    if s.upper() == "X11":
+        return None, True
+
+    return s, bool(show)
+
+
+def h5_list_keys(
+    g: Any,
+    *,
+    prefix: Optional[str] = None,
+    suffix: Optional[str] = None,
+    exclude_shape: bool = True,
+) -> List[str]:
+    """List keys under an IDS group (filtered by prefix/suffix)."""
+    out: List[str] = []
+    try:
+        keys = list(g.keys())
+    except Exception:
+        keys = []
+    for k in keys:
+        if not isinstance(k, str):
+            continue
+        if prefix and not k.startswith(prefix):
+            continue
+        if suffix and not k.endswith(suffix):
+            continue
+        if exclude_shape and (k.endswith('_SHAPE') or k.endswith('AOS_SHAPE')):
+            continue
+        out.append(k)
+    return sorted(out)
+
+
+def format_alias_map(alias_map: Dict[str, List[str]]) -> str:
+    """Human-friendly alias listing (stable order)."""
+    return ", ".join(sorted(alias_map.keys()))

@@ -29,6 +29,8 @@ import numpy as np
 
 import matplotlib.pyplot as plt
 
+from matplotlib.colors import LogNorm, SymLogNorm
+
 from pathlib import Path
 
 from nimrod2imas import (
@@ -50,6 +52,76 @@ except Exception:
     cmr = None  # type: ignore
 # IMAS integer placeholder commonly used for "not set" in many DDs
 PLACEHOLDER_INT = -999999999
+
+
+# Field aliases (user -> canonical) for --field
+_FIELD_ALIASES = {
+    'p': ['p', 'pressure'],
+    't': ['t', 'temperature'],
+    'n': ['n', 'mass_density'],
+    'b': ['b', 'bfield', 'b_field'],
+    'v': ['v', 'vel', 'velocity'],
+}
+
+
+def _canonical_field(field: str) -> str:
+    f = (field or '').strip().lower()
+    for canon, names in _FIELD_ALIASES.items():
+        if f == canon or f in names:
+            return canon
+    return f
+
+
+def _node_info(node: Any):
+    # Best-effort presence/shape for complex nodes (real/imaginary).
+    try:
+        re_a = np.asarray(node.real)
+        im_a = np.asarray(node.imaginary)
+        present = (re_a.size > 0) or (im_a.size > 0)
+        return present, f"real{tuple(re_a.shape)} imag{tuple(im_a.shape)}"
+    except Exception:
+        return False, '(unavailable)'
+
+
+def _print_field_help(ts: Any, mi: int):
+    tm = ts.toroidal_mode[mi]
+    pl = tm.plasma
+
+    print('')
+    print('Available fields and aliases for mhd_linear:')
+    print('  Scalars:')
+    ok, s = _node_info(getattr(pl, 'pressure_perturbed', None))
+    print(f"    - p / pressure           -> pressure_perturbed      : {'OK' if ok else 'MISSING'} ({s})")
+    ok, s = _node_info(getattr(pl, 'temperature_perturbed', None))
+    print(f"    - t / temperature        -> temperature_perturbed   : {'OK' if ok else 'MISSING'} ({s})")
+    ok, s = _node_info(getattr(pl, 'mass_density_perturbed', None))
+    print(f"    - n / mass_density       -> mass_density_perturbed  : {'OK' if ok else 'MISSING'} ({s})")
+
+    print('  Vectors (require --component r|z|phi):')
+    try:
+        b = pl.b_field_perturbed
+        ok1, s1 = _node_info(b.coordinate1)
+        ok2, s2 = _node_info(b.coordinate2)
+        ok3, s3 = _node_info(b.coordinate3)
+        print(f"    - b / bfield             -> b_field_perturbed       : r={'OK' if ok1 else 'MISSING'} ({s1}), z={'OK' if ok2 else 'MISSING'} ({s2}), phi={'OK' if ok3 else 'MISSING'} ({s3})")
+    except Exception:
+        print('    - b / bfield             -> b_field_perturbed       : (unavailable)')
+
+    try:
+        v = pl.velocity_perturbed
+        ok1, s1 = _node_info(v.coordinate1)
+        ok2, s2 = _node_info(v.coordinate2)
+        ok3, s3 = _node_info(v.coordinate3)
+        print(f"    - v / vel / velocity     -> velocity_perturbed      : r={'OK' if ok1 else 'MISSING'} ({s1}), z={'OK' if ok2 else 'MISSING'} ({s2}), phi={'OK' if ok3 else 'MISSING'} ({s3})")
+    except Exception:
+        print('    - v / vel / velocity     -> velocity_perturbed      : (unavailable)')
+
+    print('')
+    print('Parts (--part): real | imag | amp')
+    print('Normalization (--norm): linear | log | symlog')
+    print('  - log requires strictly positive data (typical with --part amp).')
+    print('  - symlog supports signed data; adjust --linthresh if needed.')
+    print('')
 
 
 def _leaf_value(x: Any) -> Any:
@@ -158,6 +230,45 @@ def _resolve_cmap(cmap: Optional[str], part: str) -> str:
             f"Unknown colormap {cmap!r}. Use --list-cmaps to see available names."
         )
     return cmap
+
+
+
+def _build_norm_and_levels(F2d: np.ndarray, nlevels: int, norm_kind: str = 'linear', linthresh: float = 1e-6):
+    """Build (norm, levels) for contourf based on requested normalization.
+
+    - linear: norm=None, levels=int(nlevels)
+    - log: LogNorm with log-spaced levels (requires positive finite data)
+    - symlog: SymLogNorm with integer levels (works with signed data)
+    """
+    norm_kind = (norm_kind or 'linear').lower()
+    vv = np.asarray(F2d, dtype=float)
+    vv = vv[np.isfinite(vv)]
+    if vv.size == 0:
+        return None, int(nlevels)
+
+    if norm_kind in ('linear', 'none'):
+        return None, int(nlevels)
+
+    if norm_kind == 'log':
+        pos = vv[vv > 0]
+        if pos.size == 0:
+            raise RuntimeError('Log normalization requires positive data. Use --part amp or --norm symlog for signed data.')
+        vmin = float(pos.min())
+        vmax = float(pos.max())
+        if vmax <= vmin:
+            vmax = vmin * 10.0
+        levels = np.logspace(np.log10(vmin), np.log10(vmax), int(nlevels))
+        return LogNorm(vmin=vmin, vmax=vmax), levels
+
+    if norm_kind == 'symlog':
+        absmax = float(np.max(np.abs(vv)))
+        if absmax == 0.0:
+            absmax = 1.0
+        lt = float(linthresh) if linthresh and linthresh > 0 else absmax * 1e-3
+        return SymLogNorm(linthresh=lt, vmin=-absmax, vmax=absmax), int(nlevels)
+
+    raise RuntimeError(f'Unknown --norm {norm_kind!r} (use linear|log|symlog).')
+
 # ----------------------------- IMAS helpers -----------------------------
 
 def _open_dbentry(backend: str, entry_dir: str, mode: str = "r", dd_version: str | None = None):
@@ -356,7 +467,7 @@ def _extract_rz_and_field(ts: Any, mi: int, field: str, part: str, component: Op
     except Exception:
         pass
 
-    field = field.lower()
+    field = _canonical_field(field)
     title = ""
 
     if field in ("p", "pressure"):
@@ -477,8 +588,6 @@ def main():
 
     ap.add_argument("--dd", required=True)
     ap.add_argument("--dd-version", dest="dd_version", required=True)
-    ap.add_argument("--dd-version-dir", choices=["major", "full"], default="major",
-                    help="Directory component for DD version (default: major, e.g. 3 for 3.42.0)")
     ap.add_argument("--pulse", type=int, required=True)
     ap.add_argument("--run", type=int, required=True)
     ap.add_argument("--occ", type=int, default=0)
@@ -495,9 +604,12 @@ def main():
     ap.add_argument("--n-tor", dest="n_tor", type=int, default=None)
 
     ap.add_argument("--info", action="store_true")
-    ap.add_argument("--field", default=None, choices=["p", "t", "n", "b", "v"])
+    ap.add_argument("--field", default=None, help="Field to plot (aliases: p/pressure, t/temperature, n/mass_density, b/bfield, v/vel/velocity)")
     ap.add_argument("--part", default="real", choices=["real", "imag", "amp"])
     ap.add_argument("--component", default=None, choices=["r", "z", "phi"])
+    ap.add_argument("--help-fields", action="store_true", help="Print available fields/aliases for the selected time/mode and exit")
+    ap.add_argument("--norm", default="linear", choices=["linear", "log", "symlog"], help="Color normalization for contours")
+    ap.add_argument("--linthresh", type=float, default=1e-6, help="linthresh for symlog normalization")
     ap.add_argument("--levels", type=int, default=80)
     ap.add_argument("--cmap", default=None, help="Matplotlib colormap name (e.g. viridis, RdBu_r, cmr.gothic)")
     ap.add_argument("--list-cmaps", action="store_true", help="List available colormap names and exit")
@@ -536,7 +648,7 @@ def main():
             str(args.dd_version),
             int(args.pulse),
             int(args.run),
-            dd_version_dir=str(args.dd_version_dir),
+            dd_version_dir=str(args.dd_version[0]),
         )
     print(f"IMAS entry directory: {entry_dir}")
 
@@ -551,13 +663,22 @@ def main():
         if args.field is None:
             return 0
 
-    if args.field is None:
-        raise RuntimeError("Provide --field (or use --info).")
+    if args.field is None and not args.help_fields:
+        raise RuntimeError("Provide --field (or use --info / --help-fields).")
 
     raw_i, ts, nonempty = _pick_time_slice(mhd, int(args.time_index), bool(args.raw_time_index))
     mi = _select_mode_index(ts, args.n_tor, args.mode_index)
 
-    R2d, Z2d, F2d, title = _extract_rz_and_field(ts, mi, args.field, args.part, args.component)
+    if args.help_fields:
+        _print_field_help(ts, mi)
+        return 0
+
+    try:
+        R2d, Z2d, F2d, title = _extract_rz_and_field(ts, mi, args.field, args.part, args.component)
+    except Exception as e:
+        print(f"ERROR: {e}")
+        _print_field_help(ts, mi)
+        raise
 
     # Prefer the stored toroidal mode number when present; otherwise show the requested selection.
     stored_n_tor = None
@@ -583,7 +704,8 @@ def main():
         args.title = f"occ={args.occ} raw_ts={raw_i} time={_ts_time(ts):.6g} n_tor={n_tor_label} {title} ({args.part})"
 
     fig, ax = plt.subplots()
-    cf = ax.contourf(R2d, Z2d, F2d, levels=int(args.levels), cmap=_resolve_cmap(args.cmap, args.part))
+    norm, lev = _build_norm_and_levels(F2d, int(args.levels), norm_kind=str(args.norm), linthresh=float(args.linthresh))
+    cf = ax.contourf(R2d, Z2d, F2d, levels=lev, cmap=_resolve_cmap(args.cmap, args.part), norm=norm)
     fig.colorbar(cf, ax=ax)
     ax.set_xlabel("R")
     ax.set_ylabel("Z")

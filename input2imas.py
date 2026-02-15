@@ -52,10 +52,24 @@ For the namelists, we do:
 
 import argparse
 import os
+import sys
+from pathlib import Path
 import numpy as np
 
+import hashlib
+from datetime import datetime, timezone
+import yaml
+
 import imas
-from nimrod2imas import entry_dir, open_dbentry, put_ids, value_to_string as _nimrod_value_to_string
+from nimrod2imas import (
+    entry_dir,
+    open_dbentry,
+    put_ids,
+    value_to_string as _nimrod_value_to_string,
+    update_workflow_and_dataset_fair,
+    sanitize_cli_command,
+    ids_factory,
+)
 from imas import IDSFactory
 
 import f90nml
@@ -89,6 +103,297 @@ def all_zero(arr, tol=1e-12):
 def value_to_string(val):
     """Convert Python value to token string for XML (delegates to nimrod2imas.value_to_string)."""
     return _nimrod_value_to_string(val)
+
+
+def load_metadata_yaml(yaml_path):
+    """Load optional metadata YAML.
+
+    Returns an empty dict on missing/invalid YAML, but prints a warning.
+    """
+    if not yaml_path:
+        print("Warning: --input YAML was not provided; summary/dataset_fair/workflow will be written with minimal metadata.")
+        return {}
+    yaml_path = os.path.abspath(os.path.expanduser(str(yaml_path)))
+    if not os.path.isfile(yaml_path):
+        print(f"Warning: metadata YAML not found: {yaml_path}. Proceeding without it.")
+        return {}
+    try:
+        with open(yaml_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        if not isinstance(data, dict):
+            print(f"Warning: metadata YAML root is not a mapping/dict: {yaml_path}. Proceeding without it.")
+            return {}
+        return data
+    except Exception as exc:
+        print(f"Warning: failed to read metadata YAML {yaml_path}: {exc}. Proceeding without it.")
+        return {}
+
+
+def yget(dct, *keys, default=None):
+    """Nested dict getter."""
+    cur = dct
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def file_checksum(path, algo="sha256", chunk_bytes=1024 * 1024):
+    """Compute file checksum (default sha256). Returns '' on errors."""
+    if not path:
+        return ""
+    path = os.path.abspath(os.path.expanduser(str(path)))
+    if not os.path.isfile(path):
+        return ""
+    try:
+        h = hashlib.new(algo)
+        with open(path, "rb") as f:
+            while True:
+                b = f.read(chunk_bytes)
+                if not b:
+                    break
+                h.update(b)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
+def build_input2imas_workflow_parameters_xml(args, dd_version, meta, extra_files=None):
+    """Build XML string describing input2imas run parameters (incl. optional checksums)."""
+    root = ET.Element("nimrod2imas_input2imas")
+
+    def add_text(parent, tag, text):
+        el = ET.SubElement(parent, tag)
+        el.text = "" if text is None else str(text)
+        return el
+
+    add_text(root, "script", os.path.basename(__file__))
+    add_text(root, "script_version", __version__)
+    add_text(root, "script_repository", "https://github.com/PrincetonUniversity/nimrod2imas")
+    add_text(root, "dd_version", dd_version)
+    add_text(root, "backend", getattr(args, "backend", ""))
+    add_text(root, "entry_path", getattr(args, "entry", "") or "")
+    add_text(root, "dbpath", getattr(args, "dbpath", "") or "")
+    add_text(root, "dd", getattr(args, "dd", "") or "")
+    add_text(root, "pulse", getattr(args, "pulse", "") or "")
+    add_text(root, "run", getattr(args, "run", "") or "")
+    add_text(root, "occ_inputs", getattr(args, "occ", 0))
+
+    # Input file paths
+    files_el = ET.SubElement(root, "inputs")
+    in_files = {
+        "geqdsk": getattr(args, "geqdsk", None),
+        "peqdsk": getattr(args, "peqdsk", None),
+        "nimeq_in": getattr(args, "nimeq", None),
+        "oculus_in": getattr(args, "oculus", None),
+        "fluxgrid_in": getattr(args, "fluxgrid", None),
+        "nimrod_in": getattr(args, "nimrod", None),
+    }
+    if extra_files:
+        in_files.update(extra_files)
+
+    for role, pth in in_files.items():
+        if pth is None:
+            continue
+        pth_abs = os.path.abspath(os.path.expanduser(str(pth)))
+        el = ET.SubElement(files_el, "file", role=role)
+        el.set("path", pth_abs)
+
+    # Optional checksums (controlled by YAML: converter.record_checksums)
+    rec_cs = bool(yget(meta, "converter", "record_checksums", default=False))
+    algo = str(yget(meta, "converter", "checksum_algorithm", default="sha256") or "sha256").strip() or "sha256"
+    if rec_cs:
+        cs_el = ET.SubElement(root, "checksums", algorithm=algo)
+        for role, pth in in_files.items():
+            if not pth:
+                continue
+            pth_abs = os.path.abspath(os.path.expanduser(str(pth)))
+            h = file_checksum(pth_abs, algo=algo)
+            if h:
+                fel = ET.SubElement(cs_el, "file", role=role)
+                fel.set("path", pth_abs)
+                fel.text = h
+
+    return ET.tostring(root, encoding="unicode")
+
+
+def attach_ids_properties_minimal(ids_obj, provider=None, comment=None, homogeneous_time=2):
+    """Best-effort fill ids_properties fields."""
+    try:
+        ip = getattr(ids_obj, "ids_properties", None)
+        if ip is None:
+            return
+        if hasattr(ip, "homogeneous_time"):
+            ip.homogeneous_time = int(homogeneous_time)
+        if provider and hasattr(ip, "provider"):
+            ip.provider = str(provider)
+        if hasattr(ip, "creation_date"):
+            try:
+                ip.creation_date = datetime.now(timezone.utc).isoformat()
+            except Exception:
+                pass
+        if comment and hasattr(ip, "comment"):
+            prev = str(getattr(ip, "comment", "") or "").strip()
+            ip.comment = (prev + "\n" + str(comment)).strip() if prev else str(comment)
+    except Exception:
+        pass
+
+
+def build_summary_ids(factory, args, meta, geq=None, time0=0.0):
+    """Create minimal DD4.1-friendly summary IDS."""
+    s = factory.summary()
+
+    machine = (getattr(args, "dd", None) or yget(meta, "imas", "machine", default=None) or yget(meta, "machine", default=None) or "")
+    pulse = getattr(args, "pulse", None)
+    if pulse is None:
+        pulse = yget(meta, "imas", "pulse", default=None)
+
+    descr = yget(meta, "dataset", "description", default=None) or yget(meta, "description", default=None)
+    if not descr:
+        descr = "NIMROD simulation inputs converted to IMAS (equilibrium, core_profiles, wall) using nimrod2imas input2imas.py"
+
+    # type is an identifier structure; set name if available
+    try:
+        if hasattr(s, "type") and hasattr(s.type, "name"):
+            s.type.name = "simulation"
+        elif hasattr(s, "type"):
+            s.type = "simulation"
+    except Exception:
+        pass
+
+    try:
+        if hasattr(s, "machine"):
+            s.machine = str(machine)
+    except Exception:
+        pass
+    try:
+        if hasattr(s, "pulse") and pulse is not None:
+            s.pulse = int(pulse)
+    except Exception:
+        pass
+    try:
+        if hasattr(s, "description"):
+            s.description = str(descr)
+    except Exception:
+        pass
+
+    provider = yget(meta, "contact", "provider", default=None) or yget(meta, "provider", default=None)
+    attach_ids_properties_minimal(s, provider=provider, comment="Generated by nimrod2imas input2imas.py", homogeneous_time=2)
+    return s
+
+
+def build_dataset_fair_ids(factory, meta):
+    """Create dataset_fair IDS from YAML (DD4.1)."""
+    df = factory.dataset_fair()
+
+    identifier = yget(meta, "dataset", "identifier", default="") or ""
+    replaces = yget(meta, "dataset", "replaces", default="") or ""
+    is_replaced_by = yget(meta, "dataset", "is_replaced_by", default="") or ""
+    valid = yget(meta, "dataset", "valid", default="") or ""
+    rights_holder = yget(meta, "dataset", "rights_holder", default="") or ""
+    license_ = yget(meta, "dataset", "license", default="") or ""
+
+    for attr, val in (("identifier", identifier),
+                      ("replaces", replaces),
+                      ("is_replaced_by", is_replaced_by),
+                      ("valid", valid),
+                      ("rights_holder", rights_holder),
+                      ("license", license_)):
+        try:
+            if hasattr(df, attr) and val:
+                setattr(df, attr, str(val))
+        except Exception:
+            pass
+
+    descr = yget(meta, "dataset", "description", default=None) or None
+    provider = yget(meta, "contact", "provider", default=None) or yget(meta, "provider", default=None)
+    attach_ids_properties_minimal(df, provider=provider, comment=descr, homogeneous_time=2)
+    return df
+
+
+def build_workflow_ids(factory, args, dd_version, meta, nimrod_inputs_xml=None, fgnimeq_inputs_xml=None):
+    """Create workflow IDS describing NIMROD + conversion tools."""
+    wf = factory.workflow()
+    provider = yget(meta, "contact", "provider", default=None) or yget(meta, "provider", default=None)
+    attach_ids_properties_minimal(
+        wf,
+        provider=provider,
+        comment="Workflow metadata for NIMROD and nimrod2imas conversion",
+        homogeneous_time=2,
+    )
+
+    comps = []
+
+    # Component: NIMROD (metadata mostly from YAML)
+    comps.append({
+        "name": yget(meta, "nimrod", "name", default="NIMROD") or "NIMROD",
+        "description": yget(meta, "nimrod", "description", default="Extended-MHD code") or "Extended-MHD code",
+        "repository": yget(meta, "nimrod", "repository", default="") or "",
+        "commit": yget(meta, "nimrod", "commit", default="") or "",
+        "version": yget(meta, "nimrod", "version", default="") or "",
+        "parameters": yget(meta, "nimrod", "parameters_xml", default="") or "",
+    })
+
+    # Component: input2imas converter (fixed repo + version from this script)
+    conv_commit = yget(meta, "converter", "commit", default="") or ""
+    conv_repo = yget(meta, "converter", "repository", default="https://github.com/PrincetonUniversity/nimrod2imas") or "https://github.com/PrincetonUniversity/nimrod2imas"
+    conv_params = build_input2imas_workflow_parameters_xml(args, dd_version, meta)
+
+    # Optionally embed the input XML blobs inside parameters for easier provenance tracking
+    try:
+        root = ET.fromstring(conv_params)
+        if nimrod_inputs_xml is not None:
+            root.append(ET.fromstring(ET.tostring(nimrod_inputs_xml, encoding='unicode')))
+        if fgnimeq_inputs_xml is not None:
+            root.append(ET.fromstring(ET.tostring(fgnimeq_inputs_xml, encoding='unicode')))
+        conv_params = ET.tostring(root, encoding="unicode")
+    except Exception:
+        pass
+
+    comps.append({
+        "name": "nimrod2imas:input2imas",
+        "description": "Convert NIMROD input files (GEQDSK/PEQDSK + namelists) to IMAS",
+        "repository": str(conv_repo),
+        "commit": str(conv_commit),
+        "version": __version__,
+        "parameters": conv_params,
+    })
+
+    # Optional component: fgnimeq (if XML exists)
+    if fgnimeq_inputs_xml is not None:
+        comps.append({
+            "name": "fgnimeq",
+            "description": "NIMROD preprocessing inputs (grid/equilibrium mapping)",
+            "repository": yget(meta, "fgnimeq", "repository", default="") or "",
+            "commit": yget(meta, "fgnimeq", "commit", default="") or "",
+            "version": yget(meta, "fgnimeq", "version", default="") or "",
+            "parameters": ET.tostring(fgnimeq_inputs_xml, encoding="unicode") if isinstance(fgnimeq_inputs_xml, ET.Element) else str(fgnimeq_inputs_xml),
+        })
+
+    # Attach to workflow.time_loop.component array
+    try:
+        comp_arr = wf.time_loop.component
+        try:
+            comp_arr.resize(len(comps))
+        except Exception:
+            pass
+        for i, c in enumerate(comps):
+            comp = comp_arr[i]
+            for fld in ("name", "description", "repository", "commit", "version", "parameters"):
+                val = c.get(fld, "")
+                if val is None:
+                    continue
+                try:
+                    if hasattr(comp, fld) and val != "":
+                        setattr(comp, fld, str(val))
+                except Exception:
+                    pass
+    except Exception as exc:
+        print(f"Warning: could not populate workflow IDS components: {exc}")
+
+    return wf
+
 def build_namelist_xml(tag, path):
     """Read Fortran namelist file with f90nml and return an XML element.
 
@@ -561,13 +866,28 @@ def fill_core_profiles_from_pfile(cp_ids, pfile_path, geq, time=0.0):
         prof.electrons.temperature = te_keV * 1.0e3  # keV -> eV
 
     # ------------------------------------------------------------------
-    # total pressure: ptot in kPa, core_profiles.pressure_perpendicular in Pa
-    # we use 3*pressure_perpendicular ~ total pressure
+    # total (scalar) pressure
+    #
+    # p-file ptot is provided in kPa. In IMAS core_profiles the preferred
+    # isotropic storage is profiles_1d[].pressure_thermal (or pressure, depending
+    # on DD version). We therefore store ptot directly as Pa in that leaf.
+    #
+    # Backward-compatibility:
+    #   - If neither pressure_thermal nor pressure exist in the local IMAS build,
+    #     we fall back to pressure_perpendicular assuming an isotropic pressure
+    #     tensor:  ptot ~= 3 * p_perp  (so p_perp = ptot/3).
     # ------------------------------------------------------------------
     if "ptot" in p:
         ptot_kPa = map_to_rho(p["ptot"]["data"])
-        prof.pressure_perpendicular = ptot_kPa * 1.0e3 / 3.0
-
+        ptot_Pa = ptot_kPa * 1.0e3
+    
+        if hasattr(prof, "pressure_thermal"):
+            prof.pressure_thermal = ptot_Pa
+        elif hasattr(prof, "pressure"):
+            prof.pressure = ptot_Pa
+        elif hasattr(prof, "pressure_perpendicular"):
+            # last-resort fallback (legacy files): isotropic approximation
+            prof.pressure_perpendicular = ptot_Pa / 3.0    
     # ------------------------------------------------------------------
     # species composition from N Z A (no hard-coded Z/A)
     # ------------------------------------------------------------------
@@ -739,6 +1059,9 @@ def main():
     parser.add_argument("geqdsk", help="input GEQDSK file")
     parser.add_argument("peqdsk", help="input P-EQDSK (p-file)")
 
+    parser.add_argument("--input", dest="input_yaml", default=None,
+                        help="Optional YAML metadata file for summary/dataset_fair/workflow")
+
     parser.add_argument("--nimeq", help="nimeq.in input file for FGnimeq", default='nimeq.in')
     parser.add_argument("--oculus", help="oculus.in input file for FGnimeq", default='oculus.in')
     parser.add_argument("--fluxgrid", help="fluxgrid.in input file for FGnimeq", default='fluxgrid.in')
@@ -752,16 +1075,21 @@ def main():
                         help="IMAS backend (default: hdf5)")
     parser.add_argument("--dbpath", default=".", help="DB root path (output directory)")
     parser.add_argument("--dd-version", default=None, help="IMAS DD version (defaults to $IMAS_VERSION)")
-    parser.add_argument("--dd-version-dir", choices=["major","full"], default="major",
-                        help="Directory component for DD version (major or full)")
     parser.add_argument("--entry", default=None,
                         help="Explicit entry directory override (otherwise use dbpath/dd/dd-version-dir/pulse/run)")
     parser.add_argument("--mode", default="a", help="DBEntry open mode: r/a/w/x")
+    parser.add_argument("--no-checksums", dest="record_checksums", action="store_false",
+                        help="Disable provenance file checksums in workflow/dataset_fair IDSs.")
+    parser.set_defaults(record_checksums=True)
+    parser.add_argument("--checksum-algorithm", default="sha256",
+                        help="Hash algorithm for provenance checksums (sha256, sha1, md5, ...).")
     parser.add_argument("--occ", type=int, default=0, help="Occurrence to write")
     parser.add_argument("--occ-base", dest="occ", type=int, help="Alias for --occ")
 
     args = parser.parse_args()
 
+    # Optional dataset/workflow metadata
+    meta = load_metadata_yaml(getattr(args, 'input_yaml', None))
 
     # Resolve DD version early and align IDSFactory
     dd_version = (args.dd_version or os.environ.get('IMAS_VERSION') or '').strip()
@@ -774,7 +1102,7 @@ def main():
     if args.entry:
         entry_path = os.path.abspath(os.path.expanduser(args.entry))
     else:
-        entry_path = str(entry_dir(args.dbpath, args.dd, dd_version, args.pulse, args.run, args.dd_version_dir))
+        entry_path = str(entry_dir(args.dbpath, args.dd, dd_version, args.pulse, args.run, args.dd_version[0]))
 
     time0 = 0.0
     mhd_ids = None  # optional NIMROD mhd IDS
@@ -838,14 +1166,39 @@ def main():
             except Exception as exc2:
                 print(f"Warning: could not attach NIMROD XML to core_profiles.code: {exc2}")
 
+
+    # --- create metadata IDSs (summary, dataset_fair, workflow) ---
+    # Note: dataset_fair has maximum occurrences=1; these IDSs are written to occurrence 0.
+    try:
+        summary_ids = build_summary_ids(_ids_factory, args, meta, geq=geq, time0=time0)
+    except Exception as exc:
+        print(f"Warning: failed to build summary IDS: {exc}")
+        summary_ids = None
+
+    try:
+        dataset_fair_ids = build_dataset_fair_ids(_ids_factory, meta)
+    except Exception as exc:
+        print(f"Warning: failed to build dataset_fair IDS: {exc}")
+        dataset_fair_ids = None
+
+    workflow_ids = None  # workflow provenance is recorded incrementally via update_workflow_and_dataset_fair()
+
     # --- build wall from GEQDSK limiter ---
     wall_ids = geqdsk_to_wall(geq, time=time0)
 
     # --- write to IMAS DBEntry (same directory layout as dump2imas.py) ---
 
-    db, uri, _ = open_dbentry(args.backend, entry_path, mode=args.mode, dd_version=dd_version)
+    db, uri, imas_mod = open_dbentry(args.backend, entry_path, mode=args.mode, dd_version=dd_version)
+    factory = ids_factory(imas_mod, dd_version)
     print(f"IMAS entry directory: {entry_path}")
     print(f"IMAS URI: {uri}")
+
+    # Write entry-level metadata IDSs to occurrence 0 (DD4.1 expects single occurrence)
+    meta_occ = 0
+    if summary_ids is not None:
+        put_ids(db, summary_ids, meta_occ)
+    if dataset_fair_ids is not None:
+        put_ids(db, dataset_fair_ids, meta_occ)
 
     put_ids(db, eq_ids, args.occ)
     put_ids(db, cp_ids, args.occ)
@@ -853,14 +1206,45 @@ def main():
     if mhd_ids is not None:
         put_ids(db, mhd_ids, args.occ)
 
+    # --- append per-step provenance (workflow + dataset_fair) ---
+    try:
+        pfiles = []
+        for p in [getattr(args, "input_yaml", None), args.geqdsk, args.peqdsk,
+                  getattr(args, "nimeq", None), getattr(args, "oculus", None),
+                  getattr(args, "fluxgrid", None), getattr(args, "nimrod", None)]:
+            if p and os.path.isfile(str(p)):
+                pfiles.append(str(p))
+
+        cmd = sanitize_cli_command(list(sys.argv), known_files=pfiles)
+        update_workflow_and_dataset_fair(
+            db, factory,
+            component_name="nimrod2imas:input2imas",
+            component_description="Convert NIMROD input files (GEQDSK/PEQDSK + namelists) to IMAS",
+            component_repository="https://github.com/PrincetonUniversity/nimrod2imas",
+            component_version=str(__version__),
+            exec_command=cmd,
+            input_files=pfiles,
+            record_checksums=bool(getattr(args, "record_checksums", True)),
+            checksum_algorithm=str(getattr(args, "checksum_algorithm", "sha256") or "sha256"),
+            workflow_occ=0,
+            dataset_fair_occ=0,
+            extra_kv={
+                "dd": str(args.dd),
+                "dd_version": str(dd_version),
+                "pulse": str(args.pulse),
+                "run": str(args.run),
+                "occ": str(int(getattr(args, "occ", 0) or 0)),
+            },
+        )
+    except Exception as exc:
+        print(f"Warning: provenance update failed: {exc}")
     try:
         db.close()
     except Exception:
         pass
 
-    print(f"Saved equilibrium, core_profiles, wall (and mhd if present) to IMAS entry: {entry_path} (occ={args.occ})")
+    print(f"Saved summary, dataset_fair, equilibrium, core_profiles, wall (and mhd if present) to IMAS entry: {entry_path} (occ={args.occ})")
 
 
 if __name__ == "__main__":
     main()
-

@@ -52,11 +52,12 @@ import xml.etree.ElementTree as ET
 
 from nimrod2imas import (
     entry_dir as _entry_dir_common,
-    dd_version_dirname as _dd_version_dirname,
     open_dbentry as _open_db_common,
     ids_factory as _ids_factory_common,
     value_to_string as _value_to_string_common,
     namelist_file_to_xml as _namelist_file_to_xml_common,
+    update_workflow_and_dataset_fair as _update_workflow_and_dataset_fair_common,
+    sanitize_cli_command as _sanitize_cli_command_common,
 )
 
 def _import_imas():
@@ -268,11 +269,6 @@ def _sanity_print_cocos(tag: str, src_name: str, t: float, payload: Dict[str, An
 
     print("\n".join(lines), flush=True)
 
-def _value_to_string(v: Any) -> str:
-    """Serialize values to XML text consistently across tools."""
-    return _value_to_string_common(v)
-
-
 
 def _build_nimrod_xml(nimrod_path: Optional[str]) -> str:
     """Build an XML string for nimrod.in, matching input2imas semantics.
@@ -454,6 +450,25 @@ def _aos_len(aos: Any) -> int:
         return 0
 
 
+
+def _aos_has_entries(aos: Any) -> bool:
+    """True if an IMAS AoS node appears to have at least one entry.
+
+    Some IMAS-Python builds implement __len__ incorrectly (returning 0 even when
+    indexing works), so we check both metadata length and an index probe.
+    """
+    try:
+        if _aos_len(aos) > 0:
+            return True
+    except Exception:
+        pass
+    try:
+        _ = aos[0]  # type: ignore[index]
+        return True
+    except Exception:
+        return False
+
+
 def _is_time_placeholder(x: Any) -> bool:
     """Detect IMAS placeholder / uninitialized time values.
 
@@ -490,7 +505,7 @@ def _normalize_mode(mode: str) -> str:
     return mode
 
 
-def _entry_dir(dbpath: Path, dd: str, dd_version: str, pulse: int, run: int, dd_version_dir: str = 'major') -> Path:
+def _entry_dir(dbpath: Path, dd: str, dd_version: str, pulse: int, run: int, dd_version_dir: str = '4') -> Path:
     return _entry_dir_common(dbpath, dd, dd_version, pulse, run, dd_version_dir=dd_version_dir)
 
 
@@ -617,13 +632,25 @@ def _db_put_slice(db: Any, ids: Any, occ: int) -> None:
             return
 
     # Fallback: some backends expose the lower-level signature put(ids, occ, is_slice)
-    try:
-        db.put(ids, occ, True)
-        return
-    except Exception:
-        pass
+    # (IMAS-Python variants differ: is_slice may be boolean or integer).
+    for is_slice in (True, 1):
+        try:
+            db.put(ids, occ, is_slice)
+            return
+        except TypeError:
+            pass
+        except Exception:
+            pass
 
-    raise RuntimeError("DBEntry does not support put_slice() in this IMAS-Python/IMAS-Core build")
+    # Final fallback: normal put() of the in-memory IDS.
+    # This may overwrite rather than append on some backends, but it ensures the IDS is persisted
+    # for IMAS builds that do not support put_slice()/is_slice.
+    try:
+        db.put(ids, occ)
+        return
+    except TypeError:
+        db.put(ids)
+        return
 
 
 def _append_time_equilibrium(eq: Any, t: float) -> int:
@@ -1320,9 +1347,10 @@ def _expand_single_ion_to_e_plus_main(
 
     ne = _np.asarray(nq[..., 0], dtype=float)
 
-    # If Z is unknown but zeff_input exists (common in reduced-species runs), use zeff as divisor.
-    divisor = float(z_main)
-    if (sp.get("z_ions", None) in (None, [], ()) or divisor <= 0.0) and (zeff is not None and zeff > 0.0):
+    # In "e-only" dumps, infer a single effective ion density via quasi-neutrality.
+    # Prefer zeff_input (constant in no-impurity runs) when available; otherwise fall back to Z_main.
+    divisor = float(z_main) if (_np.isfinite(z_main) and z_main > 0.0) else 1.0
+    if zeff is not None and _np.isfinite(zeff) and zeff > 0.0:
         divisor = float(zeff)
 
     with _np.errstate(divide='ignore', invalid='ignore'):
@@ -1350,6 +1378,12 @@ def _expand_single_ion_to_e_plus_main(
     except Exception:
         pass
 
+    # Ensure consistent metadata for downstream slicing (even if rend/imnd are absent).
+    try:
+        fields2["nspec_dens"] = _np.asarray([2], dtype=int)
+    except Exception:
+        pass
+
     try:
         import logging
         logging.getLogger("dump2imas").info(
@@ -1367,6 +1401,7 @@ def _expand_single_ion_to_e_plus_main(
 
 def estimate_psi_axis_and_lcfs_robust(
     psi2d: np.ndarray,
+    bq2d: Optional[np.ndarray] = None,
     te2d: Optional[np.ndarray] = None,
     pe2d: Optional[np.ndarray] = None,
     pr2d: Optional[np.ndarray] = None,
@@ -1377,11 +1412,14 @@ def estimate_psi_axis_and_lcfs_robust(
 ) -> tuple[float, float, str]:
     """Estimate (psi_axis, psi_lcfs) robustly and return a short method tag.
 
-    Key idea: pick the magnetic axis using a *core indicator* (Te preferred, else pe/ne,
-    else total pressure, else electron density). This avoids confusing "vacuum psi" extrema
-    with the true axis on stitched grids.
+    Axis selection:
+      - Prefer a *core indicator* to avoid confusing X-point/poloidal-field minima with the axis.
+        Priority: Te (dump) -> Te from pe/ne -> total pressure -> ne.
+      - Use a high-quantile "core mask" and take the median psi within it.
 
-    The LCFS proxy is taken as an extreme quantile of psi over *plasma-like* points.
+    LCFS proxy:
+      - Use the farthest extreme (high or low) of psi relative to psi_axis over plasma-like points,
+        estimated via dv quantiles.
 
     Returns:
       (psi_axis, psi_lcfs, tag)
@@ -1391,101 +1429,141 @@ def estimate_psi_axis_and_lcfs_robust(
     if not np.any(mpsi):
         return (np.nan, np.nan, "fail:nopsi")
 
-    tag = "psi"
+    # --- build plasma-like mask + indicator ---
+    tag = "psi_only"
     indicator = None
+    m = mpsi.copy()
 
-    # Build a plasma mask + indicator
+    # Electron density (robustly from nq)
+    ne2d = None
+    if nq is not None:
+        try:
+            A = np.asarray(nq, dtype=float)
+            if A.ndim == 2:
+                ne2d = A
+            elif A.ndim >= 3 and A.shape[-1] >= 1:
+                ne2d = A[..., 0]
+        except Exception:
+            ne2d = None
+
     if te2d is not None:
+        # Best indicator when available
         te = np.asarray(te2d, dtype=float)
         indicator = te
         m = mpsi & np.isfinite(te) & (te > te_min)
         tag = "te"
+    elif pe2d is not None and ne2d is not None:
+        # Fallback: estimate Te from p_e/n_e, but suppress extreme values due to very small densities
+        pe = np.asarray(pe2d, dtype=float)
+        te_est = np.full_like(pe, np.nan, dtype=float)
+        mm = mpsi & np.isfinite(pe) & np.isfinite(ne2d) & (ne2d > 0.0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            te_est[mm] = pe[mm] / (ne2d[mm] * float(qe))
+        indicator = te_est
+        m = mm & np.isfinite(te_est) & (te_est > te_min)
+        tag = "te_from_pe_ne"
+    elif pr2d is not None:
+        pr = np.asarray(pr2d, dtype=float)
+        indicator = pr
+        m = mpsi & np.isfinite(pr) & (pr > 0.0)
+        tag = "p_tot"
+    elif ne2d is not None:
+        indicator = ne2d
+        m = mpsi & np.isfinite(ne2d) & (ne2d > 0.0)
+        tag = "ne"
     else:
-        # Try to reconstruct Te from pe/ne (electron pressure + density)
-        ne2d = None
-        if nq is not None and getattr(nq, "ndim", 0) >= 3 and nq.shape[-1] >= 1:
-            ne2d = np.asarray(nq[..., 0], dtype=float)
-        if pe2d is not None and ne2d is not None:
-            pe = np.asarray(pe2d, dtype=float)
-            ne = ne2d
-            te_est = np.full_like(pe, np.nan, dtype=float)
-            mm = mpsi & np.isfinite(pe) & np.isfinite(ne) & (ne > 0.0)
-            te_est[mm] = pe[mm] / (ne[mm] * float(qe))
-            indicator = te_est
-            m = mm & (te_est > te_min)
-            tag = "te_from_pe_ne"
-        elif pr2d is not None:
-            pr = np.asarray(pr2d, dtype=float)
-            indicator = pr
-            m = mpsi & np.isfinite(pr) & (pr > 0.0)
-            tag = "p_tot"
-        elif ne2d is not None:
-            ne = ne2d
-            indicator = ne
-            m = mpsi & np.isfinite(ne) & (ne > 0.0)
-            tag = "ne"
-        else:
-            m = mpsi
-            tag = "psi_only"
+        m = mpsi.copy()
+        tag = "psi_only"
 
-    # If mask too small, fall back to finite psi
     if int(np.count_nonzero(m)) < 50:
-        m = mpsi
-        if tag != "psi_only":
-            tag = tag + "|fallback"
+        m = mpsi.copy()
+        tag = tag + "|fallback"
 
     vals = ps[m]
     if vals.size == 0:
         return (np.nan, np.nan, "fail:novals")
 
-    # ---- axis: psi in the hottest / highest-indicator region ----
-    if indicator is not None and np.any(m & np.isfinite(indicator)):
+    # --- axis ---
+    psi_axis = np.nan
+    axis_tag = "axis:unset"
+    if indicator is not None:
         ind = np.asarray(indicator, dtype=float)
         mm = m & np.isfinite(ind)
-        indv = ind[mm]
-        psiv = ps[mm]
-        # Use top 0.5% of indicator values (robust against single-pixel spikes)
-        qcore = 0.995 if indv.size > 5000 else 0.99
-        thr = float(np.nanquantile(indv, qcore))
-        core = mm & (ind >= thr)
-        if int(np.count_nonzero(core)) < 10:
-            # fallback to argmax
-            ij = np.nanargmax(indv)
-            psi_axis = float(psiv[ij])
-            axis_tag = "argmax"
-        else:
-            psi_axis = float(np.nanmedian(ps[core]))
-            axis_tag = "qcore"
+        if np.any(mm):
+            indv = ind[mm]
+            psiv = ps[mm]
+            # Use top 0.5% of indicator values (robust against single-pixel spikes)
+            qcore = 0.995 if indv.size > 5000 else 0.99
+            thr = float(np.nanquantile(indv, qcore))
+            core = mm & (ind >= thr)
+            if int(np.count_nonzero(core)) >= 10:
+                psi_axis = float(np.nanmedian(ps[core]))
+                axis_tag = "axis:core_q"
+            else:
+                # fallback to argmax of indicator
+                psi_axis = float(psiv[int(np.nanargmax(indv))])
+                axis_tag = "axis:argmax"
+    if not np.isfinite(psi_axis):
+        # pure psi fallback: take median of central quantile of psi values
+        try:
+            lo = float(np.nanquantile(vals, 0.45))
+            hi = float(np.nanquantile(vals, 0.55))
+            mid = vals[(vals >= lo) & (vals <= hi)]
+            psi_axis = float(np.nanmedian(mid)) if mid.size else float(np.nanmedian(vals))
+            axis_tag = "axis:psi_mid"
+        except Exception:
+            psi_axis = float(np.nanmedian(vals))
+            axis_tag = "axis:psi_med"
+
+    # Optional refinement using bq2d: only within core region (avoids X-point)
+    if bq2d is not None and indicator is not None:
+        try:
+            bq = np.asarray(bq2d, dtype=float)
+            # accept either scalar |Bp| or vector (..,3)
+            if bq.ndim == 3 and bq.shape[-1] == 3:
+                # Interpret as (Br,Bz,Bphi); use poloidal magnitude
+                bp = np.sqrt(bq[..., 0] ** 2 + bq[..., 1] ** 2)
+            else:
+                bp = np.asarray(bq, dtype=float)
+            if bp.shape == ps.shape:
+                ind = np.asarray(indicator, dtype=float)
+                mm = m & np.isfinite(ind)
+                if np.any(mm):
+                    qcore = 0.995
+                    thr = float(np.nanquantile(ind[mm], qcore))
+                    core = mm & (ind >= thr) & np.isfinite(bp)
+                    if int(np.count_nonzero(core)) >= 10:
+                        ij = np.nanargmin(bp[core])
+                        psi_axis = float(ps[core][int(ij)])
+                        axis_tag = axis_tag + "+bpmin_core"
+        except Exception:
+            pass
+
+    # --- lcfs proxy ---
+    dv = vals - float(psi_axis)
+    try:
+        dv_hi = float(np.nanquantile(dv, qedge))
+        dv_lo = float(np.nanquantile(dv, 1.0 - qedge))
+    except Exception:
+        dv_hi = float(np.nanmax(dv))
+        dv_lo = float(np.nanmin(dv))
+
+    if abs(dv_hi) >= abs(dv_lo):
+        psi_lcfs = float(psi_axis + dv_hi)
+        dir_tag = "dir:+"
     else:
-        # Last resort: median of finite psi
-        psi_axis = float(np.nanmedian(ps[mpsi]))
-        axis_tag = "median"
+        psi_lcfs = float(psi_axis + dv_lo)
+        dir_tag = "dir:-"
 
-    # ---- LCFS proxy: extreme quantile of psi over plasma-like points ----
-    # Decide which side corresponds to the edge by looking at distribution relative to axis.
-    dv = vals - psi_axis
-    if np.nanmedian(dv) >= 0:
-        # psi tends to increase outward
-        psi_lcfs = float(np.nanquantile(vals, qedge))
-        edge_tag = "hi"
-    else:
-        psi_lcfs = float(np.nanquantile(vals, 1.0 - qedge))
-        edge_tag = "lo"
+    if not np.isfinite(psi_lcfs) or abs(psi_lcfs - psi_axis) < 1e-12:
+        # fallback to farthest extreme
+        try:
+            dv_far = dv_hi if abs(dv_hi) >= abs(dv_lo) else dv_lo
+            psi_lcfs = float(psi_axis + dv_far)
+        except Exception:
+            psi_lcfs = float(np.nanmax(vals))
 
-    if (not np.isfinite(psi_lcfs)) or abs(psi_lcfs - psi_axis) < 1e-12:
-        # fall back to an outer-ish quantile of all finite psi
-        allv = ps[mpsi]
-        if np.nanmedian(allv - psi_axis) >= 0:
-            psi_lcfs = float(np.nanquantile(allv, qedge))
-        else:
-            psi_lcfs = float(np.nanquantile(allv, 1.0 - qedge))
-
-    return (float(psi_axis), float(psi_lcfs), f"{tag}:{axis_tag}:{edge_tag}")
-
-
-# -----------------------------
-# Separatrix (LCFS) identification helpers
-# -----------------------------
+    return (float(psi_axis), float(psi_lcfs), f"{tag}|{axis_tag}|{dir_tag}")
 
 def _resolve_optional_file(args, attr: str, default_name: str) -> Optional[str]:
     """Resolve an optional input file path.
@@ -1518,6 +1596,22 @@ def _resolve_optional_file(args, attr: str, default_name: str) -> Optional[str]:
                 cand = val
         if _isfile(cand):
             return cand
+
+        # Common robustness: case-insensitive lookup for bare filenames (e.g. PEQDSK vs peqdsk)
+        try:
+            base = os.path.basename(str(val))
+            if base == str(val) and default_name and base.lower() == str(default_name).lower():
+                for d in (run_dir, os.getcwd()):
+                    if not d or (not os.path.isdir(d)):
+                        continue
+                    for fn in os.listdir(d):
+                        if fn.lower() == base.lower() or fn.lower().startswith(base.lower()):
+                            p = os.path.join(d, fn)
+                            if _isfile(p):
+                                return p
+        except Exception:
+            pass
+
         return None
 
     # default name
@@ -1527,70 +1621,97 @@ def _resolve_optional_file(args, attr: str, default_name: str) -> Optional[str]:
             return cand
     if _isfile(default_name):
         return default_name
+
+    # Robustness: case-insensitive / prefix match for default_name (when user did not pass --{attr}).
+    # This handles common variants like PEQDSK, peqdsk_*, peqdsk.dat, etc.
+    try:
+        base = str(default_name)
+        for d in (run_dir, os.getcwd()):
+            if not d or (not os.path.isdir(d)):
+                continue
+            for fn in os.listdir(d):
+                fn_l = fn.lower()
+                base_l = base.lower()
+                if fn_l == base_l or fn_l.startswith(base_l):
+                    pp = os.path.join(d, fn)
+                    if _isfile(pp):
+                        return pp
+    except Exception:
+        pass
+
     return None
 
 
-def _read_peqdsk_block(peqdsk_path: str, key: str) -> Optional[Tuple[np.ndarray, np.ndarray, str]]:
-    """Read a (psinorm, value) block from a TRANSP-style peqdsk file.
+def _read_peqdsk_block(path: str, key: str) -> Optional[Tuple[np.ndarray, np.ndarray, str]]:
+    """Read a 1D profile block from a PEQDSK-like ASCII file.
 
-    The file is organized as repeated blocks:
-      <N> <label...>
-      then N lines: psinorm  value  derivative
+    Many 'peqdsk' variants use different labels. We scan for a header line that contains
+    *key* as a standalone token (e.g. 'TE', 'NE'), not merely as a substring, to avoid
+    false matches (e.g. 'temperature').
 
-    We search for a header containing the requested key (case-insensitive), e.g. 'te' or 'ne'.
+    After the header, we expect whitespace-separated numeric rows with at least two columns:
+        x  y  [optional...]
 
-    Returns (psinorm, value, unit_string) or None.
+    Returns:
+        (x, y, unit_str) where x is the first column (often psinorm) and y is the second.
     """
-    try:
-        with open(peqdsk_path, "r") as f:
-            lines = f.readlines()
-    except Exception:
+    if not path or not os.path.isfile(path):
         return None
 
-    key_l = key.lower()
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if not line:
-            i += 1
-            continue
+    key_l = str(key).strip().lower()
+    if not key_l:
+        return None
 
-        # header starts with integer N
-        m = re.match(r"^\s*(\d+)\s+(.+)$", line)
-        if not m:
-            i += 1
-            continue
-        n = int(m.group(1))
-        hdr = m.group(2).strip()
-        hdr_l = hdr.lower()
+    # Standalone-token match, so 'TE(keV)' matches, 'temperature' does not.
+    pat = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(key_l)}(?![A-Za-z0-9_])", re.IGNORECASE)
 
-        # check if this is the requested block
-        if key_l in hdr_l:
-            unit = ""
-            um = re.search(r"\(([^)]+)\)", hdr)
-            if um:
-                unit = um.group(1).strip()
-            ps = []
-            vv = []
-            j0 = i + 1
-            j1 = min(len(lines), j0 + n)
-            for j in range(j0, j1):
-                parts = lines[j].split()
+    xs: List[float] = []
+    ys: List[float] = []
+    unit = ""
+    in_block = False
+
+    with open(path, "r", errors="ignore") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                if in_block and xs:
+                    break
+                continue
+
+            # Header trigger
+            if (not in_block) and (not s[0].isdigit()) and pat.search(s):
+                unit = _parse_peqdsk_units(s) if "_parse_peqdsk_units" in globals() else ""
+                in_block = True
+                continue
+
+            if not in_block:
+                continue
+
+            # Numeric rows
+            try:
+                parts = s.replace(",", " ").split()
                 if len(parts) < 2:
                     continue
-                try:
-                    ps.append(float(parts[0]))
-                    vv.append(float(parts[1]))
-                except Exception:
-                    continue
-            if len(ps) < 2:
-                return None
-            return (np.asarray(ps, dtype=float), np.asarray(vv, dtype=float), unit)
+                xs.append(float(parts[0]))
+                ys.append(float(parts[1]))
+            except Exception:
+                if xs:
+                    break
+                continue
 
-        i += 1 + max(n, 0)
+    if len(xs) < 4:
+        return None
 
-    return None
+    x = np.asarray(xs, dtype=float)
+    y = np.asarray(ys, dtype=float)
 
+    # Ensure monotone-increasing x for interpolation.
+    if np.any(np.diff(x) < 0):
+        o = np.argsort(x)
+        x = x[o]
+        y = y[o]
+
+    return x, y, unit
 
 def _peqdsk_te_sep_ev(peqdsk_path: str, *, log: Optional[logging.Logger] = None) -> Optional[float]:
     """Return Te at psinorm≈1 from peqdsk in eV."""
@@ -1616,6 +1737,240 @@ def _peqdsk_te_sep_ev(peqdsk_path: str, *, log: Optional[logging.Logger] = None)
         log.info(f"peqdsk: Te_sep≈{val:.3g} eV (unit='{unit}', psin={ps[j]:.6g}) from {peqdsk_path}")
     return val
 
+
+def _peqdsk_profile_si(peqdsk_path: str, key: str, *, log: Optional[logging.Logger] = None) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Read a peqdsk 1D profile and convert to SI-like units.
+
+    Supported keys:
+      - 'te': returns Te in eV
+      - 'ne': returns ne in m^-3
+
+    Returns (psinorm, values_si) with psinorm sorted ascending.
+    """
+    blk = _read_peqdsk_block(peqdsk_path, key)
+    if blk is None:
+        return None
+    ps, vv, unit = blk
+    ps = np.asarray(ps, dtype=float)
+    vv = np.asarray(vv, dtype=float)
+
+    # sort by psinorm
+    o = np.argsort(ps)
+    ps = ps[o]
+    vv = vv[o]
+
+    u = (unit or '').lower().replace(' ', '')
+
+    if key.lower() == 'te':
+        # Te -> eV
+        if 'kev' in u:
+            vv = vv * 1e3
+        elif 'ev' in u:
+            vv = vv * 1.0
+        else:
+            # heuristic: if values are O(1-50) assume keV
+            med = float(np.nanmedian(vv[np.isfinite(vv)])) if np.any(np.isfinite(vv)) else float('nan')
+            if np.isfinite(med) and med < 50.0:
+                vv = vv * 1e3
+        return (ps, vv)
+
+    if key.lower() == 'ne':
+        # ne -> m^-3
+        scale = 1.0
+        # explicit 10^N or 1eN
+        m = re.search(r'10\^([+-]?\d+)', u)
+        if m:
+            scale = 10.0 ** int(m.group(1))
+        else:
+            m = re.search(r'1e([+-]?\d+)', u)
+            if m:
+                scale = 10.0 ** int(m.group(1))
+        # cm^-3 -> m^-3
+        if ('cm' in u) and ('-3' in u or '^-3' in u):
+            scale *= 1e6
+        # If unit string says per m^3 without explicit scale, keep scale=1.
+        # Otherwise, apply a simple magnitude heuristic common for TRANSP peqdsk:
+        # values are often in 10^19 or 10^20 m^-3.
+        if scale == 1.0 and ('/m3' not in u) and ('m-3' not in u) and ('m^(-3' not in u) and ('m^-3' not in u):
+            vmax = float(np.nanmax(vv[np.isfinite(vv)])) if np.any(np.isfinite(vv)) else float('nan')
+            if np.isfinite(vmax) and vmax < 1e6:
+                # typical: ne~(0.1-10) in units of 1e20 or 1e19
+                if vmax < 5.0:
+                    scale = 1e20
+                else:
+                    scale = 1e19
+        vv = vv * scale
+        return (ps, vv)
+
+    return (ps, vv)
+
+
+def _peqdsk_te_ne_si(peqdsk_path: str, *, log: Optional[logging.Logger] = None) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Convenience: read Te(eV) and ne(m^-3) on a common psinorm grid."""
+    te_blk = _peqdsk_profile_si(peqdsk_path, 'te', log=log)
+    ne_blk = _peqdsk_profile_si(peqdsk_path, 'ne', log=log)
+    if te_blk is None or ne_blk is None:
+        return None
+    ps_te, te = te_blk
+    ps_ne, ne = ne_blk
+    # Interpolate ne onto ps_te if grids differ
+    if ps_ne.shape != ps_te.shape or np.nanmax(np.abs(ps_ne - ps_te)) > 1e-6:
+        ne = np.interp(ps_te, ps_ne, ne, left=ne[0], right=ne[-1])
+    return (ps_te, te, ne)
+
+
+def _imas_core_profiles_te_ne(
+    cp_ids: Any,
+    *,
+    target_time: Optional[float] = None,
+    log: Optional[logging.Logger] = None,
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Extract (psi_norm_like, Te[eV], ne[m^-3]) from an existing core_profiles IDS.
+
+    This is intended for workflows where input2imas runs first and stores equilibrium
+    kinetic profiles (from PEQDSK/P-file) into IMAS core_profiles. In that workflow,
+    input2imas commonly stores psinorm into grid.rho_tor_norm (not true rho_tor_norm).
+
+    We therefore accept the first available grid among:
+        grid.psi_norm, grid.rho_pol_norm, grid.rho_tor_norm
+    and treat it as a *normalized poloidal flux-like* coordinate for edge_profiles.
+    """
+    if cp_ids is None:
+        return None
+
+    # Resolve profiles_1d container
+    try:
+        aos = cp_ids.profiles_1d
+    except Exception:
+        return None
+
+    # Determine number of slices
+    try:
+        n = len(aos)
+    except Exception:
+        try:
+            aos = list(aos)
+            n = len(aos)
+        except Exception:
+            return None
+
+    if n <= 0:
+        return None
+
+    # Select slice by time if available
+    idx_best = 0
+    if target_time is not None:
+        try:
+            t0 = float(target_time)
+            best = None
+            for i in range(n):
+                try:
+                    p = aos[i]
+                except Exception:
+                    continue
+                ti = getattr(p, 'time', None)
+                if ti is None:
+                    continue
+                try:
+                    dt = abs(float(ti) - t0)
+                except Exception:
+                    continue
+                if best is None or dt < best:
+                    best = dt
+                    idx_best = i
+        except Exception:
+            pass
+
+    try:
+        p = aos[idx_best]
+    except Exception:
+        try:
+            p = aos[0]
+        except Exception:
+            return None
+
+    # Grid coordinate
+    g = getattr(p, 'grid', None)
+    psi = None
+    if g is not None:
+        for nm in ('psi_norm', 'rho_pol_norm', 'rho_tor_norm'):
+            if hasattr(g, nm):
+                try:
+                    arr = getattr(g, nm)
+                    if arr is None:
+                        continue
+                    arr = np.asarray(arr, dtype=float).ravel()
+                    if arr.size > 1 and np.any(np.isfinite(arr)):
+                        psi = arr
+                        break
+                except Exception:
+                    continue
+    if psi is None:
+        return None
+
+    # Electrons
+    e = getattr(p, 'electrons', None)
+    if e is None:
+        return None
+
+    # Te
+    te = None
+    if hasattr(e, 'temperature'):
+        try:
+            te = np.asarray(e.temperature, dtype=float).ravel()
+        except Exception:
+            te = None
+
+    # ne (prefer density_thermal if available)
+    ne = None
+    for nm in ('density_thermal', 'density'):
+        if hasattr(e, nm):
+            try:
+                arr = getattr(e, nm)
+                if arr is None:
+                    continue
+                ne = np.asarray(arr, dtype=float).ravel()
+                break
+            except Exception:
+                ne = None
+
+    if te is None or ne is None:
+        return None
+
+    nmin = min(int(psi.size), int(te.size), int(ne.size))
+    if nmin < 2:
+        return None
+
+    psi = psi[:nmin]
+    te = te[:nmin]
+    ne = ne[:nmin]
+
+    m = np.isfinite(psi) & np.isfinite(te) & np.isfinite(ne)
+    if int(np.count_nonzero(m)) < 2:
+        return None
+
+    psi_m = psi[m]
+    te_m = te[m]
+    ne_m = ne[m]
+
+    # Sort by coordinate (ensure monotone increasing)
+    o = np.argsort(psi_m)
+    psi_m = psi_m[o]
+    te_m = te_m[o]
+    ne_m = ne_m[o]
+
+    if log is not None:
+        try:
+            te_sep = float(np.interp(1.0, psi_m, te_m, left=te_m[0], right=te_m[-1]))
+        except Exception:
+            te_sep = float('nan')
+        log.info(
+            "edge_profiles(equilibrium): using existing IMAS core_profiles as equilibrium source "
+            "(grid range %.3g..%.3g; Te(psiN=1)~%.3g eV)",
+            float(psi_m[0]), float(psi_m[-1]), float(te_sep)
+        )
+
+    return (psi_m.astype(float), te_m.astype(float), ne_m.astype(float))
 
 def _psi_lcfs_from_contours(
     contours_path: str,
@@ -1705,62 +2060,113 @@ def _psi_lcfs_from_te_sep(
     return psi_lcfs
 
 
-def _choose_psi_axis_lcfs(
-    data: Dict[str, Any],
-    args,
-    *,
-    log: Optional[logging.Logger] = None,
-) -> Tuple[float, float, str]:
-    """Choose (psi_axis, psi_lcfs) with the requested priority:
-      1) contours.h5 (LCFS polyline)
-      2) peqdsk (Te at psin=1 used to locate LCFS on NIMROD fields)
-      3) robust estimator (fallback)
-      4) user-provided Te_sep (used only for logging; still falls back to robust if Te missing)
+def _choose_psi_axis_lcfs(data: Dict[str, Any], args, log: Optional[logging.Logger] = None) -> tuple[float, float, str]:
+    """Select (psi_axis, psi_lcfs) consistently for all IDS writers.
+
+    This routine is used by both core_profiles and edge_profiles.
+
+    Priority:
+      1) Stitch contours file (if provided) to identify LCFS value on the dump grid.
+      2) Use PEQDSK Te at psiN=1 to identify LCFS on the dump grid (if Te exists in dump).
+      3) Use equilibrium occurrence 0 (psi_axis, psi_boundary) if available.
+      4) Use core_profiles occurrence 0 endpoints (fallback).
+      5) If Te exists in dump, use user Te_sep_ev to estimate LCFS.
+      6) Robust fallback (quantile method).
+
+    Post-processing:
+      - Apply a core-peaked indicator sanity check to swap axis/lcfs when the normalization
+        would place the core near psiN≈1 (common sign convention mismatch).
     """
     psi2d = data.get("psi_eq", None)
     if psi2d is None:
+        psi2d = data.get("psi", None)
+    if psi2d is None:
         return (np.nan, np.nan, "fail:nopsi")
 
+    bq2d = data.get("bq", None)
     te2d = data.get("teq", None)
     pe2d = data.get("peq", None)
     pr2d = data.get("prq", None)
     nq = data.get("nq", None)
 
+    sp = getattr(args, "_nimrod_species", {}) or {}
+    qe = float(sp.get("qe_c", 1.602176634e-19))
+    te_min = float(getattr(args, "te_min_ev", 20.0) or 20.0)
+    qedge = float(getattr(args, "psi_edge_quantile", 0.995) or 0.995)
+
     psi_axis, psi_lcfs_guess, tag = estimate_psi_axis_and_lcfs_robust(
-        psi2d,
-        te2d=te2d,
-        pe2d=pe2d,
-        pr2d=pr2d,
-        nq=nq,
-        te_min=float(getattr(args, "te_min_ev", 20.0) or 20.0),
-        qedge=0.995,
+        np.asarray(psi2d, dtype=float),
+        bq2d=np.asarray(bq2d, dtype=float) if bq2d is not None else None,
+        te2d=np.asarray(te2d, dtype=float) if te2d is not None else None,
+        pe2d=np.asarray(pe2d, dtype=float) if pe2d is not None else None,
+        pr2d=np.asarray(pr2d, dtype=float) if pr2d is not None else None,
+        nq=np.asarray(nq, dtype=float) if nq is not None else None,
+        qe=qe,
+        te_min=te_min,
+        qedge=qedge,
     )
 
-    # 1) contours.h5
+    def _finalize(pa: float, pb: float, tag2: str) -> tuple[float, float, str]:
+        pa = float(pa); pb = float(pb)
+        if (not np.isfinite(pa)) or (not np.isfinite(pb)) or abs(pb - pa) < 1e-12:
+            return (pa, pb, tag2)
+
+        # sanity: a core-peaked indicator (Te) should live near psiN≈0
+        try:
+            if te2d is None:
+                return (pa, pb, tag2)
+            te = np.asarray(te2d, dtype=float)
+            ps = np.asarray(psi2d, dtype=float)
+            m = np.isfinite(te) & np.isfinite(ps) & (te > te_min)
+            if int(np.count_nonzero(m)) < 50:
+                return (pa, pb, tag2)
+
+            psn = (ps - pa) / (pb - pa)
+            ind = te[m]
+            psnv = psn[m]
+            qcore = 0.995 if ind.size > 5000 else 0.99
+            thr = float(np.nanquantile(ind, qcore))
+            core = m & (te >= thr)
+            if int(np.count_nonzero(core)) < 10:
+                return (pa, pb, tag2)
+
+            ps_core = float(np.nanmedian(psn[core]))
+            # If the core maps near 1, swap
+            if ps_core > 0.8 and ps_core < 1.2:
+                if log is not None:
+                    log.warning(
+                        f"Swapping psi_axis/psi_lcfs (core indicator at psiN≈{ps_core:.3f}); "
+                        f"was axis≈{pa:.6g}, lcfs≈{pb:.6g} (tag={tag2})"
+                    )
+                return (pb, pa, tag2 + "|swap")
+        except Exception:
+            pass
+        return (pa, pb, tag2)
+
+    # 1) contours file (highest priority for LCFS value)
     contours_path = _resolve_optional_file(args, "contours", "contours.h5")
     if contours_path:
         try:
-            psi_lcfs_c = _psi_lcfs_from_contours(contours_path, data["R"], data["Z"], psi2d, log=log)
+            psi_lcfs_c = _psi_lcfs_from_contours(contours_path, data.get("R"), data.get("Z"), psi2d, log=log)
         except Exception:
             psi_lcfs_c = None
-        if psi_lcfs_c is not None and np.isfinite(psi_lcfs_c) and abs(psi_lcfs_c - psi_axis) > 1e-12:
-            return (float(psi_axis), float(psi_lcfs_c), f"{tag}|contours")
+        if psi_lcfs_c is not None and np.isfinite(psi_lcfs_c) and abs(float(psi_lcfs_c) - float(psi_axis)) > 1e-12:
+            return _finalize(float(psi_axis), float(psi_lcfs_c), f"{tag}|contours")
 
-    # 2) peqdsk: Te at psiN=1
+    # 2) peqdsk: Te at psiN=1 used to infer LCFS from dump Te
     peqdsk_path = _resolve_optional_file(args, "peqdsk", "peqdsk")
     te_sep_ev = None
     if peqdsk_path:
         te_sep_ev = _peqdsk_te_sep_ev(peqdsk_path, log=log)
         if te_sep_ev is not None and te2d is not None:
             psi_lcfs_p = _psi_lcfs_from_te_sep(psi2d, te2d, te_sep_ev, psi_axis, psi_lcfs_guess, log=log)
-            if psi_lcfs_p is not None and np.isfinite(psi_lcfs_p) and abs(psi_lcfs_p - psi_axis) > 1e-12:
-                return (float(psi_axis), float(psi_lcfs_p), f"{tag}|peqdsk_te")
-
+            if psi_lcfs_p is not None and np.isfinite(psi_lcfs_p) and abs(float(psi_lcfs_p) - float(psi_axis)) > 1e-12:
+                return _finalize(float(psi_axis), float(psi_lcfs_p), f"{tag}|peqdsk_te")
 
     # 3) equilibrium/core_profiles occurrence 0 (fallback when contours/peqdsk are not available)
     entry_dir = getattr(args, "_entry_dir", None)
     if entry_dir:
-        occ0 = 0  # explicitly use occurrence 0 per workflow convention
+        occ0 = 0
         # 3a) equilibrium: global_quantities psi_axis / psi_boundary
         for fpath in (os.path.join(entry_dir, f"equilibrium_{occ0}.h5"), os.path.join(entry_dir, "equilibrium.h5")):
             if os.path.isfile(fpath):
@@ -1773,7 +2179,7 @@ def _choose_psi_axis_lcfs(
                     if np.isfinite(pa) and np.isfinite(pb) and abs(pb - pa) > 1e-12:
                         if log is not None:
                             log.info(f"LCFS from equilibrium occ0: psi_axis≈{pa:.6g}, psi_lcfs≈{pb:.6g} from {fpath}")
-                        return (pa, pb, f"{tag}|equilibrium0")
+                        return _finalize(pa, pb, f"{tag}|equilibrium0")
                 except Exception:
                     pass
 
@@ -1803,11 +2209,11 @@ def _choose_psi_axis_lcfs(
                     if np.isfinite(pa) and np.isfinite(pb) and abs(pb - pa) > 1e-12:
                         if log is not None:
                             log.info(f"LCFS from core_profiles occ0: psi_axis≈{pa:.6g}, psi_lcfs≈{pb:.6g} from {fpath}")
-                        return (pa, pb, f"{tag}|core_profiles0")
+                        return _finalize(pa, pb, f"{tag}|core_profiles0")
                 except Exception:
                     pass
 
-    # 3) user Te_sep (only used to try matching if peqdsk missing)
+    # 4) user Te_sep (only used when peqdsk missing)
     if te_sep_ev is None:
         try:
             te_sep_ev = float(getattr(args, "te_sep_ev", 60.0) or 60.0)
@@ -1815,14 +2221,13 @@ def _choose_psi_axis_lcfs(
             te_sep_ev = 60.0
     if te2d is not None and np.isfinite(psi_axis) and np.isfinite(psi_lcfs_guess):
         psi_lcfs_u = _psi_lcfs_from_te_sep(psi2d, te2d, te_sep_ev, psi_axis, psi_lcfs_guess, log=log)
-        if psi_lcfs_u is not None and np.isfinite(psi_lcfs_u) and abs(psi_lcfs_u - psi_axis) > 1e-12:
-            return (float(psi_axis), float(psi_lcfs_u), f"{tag}|user_te")
+        if psi_lcfs_u is not None and np.isfinite(psi_lcfs_u) and abs(float(psi_lcfs_u) - float(psi_axis)) > 1e-12:
+            return _finalize(float(psi_axis), float(psi_lcfs_u), f"{tag}|user_te")
 
-    # 4) robust fallback
+    # 5) robust fallback
     if log is not None:
         log.info(f"LCFS fallback: psi_axis≈{psi_axis:.6g}, psi_lcfs≈{psi_lcfs_guess:.6g} (tag={tag})")
-    return (float(psi_axis), float(psi_lcfs_guess), tag)
-
+    return _finalize(float(psi_axis), float(psi_lcfs_guess), tag)
 
 def _make_bin_edges_from_data(xv: np.ndarray, nbins: int, vmin: float, vmax: float, *, log: Optional[logging.Logger] = None, tag: str = "") -> np.ndarray:
     """Make monotone bin edges for x in [vmin,vmax] that avoid massive empty-bin NaNs.
@@ -1905,34 +2310,6 @@ def _bin_scalar_on_rho_bins(
     out = np.full((nb,), np.nan, dtype=float)
     nz = c > 0
     out[nz] = s[nz] / c[nz]
-    return out
-
-def _make_equal_count_bins(x: np.ndarray, nbins: int) -> Tuple[np.ndarray, np.ndarray]:
-    x = np.asarray(x, dtype=float)
-    m = np.isfinite(x)
-    xv = x[m]
-    if xv.size < 2:
-        psi_grid = np.linspace(0.0, 1.0, nbins)
-        bins = np.digitize(x, psi_grid, right=False)
-        return psi_grid, bins
-
-    # Use quantiles for equal-count bins
-    qs = np.linspace(0.0, 1.0, nbins)
-    edges = np.quantile(xv, qs)
-    # Ensure strictly increasing
-    edges = np.maximum.accumulate(edges)
-    psi_grid = edges
-    bins = np.digitize(x, psi_grid, right=False)
-    return psi_grid, bins
-
-
-def _bin_scalar_on_bins(y: np.ndarray, psi_grid: np.ndarray, bins: np.ndarray) -> np.ndarray:
-    y = np.asarray(y, dtype=float)
-    out = np.full_like(psi_grid, np.nan, dtype=float)
-    for i in range(psi_grid.size):
-        m = (bins == i) & np.isfinite(y)
-        if np.any(m):
-            out[i] = float(np.nanmean(y[m]))
     return out
 
 
@@ -2027,58 +2404,6 @@ def _set_rz_grid_mhd(plasma: Any, R: np.ndarray, Z: np.ndarray, Nx: int, Ny: int
 # -----------------------------
 # Core conversion
 # -----------------------------
-
-def estimate_psi_axis_and_lcfs(psi2d, te2d=None, te_min=10.0, qsep=0.98):
-    psi = np.asarray(psi2d, float)
-    if te2d is not None:
-        te = np.asarray(te2d, float)
-        mask = np.isfinite(psi) & np.isfinite(te) & (te > te_min)
-    else:
-        mask = np.isfinite(psi)
-
-    # Determine sign convention using robust extrema on the mask
-    vals = psi[mask]
-    if vals.size < 10:
-        # fallback: use all finite values
-        vals = psi[np.isfinite(psi)]
-    if vals.size == 0:
-        raise RuntimeError("Cannot estimate psi_axis/psi_lcfs: psi has no finite values")
-
-    # Choose axis as the more “central” extremum (works for typical NIMROD psi)
-    pmin = np.nanmin(vals)
-    pmax = np.nanmax(vals)
-
-    # Decide which is axis vs edge by assuming LCFS is closer to the opposite extreme than axis
-    # In practice: axis is the “more extreme” value; LCFS is the opposite side.
-    # If your psi is reversed, this still works with quantile below.
-    psi_axis = pmin if abs(pmin) > abs(pmax) else pmax
-
-    # LCFS estimate: high-quantile in plasma region, biased toward the “edge side”
-    # If axis is min, edge is high; if axis is max, edge is low.
-    if psi_axis == pmin:
-        psi_lcfs = np.nanquantile(vals, qsep)
-    else:
-        psi_lcfs = np.nanquantile(vals, 1.0 - qsep)
-
-    return float(psi_axis), float(psi_lcfs)
-
-def psi_to_rho_norm(psi1d, psi_axis, psi_lcfs):
-    psi1d = np.asarray(psi1d, float).ravel()
-    den = psi_lcfs - psi_axis
-    if not np.isfinite(den) or abs(den) < 1e-30:
-        # fallback monotonic coordinate
-        return np.linspace(0.0, 1.0, psi1d.size)
-
-    x = (psi1d - psi_axis) / den
-    # If den < 0, x flips; fix by using absolute mapping relative to axis->lcfs
-    # Equivalent to x = (psi1d-psi_axis)/(psi_lcfs-psi_axis) and then clip
-    x = np.clip(x, 0.0, 1.0)
-    # sqrt is typical for rho_tor_norm; if you prefer linear, drop sqrt.
-    rho = np.sqrt(x)
-    # enforce exactly 1 at and beyond LCFS
-    rho = np.minimum(rho, 1.0)
-    return rho
-
 
 def read_and_stitch_dump(fn: Path, args) -> Dict[str, Any]:
     with h5py.File(fn, "r") as f:
@@ -2176,7 +2501,7 @@ def read_and_stitch_dump(fn: Path, args) -> Dict[str, Any]:
         jq = try_read_vec3("jq")
 
         # nq: can be (ny,nx) or (ny,nx,nspec)
-# nq: can be (ny,nx) or (ny,nx,nspec)
+        # nq: can be (ny,nx) or (ny,nx,nspec)
         nq_blocks: List[np.ndarray] = []
         nspec_eq = 0
         nq: Optional[np.ndarray] = None
@@ -2397,11 +2722,11 @@ def _reconstruct_psi_from_bq(R: np.ndarray, Z: np.ndarray, bq: np.ndarray) -> Op
         B_R = -(1/R) * dpsi/dZ
         B_Z =  (1/R) * dpsi/dR
 
-    This corresponds to the COCOS=12 sign convention (sigma_{R\phi Z}=-1). The
+    This corresponds to the COCOS=12 sign convention (sigma_{R phi Z}=-1). The
     surrounding dump2imas workflow will subsequently convert the reconstructed
     psi to COCOS=11 by flipping its sign.
 
-    NOTE: this relation corresponds to sigma_{R\phi Z} = -1 (COCOS=12-type) in the Sauter
+    NOTE: this relation corresponds to sigma_{R phi Z} = -1 (COCOS=12-type) in the Sauter
     coordinate-convention definitions. dump2imas enforces COCOS=11 output by flipping the
     sign of psi after stitching/reconstruction.
 
@@ -2633,19 +2958,6 @@ def _ensure_psi_eq_available(
     log.warning("psi not available: dump psi missing; B-field reconstruction failed; mhd fallback not found. 1D profiles may be empty.")
 
 
-def _psi_axis_and_sign(psi: np.ndarray) -> Tuple[float, float]:
-    # Use median of finite psi as axis estimate and choose sign so that psi_out is mostly positive.
-    p = np.asarray(psi, dtype=float)
-    m = np.isfinite(p)
-    if not np.any(m):
-        return 0.0, 1.0
-    psi_axis = float(np.nanmedian(p[m]))
-    # sign: choose so that outside is positive
-    po = p[m] - psi_axis
-    sign = 1.0 if np.nanmean(po) >= 0 else -1.0
-    return psi_axis, sign
-
-
 def populate_equilibrium(eq: Any, data: Dict[str, Any], t_index: int, quiet: bool) -> None:
     t = float(data["time"])
 
@@ -2743,6 +3055,7 @@ def populate_core_profiles(cp: Any, data: Dict[str, Any], t_index: int, args) ->
     # Elementary charge (C) used when deriving Te from p/n
     sp = getattr(args, "_nimrod_species", {}) or {}
     qe = float(sp.get("qe_c", 1.602176634e-19))
+    n_scale = float(getattr(args, "n_scale", 1.0) or 1.0)
 
     psi_axis, psi_lcfs, tag = _choose_psi_axis_lcfs(data, args, log=log)
     if (not np.isfinite(psi_axis)) or (not np.isfinite(psi_lcfs)) or abs(psi_lcfs - psi_axis) < 1e-12:
@@ -2753,18 +3066,124 @@ def populate_core_profiles(cp: Any, data: Dict[str, Any], t_index: int, args) ->
     ps = np.asarray(psi2d, dtype=float)
     psi_pol_norm2d = (ps - float(psi_axis)) / den
 
+    # Optional: include perturbations in core_profiles when requested.
+    # For --edge-ggd-values=full we reconstruct a "full field" snapshot at phi=0:
+    #   full = equilibrium + pert_scale * sum_k [ re_k*cos(n_k*phi) - im_k*sin(n_k*phi) ].
+    edge_mode = str(getattr(args, "edge_ggd_values", "equilibrium") or "equilibrium").strip().lower()
+    _cp_vphi2d = None
+    _cp_jphi2d = None
+    _dens2d_cache = {}
+    if edge_mode == "full" and bool(getattr(args, "_nonlinear_run", False)):
+        fields = data.get("fields", {}) or {}
+        keff = np.asarray(data.get("keff"), dtype=float) if data.get("keff") is not None else np.arange(int(data.get("nmodes", 0) or 0), dtype=float)
+        phi0 = 0.0
+        try:
+            _pscl = float(getattr(args, "pert_scale", 1.0) or 1.0)
+        except Exception:
+            _pscl = 1.0
+
+        def _slice_modes_cp(A, *, spec=None, comp=None):
+            if A is None:
+                return None
+            AA = np.asarray(A)
+            nm = int(len(keff))
+            # vector component extraction
+            if comp is not None:
+                c = int(comp)
+                if AA.ndim == 4:
+                    if AA.shape[-1] == 3 and AA.shape[-2] == nm:
+                        return AA[:, :, :, c]
+                    if AA.shape[2] == 3 and AA.shape[3] == nm:
+                        return AA[:, :, c, :]
+                if AA.ndim == 3 and AA.shape[-1] == 3 * nm:
+                    return AA[:, :, c * nm:(c + 1) * nm]
+                return None
+            # density/species extraction
+            if spec is not None:
+                s = int(spec)
+                if AA.ndim == 4:
+                    if AA.shape[-1] == nm:
+                        return AA[:, :, s, :] if (0 <= s < AA.shape[2]) else None
+                    if AA.shape[2] == nm:
+                        return AA[:, :, :, s] if (0 <= s < AA.shape[3]) else None
+                return None
+            # scalar modes
+            if AA.ndim == 3 and AA.shape[-1] == nm:
+                return AA
+            return None
+
+        def _recon_cp(eq2d, reA, imA):
+            if eq2d is None and (reA is None or imA is None):
+                return None
+            out = _reconstruct_full_from_modes(eq2d, reA, imA, keff, float(phi0), pert_scale=_pscl)
+            return np.asarray(out, dtype=float) if out is not None else None
+
+        def _recon_key(eq2d, rekey, imkey, *, spec=None, comp=None):
+            return _recon_cp(eq2d, _slice_modes_cp(fields.get(rekey), spec=spec, comp=comp),
+                             _slice_modes_cp(fields.get(imkey), spec=spec, comp=comp))
+
+        # Override scalar equilibrium fields (when corresponding perturbations are present)
+        pr2d = _recon_key(pr2d, "repr", "impr") or pr2d
+        pe2d = _recon_key(pe2d, "repe", "impe") or pe2d
+        te2d = _recon_key(te2d, "rete", "imte") or te2d
+        ti2d = _recon_key(ti2d, "reti", "imti") or ti2d
+
+        # Density helper (spec=0 is electrons; spec>=1 are ion species)
+        def dens2d(spec_index: int):
+            key = int(spec_index)
+            if key in _dens2d_cache:
+                return _dens2d_cache[key]
+            eq = None
+            try:
+                if nq is not None and getattr(nq, "ndim", 0) >= 3 and key < int(nq.shape[-1]):
+                    eq = np.asarray(nq[..., key], dtype=float)
+                elif nq is not None and getattr(nq, "ndim", 0) == 2 and key == 0:
+                    eq = np.asarray(nq, dtype=float)
+            except Exception:
+                eq = None
+            full = _recon_key(eq, "rend", "imnd", spec=key)
+            out = full if full is not None else eq
+            _dens2d_cache[key] = out
+            return out
+
+        # Toroidal velocity/current overrides (used later in binning)
+        try:
+            vphi_eq = np.asarray(vq[..., 2], dtype=float) if (vq is not None and getattr(vq, "ndim", 0) >= 3) else None
+            _cp_vphi2d = _recon_key(vphi_eq, "reve", "imve", comp=2) or vphi_eq
+        except Exception:
+            _cp_vphi2d = None
+        try:
+            jphi_eq = np.asarray(jq[..., 2], dtype=float) if (jq is not None and getattr(jq, "ndim", 0) >= 3) else None
+            _cp_jphi2d = _recon_key(jphi_eq, "reja", "imja", comp=2) or jphi_eq
+        except Exception:
+            _cp_jphi2d = None
+
     # --- plasma-like mask: stay inside LCFS and avoid vacuum artifacts ---
     m = np.isfinite(psi_pol_norm2d)
     m &= (psi_pol_norm2d >= 0.0) & (psi_pol_norm2d <= 1.0 + 1e-6)
 
     # Prefer Te > te_min, else use p/n, else use p>0 or n>0.
     te_min = float(getattr(args, "te_min_ev", 20.0) or 20.0)
+    
     ne2d = None
     try:
-        if nq is not None and getattr(nq, "ndim", 0) >= 3 and nq.shape[-1] >= 1:
-            ne2d = np.asarray(nq[..., 0], dtype=float)
+        if nq is not None:
+            _A = np.asarray(nq, dtype=float)
+            if _A.ndim == 2:
+                ne2d = _A
+            elif _A.ndim >= 3 and _A.shape[-1] >= 1:
+                ne2d = _A[..., 0]
     except Exception:
         ne2d = None
+
+    # If "full field" was requested, override ne2d using density perturbations (spec=0).
+    if edge_mode == "full" and bool(getattr(args, "_nonlinear_run", False)):
+        try:
+            ne2d_full = dens2d(0)
+            if ne2d_full is not None:
+                ne2d = ne2d_full
+        except Exception:
+            pass
 
     if te2d is not None:
         te = np.asarray(te2d, dtype=float)
@@ -2806,7 +3225,27 @@ def populate_core_profiles(cp: Any, data: Dict[str, Any], t_index: int, args) ->
     ion_dens: List[Optional[np.ndarray]] = []
     if nq is not None and getattr(nq, "ndim", 0) >= 3 and nq.shape[-1] >= 2:
         for s in range(1, int(nq.shape[-1])):
-            ion_dens.append(_bin_scalar_on_rho_bins(nq[..., s], psi_pol_norm2d, edges, m))
+            ion_dens.append(_bin_scalar_on_rho_bins((dens2d(s) if (edge_mode == "full" and bool(getattr(args, "_nonlinear_run", False))) else nq[..., s]), psi_pol_norm2d, edges, m))
+
+    # No explicit ion channels (single-ion/no-impurity dump): synthesize a single main-ion density
+    # using constant zeff_input (preferred) or Z_main when available.
+    if (not ion_dens) and (ne2d is not None):
+        z_main = 1.0
+        try:
+            zlist = sp.get("z_ions", None) or []
+            if zlist:
+                z_main = float(zlist[0])
+        except Exception:
+            z_main = 1.0
+        zeff_input = sp.get("zeff_input", None)
+        try:
+            zeff_v = float(zeff_input) if zeff_input not in (None, "") else None
+        except Exception:
+            zeff_v = None
+        divisor = float(zeff_v) if (zeff_v is not None and np.isfinite(zeff_v) and zeff_v > 0.0) else float(z_main if (np.isfinite(z_main) and z_main > 0.0) else 1.0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ni2d_eff = np.asarray(ne2d, dtype=float) / divisor
+        ion_dens.append(_bin_scalar_on_rho_bins(ni2d_eff, psi_pol_norm2d, edges, m))
 
     # Electron temperature: prefer teq; else derive from pe/ne when possible
     te1d = _bin_scalar_on_rho_bins(te2d, psi_pol_norm2d, edges, m) if (te2d is not None) else None
@@ -2840,12 +3279,12 @@ def populate_core_profiles(cp: Any, data: Dict[str, Any], t_index: int, args) ->
         pi1d = ni_tot * qe * _as_f64(ti1d)
 
     # Toroidal velocity v_phi and omega_tor = vphi/R
-    vtor1d = _bin_scalar_on_rho_bins(vq[..., 2], psi_pol_norm2d, edges, m) if (vq is not None) else None
+    vtor1d = _bin_scalar_on_rho_bins((_cp_vphi2d if _cp_vphi2d is not None else vq[..., 2]), psi_pol_norm2d, edges, m) if ((_cp_vphi2d is not None) or (vq is not None)) else None
     omega1d = None
-    if vq is not None and R is not None:
+    if ((_cp_vphi2d is not None) or (vq is not None)) and R is not None:
         try:
             RR = np.asarray(R, dtype=float)
-            vv = np.asarray(vq[..., 2], dtype=float)
+            vv = np.asarray((_cp_vphi2d if _cp_vphi2d is not None else vq[..., 2]), dtype=float)
             omega2d = np.full_like(RR, np.nan, dtype=float)
             mm = m & np.isfinite(RR) & (np.abs(RR) > 0) & np.isfinite(vv)
             omega2d[mm] = vv[mm] / RR[mm]
@@ -2854,7 +3293,7 @@ def populate_core_profiles(cp: Any, data: Dict[str, Any], t_index: int, args) ->
             omega1d = None
 
     # Toroidal current density
-    jtor1d = _bin_scalar_on_rho_bins(jq[..., 2], psi_pol_norm2d, edges, m) if (jq is not None) else None
+    jtor1d = _bin_scalar_on_rho_bins((_cp_jphi2d if _cp_jphi2d is not None else jq[..., 2]), psi_pol_norm2d, edges, m) if ((_cp_jphi2d is not None) or (jq is not None)) else None
 
     # ---- reduce empty-bin NaNs (common with quantized flux labels) ----
     te1d = _fill_nan_1d(te1d)
@@ -2990,6 +3429,36 @@ def populate_edge_profiles(ep: Any, data: Dict[str, Any], t_index: int, args) ->
     ti2d = data.get("tiq", None)
     jq = data.get("jq", None)
 
+    # --- ensure 2D electron equilibrium fields (NIMROD dumps may store some scalars with an extra trailing dim)
+    # psi_eq is expected to be 2D (R,Z). For equilibrium kinetic fields:
+    #   - nq is often [R,Z,nspecies]
+    #   - teq/peq/prq/tiq may appear as [R,Z,1] or [R,Z,ncomp]; we consistently take [:,:,0].
+    eidx = int(getattr(args, "electrons_index", 0))
+    def _slice0(a):
+        if a is None:
+            return None
+        a = np.asarray(a)
+        return a[:, :, 0] if getattr(a, "ndim", 0) == 3 else a
+
+    def _slice_species(a, idx):
+        if a is None:
+            return None
+        a = np.asarray(a)
+        if getattr(a, "ndim", 0) == 3:
+            ii = int(idx)
+            if ii < 0 or ii >= int(a.shape[2]):
+                ii = 0
+            return a[:, :, ii]
+        return a
+
+    # electron density / temperature / pressure used by edge_profiles
+    nq = _slice_species(nq, eidx)
+    te2d = _slice0(te2d)
+    pe2d = _slice0(pe2d)
+    pr2d = _slice0(pr2d)
+    ti2d = _slice0(ti2d)
+
+
     sp = getattr(args, "_nimrod_species", {}) or {}
     qe = float(sp.get("qe_c", 1.602176634e-19))
 
@@ -3002,14 +3471,474 @@ def populate_edge_profiles(ep: Any, data: Dict[str, Any], t_index: int, args) ->
     ps = np.asarray(psi2d, dtype=float)
     psi_pol_norm2d = (ps - float(psi_axis)) / den
 
+    # If requested, source edge_profiles 1D profiles from TRANSP-style peqdsk (equilibrium).
+    # This is important for cases where NIMROD teq/nq are not on the same separatrix definition as peqdsk.
+    edge_mode = str(getattr(args, 'edge_ggd_values', '') or '').strip().lower()
+    if edge_mode == 'equilibrium':
+
+        # Prefer preprocessed IMAS core_profiles (typically written by input2imas) as the equilibrium source.
+        # This avoids depending on external peqdsk discovery and avoids mixing dump COCOS with input2imas COCOS.
+        cp_pre = getattr(args, '_preproc_cp', None)
+        if cp_pre is not None:
+            prof_imas = _imas_core_profiles_te_ne(cp_pre, target_time=t, log=log)
+        else:
+            prof_imas = None
+
+        if prof_imas is not None:
+            ps1d, te_pe_ev, ne_pe_m3 = prof_imas
+            # Extend preprocessed core_profiles beyond LCFS (psi_pol_norm>1) so edge_profiles can
+            # represent SOL / edge regions in addition to the core. Prefer PEQDSK tail when available,
+            # because it is consistent with the input2imas equilibrium source.
+            try:
+                ps1d = _as_f64(ps1d)
+                te_pe_ev = _as_f64(te_pe_ev)
+                ne_pe_m3 = _as_f64(ne_pe_m3)
+            except Exception:
+                ps1d = np.asarray(ps1d, dtype=float)
+                te_pe_ev = np.asarray(te_pe_ev, dtype=float)
+                ne_pe_m3 = np.asarray(ne_pe_m3, dtype=float)
+
+            # Ensure sorted/unique
+            try:
+                ok = np.isfinite(ps1d) & np.isfinite(te_pe_ev) & np.isfinite(ne_pe_m3)
+                ps1d = ps1d[ok]; te_pe_ev = te_pe_ev[ok]; ne_pe_m3 = ne_pe_m3[ok]
+                o = np.argsort(ps1d)
+                ps1d = ps1d[o]; te_pe_ev = te_pe_ev[o]; ne_pe_m3 = ne_pe_m3[o]
+                # drop duplicates in psi (keep first)
+                if ps1d.size > 1:
+                    keep = np.ones(ps1d.size, dtype=bool)
+                    keep[1:] = (np.diff(ps1d) > 0.0)
+                    ps1d = ps1d[keep]; te_pe_ev = te_pe_ev[keep]; ne_pe_m3 = ne_pe_m3[keep]
+            except Exception:
+                pass
+
+            psi_core_max = float(np.nanmax(ps1d)) if ps1d.size else 1.0
+            psi_cap = getattr(args, 'edge_psi_max', None)
+            try:
+                psi_cap = float(psi_cap) if psi_cap not in (None, '') else None
+            except Exception:
+                psi_cap = None
+            # If user did not specify --edge-psi-max, do not impose an artificial cap.
+            # The SOL extent is determined from the available equilibrium sources:
+            #   * PEQDSK tail (preferred), otherwise
+            #   * maximum psi_pol_norm present on the stitched (R,Z) grid.
+            # --- Primary extension: PEQDSK tail beyond the last core point ---
+            peqdsk_path = _resolve_optional_file(args, 'peqdsk', 'peqdsk')
+            prof_ext = _peqdsk_te_ne_si(peqdsk_path, log=log) if peqdsk_path else None
+            if prof_ext is not None:
+                ps_ext, te_ext, ne_ext = prof_ext
+                ps_ext = _as_f64(ps_ext); te_ext = _as_f64(te_ext); ne_ext = _as_f64(ne_ext)
+                # Select only SOL tail and cap extent
+                eps = 1e-6
+                m = (ps_ext > (psi_core_max + eps)) & np.isfinite(ps_ext) & np.isfinite(te_ext) & np.isfinite(ne_ext)
+                if psi_cap is not None:
+                    m &= (ps_ext <= (psi_cap + 1e-12))
+                if np.any(m):
+                    ps1d = np.concatenate([ps1d, ps_ext[m]])
+                    te_pe_ev = np.concatenate([te_pe_ev, te_ext[m]])
+                    ne_pe_m3 = np.concatenate([ne_pe_m3, ne_ext[m]])
+                    o = np.argsort(ps1d)
+                    ps1d = ps1d[o]; te_pe_ev = te_pe_ev[o]; ne_pe_m3 = ne_pe_m3[o]
+                    log.info("edge_profiles(equilibrium): extended core_profiles with PEQDSK tail to psi_pol_norm=%.6g", float(np.nanmax(ps1d)))
+
+            # --- Secondary extension: dump-derived binning (only if still not extended) ---
+            # NOTE: do NOT attempt to construct Te in the SOL from p/n if teq is absent.
+            # In no-impurity cases, nq can become extremely small outside the LCFS and p/n will
+            # produce unphysical multi-keV spikes. If teq is not available, we fall back to a
+            # smooth extrapolation anchored at the separatrix values from the equilibrium source.
+            if (ps1d.size > 0) and (float(np.nanmax(ps1d)) <= 1.0001):
+                # separatrix anchors from the equilibrium 1D profile
+                try:
+                    i_sep = int(np.nanargmin(np.abs(ps1d - 1.0)))
+                except Exception:
+                    i_sep = int(ps1d.size - 1) if ps1d.size else 0
+                te_sep = float(te_pe_ev[i_sep]) if (te_pe_ev.size and np.isfinite(te_pe_ev[i_sep])) else float('nan')
+                ne_sep = float(ne_pe_m3[i_sep]) if (ne_pe_m3.size and np.isfinite(ne_pe_m3[i_sep])) else float('nan')
+                te_core_max = float(np.nanmax(te_pe_ev)) if te_pe_ev.size else float('nan')
+            
+                # Determine SOL extent from the stitched dump grid, but use a high-quantile
+                # rather than the absolute max to avoid vacuum/outlier regions dominating.
+                x_all = _as_f64(psi_pol_norm2d).ravel()
+                m_all = np.isfinite(x_all) & (x_all > 1.0)
+                if nq is not None:
+                    ne_all = _as_f64(nq).ravel()
+                    m_all &= np.isfinite(ne_all) & (ne_all > 0.0)
+                if int(np.count_nonzero(m_all)) >= 100:
+                    try:
+                        psi_max_2d = float(np.nanquantile(x_all[m_all], 0.999))
+                    except Exception:
+                        psi_max_2d = float(np.nanmax(x_all[m_all]))
+                else:
+                    psi_max_2d = float('nan')
+            
+                psi_target_max = float('nan')
+                if np.isfinite(psi_max_2d) and (psi_max_2d > 1.0):
+                    psi_target_max = float(psi_max_2d if (psi_cap is None) else min(psi_max_2d, psi_cap))
+            
+                if np.isfinite(psi_target_max) and (psi_target_max > 1.0 + 1e-3):
+                    # Estimate spacing from last part of the core profile
+                    try:
+                        d = np.diff(ps1d)
+                        dpsi = float(np.nanmedian(d[-min(20, d.size):])) if d.size else 0.01
+                    except Exception:
+                        dpsi = 0.01
+                    if (not np.isfinite(dpsi)) or dpsi <= 0.0:
+                        dpsi = 0.01
+            
+                    ps_sol = np.arange(1.0 + dpsi, psi_target_max + 0.5 * dpsi, dpsi, dtype=float)
+                    if ps_sol.size > 0:
+                        # Prefer teq from the dump; do NOT synthesize Te from p/n in the SOL.
+                        te_src = te2d if (te2d is not None) else None
+                        ne_src = nq
+            
+                        te_out = np.full(ps_sol.shape, np.nan, dtype=float)
+                        ne_out = np.full(ps_sol.shape, np.nan, dtype=float)
+            
+                        x = x_all
+                        if (te_src is not None) and (ne_src is not None):
+                            # Dump-derived SOL extension can be noisy if we mix divertor/private-flux regions.
+                            # Prefer an outboard-midplane sample in the SOL, with a fallback to the full-domain
+                            # sample if too few points are available.
+                            te_flat = _as_f64(te_src).ravel()
+                            ne_flat = _as_f64(ne_src).ravel()
+
+                            base_m = np.isfinite(x) & np.isfinite(te_flat) & np.isfinite(ne_flat)
+            
+                            # Density floor to prevent pathological regions dominating bins
+                            if np.isfinite(ne_sep) and ne_sep > 0.0:
+                                ne_floor = max(1e16, 1e-2 * float(ne_sep))
+                            else:
+                                ne_floor = 1e16
+                            base_m &= (ne_flat >= ne_floor)
+
+                            # Outboard-midplane preference (avoids divertor/private-flux mixing)
+                            mid_mask = None
+                            try:
+                                R2d = data.get('R', None)
+                                Z2d = data.get('Z', None)
+                                if (R2d is not None) and (Z2d is not None):
+                                    Rf = _as_f64(R2d).ravel()
+                                    Zf = _as_f64(Z2d).ravel()
+                                    if (Rf.size == x.size) and (Zf.size == x.size):
+                                        # axis estimate from minimum psi
+                                        ps_loc = _as_f64(psi2d)
+                                        k = int(np.nanargmin(ps_loc))
+                                        r_axis = float(Rf[k]); z_axis = float(Zf[k])
+                                        z_rng = float(np.nanmax(Zf) - np.nanmin(Zf))
+                                        dz = max(1e-3, 0.02 * z_rng)
+                                        mid_mask = (np.abs(Zf - z_axis) <= dz) & (Rf >= r_axis)
+                            except Exception:
+                                mid_mask = None
+            
+                            half = 0.5 * dpsi
+                            eps_lcfs = 2.0e-3
+                            min_pts = 128
+            
+                            for i, c in enumerate(ps_sol):
+                                lo = max(c - half, 1.0 + eps_lcfs)
+                                hi = c + half
+                                mm0 = base_m & (x >= lo) & (x < hi)
+                                mm = (mm0 & mid_mask) if (mid_mask is not None) else mm0
+                                if (mid_mask is not None) and (mm.sum() < min_pts):
+                                    # fallback: too few points in the midplane band
+                                    mm = mm0
+                                if mm.any():
+                                    # Use a low-quantile for Te to reject any residual hot-core leakage
+                                    try:
+                                        te_v = float(np.nanquantile(te_flat[mm], 0.2))
+                                    except Exception:
+                                        te_v = float(np.nanmedian(te_flat[mm]))
+                                    ne_v = float(np.nanmedian(ne_flat[mm]))
+                                    # Hard sanity: SOL Te must not exceed core max
+                                    if np.isfinite(te_core_max) and np.isfinite(te_v) and (te_v > te_core_max * 1.05):
+                                        te_v = float('nan')
+                                    te_out[i] = te_v
+                                    ne_out[i] = ne_v
+            
+                        # Fill missing SOL bins by smooth extrapolation anchored at the separatrix
+                        def _exp_tail(y_sep, psi_arr, y_floor=0.0):
+                            if (not np.isfinite(y_sep)) or y_sep <= 0.0:
+                                return np.full_like(psi_arr, np.nan, dtype=float)
+                            lam = 0.05
+                            try:
+                                j = np.where((ps1d > 0.85) & (ps1d <= 1.0) & np.isfinite(te_pe_ev) & (te_pe_ev > 0.0))[0]
+                                if j.size >= 6:
+                                    jj = j[-6:]
+                                    yy = np.log(np.maximum(te_pe_ev[jj], 1e-12))
+                                    xx = ps1d[jj]
+                                    s = np.polyfit(xx, yy, 1)[0]
+                                    if np.isfinite(s) and s < 0.0:
+                                        lam = float(min(0.2, max(0.01, -1.0 / s)))
+                            except Exception:
+                                pass
+                            out = y_sep * np.exp(-(psi_arr - 1.0) / lam)
+                            if y_floor > 0.0:
+                                out = np.maximum(out, float(y_floor))
+                            return out
+            
+                        te_ex = _exp_tail(te_sep, ps_sol, y_floor=0.5)
+                        ne_ex = _exp_tail(ne_sep, ps_sol, y_floor=0.0)
+            
+                        bad_te = ~np.isfinite(te_out)
+                        bad_ne = ~np.isfinite(ne_out)
+                        if np.any(bad_te) and np.any(np.isfinite(te_ex)):
+                            te_out[bad_te] = te_ex[bad_te]
+                        if np.any(bad_ne) and np.any(np.isfinite(ne_ex)):
+                            ne_out[bad_ne] = ne_ex[bad_ne]
+            
+                        # Enforce non-increasing SOL tails outward from the LCFS
+                        if np.isfinite(te_sep):
+                            prev = float(te_sep)
+                            for i in range(te_out.size):
+                                if np.isfinite(te_out[i]):
+                                    te_out[i] = min(float(te_out[i]), prev)
+                                    prev = float(te_out[i])
+                        if np.isfinite(ne_sep):
+                            prev = float(ne_sep)
+                            for i in range(ne_out.size):
+                                if np.isfinite(ne_out[i]):
+                                    ne_out[i] = min(float(ne_out[i]), prev)
+                                    prev = float(ne_out[i])
+            
+                        ok2 = np.isfinite(te_out) & np.isfinite(ne_out)
+                        if np.any(ok2):
+                            ps1d = np.concatenate([ps1d, ps_sol[ok2]])
+                            te_pe_ev = np.concatenate([te_pe_ev, te_out[ok2]])
+                            ne_pe_m3 = np.concatenate([ne_pe_m3, ne_out[ok2]])
+                            o = np.argsort(ps1d)
+                            ps1d = ps1d[o]; te_pe_ev = te_pe_ev[o]; ne_pe_m3 = ne_pe_m3[o]
+                            log.info("edge_profiles(equilibrium): extended with SOL tail to psi_pol_norm=%.6g", float(np.nanmax(ps1d)))
+
+            # For absolute psi (optional), prefer preprocessed equilibrium global_quantities when available.
+            pa_abs = float(psi_axis)
+            pb_abs = float(psi_lcfs)
+            eq_pre = getattr(args, '_preproc_eq', None)
+            if eq_pre is not None:
+                try:
+                    ts = getattr(eq_pre, 'time_slice', None)
+                    if ts is not None and len(ts) > 0:
+                        gq = getattr(ts[0], 'global_quantities', None)
+                        if gq is not None:
+                            pa2 = float(getattr(gq, 'psi_axis')) if hasattr(gq, 'psi_axis') else pa_abs
+                            pb2 = float(getattr(gq, 'psi_boundary')) if hasattr(gq, 'psi_boundary') else pb_abs
+                            if (abs(pb2 - pa2) > 1e-12) and (pa2 == pa2) and (pb2 == pb2):
+                                pa_abs, pb_abs = pa2, pb2
+                except Exception:
+                    pass
+
+            den_abs = float(pb_abs - pa_abs)
+            if (not np.isfinite(den_abs)) or abs(den_abs) < 1e-12:
+                den_abs = den
+
+            # pressures from profiles
+            pe1d = _as_f64(ne_pe_m3) * qe * _as_f64(te_pe_ev)
+
+            # synthesize single-ion density for no-impurity cases using zeff_input (preferred)
+            z_main = 1.0
+            try:
+                zlist = sp.get('z_ions', None) or []
+                if zlist:
+                    z_main = float(zlist[0])
+            except Exception:
+                z_main = 1.0
+            zeff_input = sp.get('zeff_input', None)
+            try:
+                zeff_v = float(zeff_input) if zeff_input not in (None, '') else None
+            except Exception:
+                zeff_v = None
+            divisor = float(zeff_v) if (zeff_v is not None and np.isfinite(zeff_v) and zeff_v > 0.0) else float(z_main if (np.isfinite(z_main) and z_main > 0.0) else 1.0)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ni1d = _as_f64(ne_pe_m3) / divisor
+
+            # grid coordinates from psinorm-like coordinate
+            psi_pol_norm_1d = _as_f64(ps1d)
+            psi_abs_1d = float(pa_abs) + psi_pol_norm_1d * den_abs
+
+            # append profile entry
+            idx = _append_time_edge_profiles(ep, t)
+            p = ep.profiles_1d[idx]
+            try:
+                p.time = float(t)
+            except Exception:
+                pass
+
+            # ---- grid coordinates ----
+            if hasattr(p, 'grid'):
+                g = p.grid
+                if hasattr(g, 'psi'):
+                    try:
+                        g.psi = _as_f64(psi_abs_1d)
+                    except Exception:
+                        pass
+                wrote_norm = False
+                for nm in ('psi_norm', 'rho_pol_norm'):
+                    if hasattr(g, nm):
+                        try:
+                            setattr(g, nm, _as_f64(psi_pol_norm_1d))
+                            wrote_norm = True
+                        except Exception:
+                            pass
+                if (not wrote_norm) and hasattr(g, 'rho_tor_norm'):
+                    try:
+                        g.rho_tor_norm = _as_f64(psi_pol_norm_1d)
+                    except Exception:
+                        pass
+
+                # Compatibility: also mirror psi_pol_norm into rho_tor_norm when available,
+                # because some plotting utilities only look at rho_tor_norm for the x-axis.
+                if hasattr(g, 'rho_tor_norm'):
+                    try:
+                        g.rho_tor_norm = _as_f64(psi_pol_norm_1d)
+                    except Exception:
+                        pass
+
+            # ---- populate electrons ----
+            try:
+                e = p.electrons
+                if hasattr(e, 'density'):
+                    e.density = _as_f64(ne_pe_m3)
+                if hasattr(e, 'temperature'):
+                    e.temperature = _as_f64(te_pe_ev)
+                if hasattr(e, 'pressure'):
+                    e.pressure = _as_f64(pe1d)
+            except Exception:
+                pass
+
+            # ---- populate ions (single representative main ion) ----
+            try:
+                if hasattr(p, 'ion'):
+                    ions = p.ion
+                elif hasattr(p, 'ions'):
+                    ions = p.ions
+                else:
+                    ions = None
+                if ions is not None:
+                    try:
+                        ions.resize(1)
+                        it = ions[0]
+                    except Exception:
+                        it = ions
+                    if hasattr(it, 'density'):
+                        it.density = _as_f64(ni1d)
+            except Exception:
+                pass
+
+            # Done: do not fall back to peqdsk or dump-derived binning.
+            return
+        peqdsk_path = _resolve_optional_file(args, 'peqdsk', 'peqdsk')
+        if peqdsk_path:
+            prof = _peqdsk_te_ne_si(peqdsk_path, log=log)
+        else:
+            prof = None
+        if prof is not None:
+            ps1d, te_pe_ev, ne_pe_m3 = prof
+            # pressures from peqdsk profiles
+            pe1d = _as_f64(ne_pe_m3) * qe * _as_f64(te_pe_ev)
+
+            # synthesize single-ion density for no-impurity cases using zeff_input (preferred)
+            z_main = 1.0
+            try:
+                zlist = sp.get('z_ions', None) or []
+                if zlist:
+                    z_main = float(zlist[0])
+            except Exception:
+                z_main = 1.0
+            zeff_input = sp.get('zeff_input', None)
+            try:
+                zeff_v = float(zeff_input) if zeff_input not in (None, '') else None
+            except Exception:
+                zeff_v = None
+            divisor = float(zeff_v) if (zeff_v is not None and np.isfinite(zeff_v) and zeff_v > 0.0) else float(z_main if (np.isfinite(z_main) and z_main > 0.0) else 1.0)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ni1d = _as_f64(ne_pe_m3) / divisor
+
+            # grid coordinates from psinorm
+            psi_pol_norm_1d = _as_f64(ps1d)
+            psi_abs_1d = float(psi_axis) + psi_pol_norm_1d * den
+
+            # append profile entry
+            idx = _append_time_edge_profiles(ep, t)
+            p = ep.profiles_1d[idx]
+            try:
+                p.time = float(t)
+            except Exception:
+                pass
+
+            # ---- grid coordinates ----
+            if hasattr(p, 'grid'):
+                g = p.grid
+                if hasattr(g, 'psi'):
+                    try:
+                        g.psi = _as_f64(psi_abs_1d)
+                    except Exception:
+                        pass
+                wrote_norm = False
+                for nm in ('psi_norm', 'rho_pol_norm'):
+                    if hasattr(g, nm):
+                        try:
+                            setattr(g, nm, _as_f64(psi_pol_norm_1d))
+                            wrote_norm = True
+                        except Exception:
+                            pass
+                if (not wrote_norm) and hasattr(g, 'rho_tor_norm'):
+                    # fallback: store psi_pol_norm into rho_tor_norm
+                    try:
+                        g.rho_tor_norm = _as_f64(psi_pol_norm_1d)
+                    except Exception:
+                        pass
+
+            # ---- populate electrons ----
+            try:
+                e = p.electrons
+                if hasattr(e, 'density'):
+                    e.density = _as_f64(ne_pe_m3)
+                if hasattr(e, 'temperature'):
+                    e.temperature = _as_f64(te_pe_ev)
+                if hasattr(e, 'pressure'):
+                    e.pressure = _as_f64(pe1d)
+            except Exception:
+                pass
+
+            # ---- populate ions (single representative main ion) ----
+            try:
+                if hasattr(p, 'ion'):
+                    ions = p.ion
+                elif hasattr(p, 'ions'):
+                    ions = p.ions
+                else:
+                    ions = None
+                if ions is not None:
+                    try:
+                        ions.resize(1)
+                        it = ions[0]
+                    except Exception:
+                        it = ions
+                    if hasattr(it, 'density'):
+                        it.density = _as_f64(ni1d)
+            except Exception:
+                pass
+
+            # Done: do not fall back to dump-derived binning.
+            return
+        else:
+            log.warning("edge_profiles: --edge-ggd-values equilibrium requested but peqdsk unavailable or missing Te/ne; falling back to dump-derived profiles")
+    p.add_argument('--edge-psi-max', dest='edge_psi_max', type=float, default=None,
+                   help='Maximum psi_pol_norm to include in edge_profiles.profiles_1d when extending beyond LCFS. If omitted, the extent is taken from PEQDSK tail (if available) or the maximum psi_pol_norm on the stitched (R,Z) grid.')
+
+
     # Base finite mask
     m = np.isfinite(psi_pol_norm2d)
 
     # Use density/pressure positivity to avoid deep vacuum (but keep SOL/PF)
+    
     ne2d = None
     try:
-        if nq is not None and getattr(nq, "ndim", 0) >= 3 and nq.shape[-1] >= 1:
-            ne2d = np.asarray(nq[..., 0], dtype=float)
+        if nq is not None:
+            _A = np.asarray(nq, dtype=float)
+            if _A.ndim == 2:
+                ne2d = _A
+            elif _A.ndim >= 3 and _A.shape[-1] >= 1:
+                ne2d = _A[..., 0]
     except Exception:
         ne2d = None
 
@@ -3067,6 +3996,26 @@ def populate_edge_profiles(ep: Any, data: Dict[str, Any], t_index: int, args) ->
     if nq is not None and getattr(nq, "ndim", 0) >= 3 and nq.shape[-1] >= 2:
         for s in range(1, int(nq.shape[-1])):
             ion_dens.append(_bin_scalar_on_rho_bins(nq[..., s], psi_pol_norm2d, edges, m))
+
+    # No explicit ion channels (single-ion/no-impurity dump): synthesize a single main-ion density
+    # using constant zeff_input (preferred) or Z_main when available.
+    if (not ion_dens) and (ne2d is not None):
+        z_main = 1.0
+        try:
+            zlist = sp.get("z_ions", None) or []
+            if zlist:
+                z_main = float(zlist[0])
+        except Exception:
+            z_main = 1.0
+        zeff_input = sp.get("zeff_input", None)
+        try:
+            zeff_v = float(zeff_input) if zeff_input not in (None, "") else None
+        except Exception:
+            zeff_v = None
+        divisor = float(zeff_v) if (zeff_v is not None and np.isfinite(zeff_v) and zeff_v > 0.0) else float(z_main if (np.isfinite(z_main) and z_main > 0.0) else 1.0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ni2d_eff = np.asarray(ne2d, dtype=float) / divisor
+        ion_dens.append(_bin_scalar_on_rho_bins(ni2d_eff, psi_pol_norm2d, edges, m))
 
     te1d = _bin_scalar_on_rho_bins(te2d, psi_pol_norm2d, edges, m) if (te2d is not None) else None
     if te1d is None and pe1d is not None and ne1d is not None:
@@ -3358,9 +4307,10 @@ def _gridggd_write_node_vectors(g: Any, r_nodes: np.ndarray, z_nodes: np.ndarray
             pass
         try:
             space_obj.coordinates_type.resize(1)
-            space_obj.coordinates_type[0].name = coord_name
-            space_obj.coordinates_type[0].index = -1
-            space_obj.coordinates_type[0].description = coord_name
+            _cn = str(coord_name).strip().lower()
+            space_obj.coordinates_type[0].name = _cn
+            space_obj.coordinates_type[0].index = {'r': 4, 'z': 3, 'phi': 5}.get(_cn, -1)
+            space_obj.coordinates_type[0].description = _cn
         except Exception:
             pass
         try:
@@ -3518,56 +4468,71 @@ def _build_fe_wedge_nodes_conn(
 
 
 def _gridggd_write_tri_connectivity(g: Any, tri_conn: np.ndarray) -> None:
-    """Write triangle connectivity into grid_ggd.grid_subset (standard IMAS location)."""
-    tri_conn = np.asarray(tri_conn, dtype=np.int32)
-    if tri_conn.ndim != 2 or tri_conn.shape[1] != 3:
-        raise ValueError("tri_conn must have shape (ntri,3)")
+    """Write a minimal IMAS-compliant 2D unstructured connectivity (triangles).
 
+    Defines two subsets:
+      - nodes: identifier.index=1, dimension=1
+      - cells: identifier.index=5, dimension=3 (2D faces / cells)
+
+    Each cell element references three node indices (0-based).
+    """
+    import numpy as _np
+    tri_conn = _np.asarray(tri_conn)
+    if tri_conn.ndim != 2 or tri_conn.shape[1] != 3:
+        raise ValueError(f"tri_conn must be (ntri,3); got {tri_conn.shape}")
+    ntri = int(tri_conn.shape[0])
+
+    # Subsets
     try:
         g.grid_subset.resize(2)
     except Exception:
         pass
 
-    s0 = g.grid_subset[0]
+    s_nodes = g.grid_subset[0]
     try:
-        s0.dimension = 0
-        s0.identifier.name = "nodes"
-        s0.identifier.index = 0
-        s0.identifier.description = "Unstructured nodes"
+        s_nodes.identifier.name = "nodes"
+        s_nodes.identifier.index = 1
+        s_nodes.identifier.description = "Unstructured nodes"
+        s_nodes.dimension = 1
     except Exception:
         pass
 
-    s1 = g.grid_subset[1]
+    s_cells = g.grid_subset[1]
     try:
-        s1.dimension = 2
-        s1.identifier.name = "cells"
-        s1.identifier.index = 1
-        s1.identifier.description = "Triangulated 2D cells"
+        s_cells.identifier.name = "cells"
+        s_cells.identifier.index = 5
+        s_cells.identifier.description = "Triangulated 2D cells"
+        s_cells.dimension = 3
     except Exception:
         pass
 
+    # Elements
     try:
-        s1.base.resize(1)
-        s1.base[0].index = 0
-        s1.base[0].grid_subset_index = 0
+        s_cells.element.resize(ntri)
     except Exception:
-        pass
+        return
 
-    try:
-        s1.element.resize(1)
-        e0 = s1.element[0]
-        e0.object.resize(3)
+    for i in range(ntri):
+        e = s_cells.element[i]
+        try:
+            e.object.resize(3)
+        except Exception:
+            pass
         for k in range(3):
+            o = e.object[k]
+            # node index (0-based)
             try:
-                e0.object[k].index = tri_conn[:, k].astype(np.int32, copy=False)
+                o.index = int(tri_conn[i, k]) - 1
             except Exception:
                 pass
-    except Exception:
-        pass
-
-    return None
-
-
+            try:
+                o.dimension = 1
+            except Exception:
+                pass
+            try:
+                o.space = 1
+            except Exception:
+                pass
 def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | None = None) -> None:
     """Populate the nonlinear mhd IDS (GGD-based) with reconstructed full fields.
 
@@ -3598,9 +4563,10 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
     if use_fe_nodes:
         it, ig = _append_time_ggd(mhd, t, write_grid=_ggd_should_write_grid(args), reuse_grid=bool(getattr(args, "ggd_reuse_grid", False)))
         g = mhd.grid_ggd[ig]
+        gidx = int(ig + 1)
         try:
             g.identifier.name = "nimrod_fe_rzphi_nodes_tri"
-            g.identifier.index = -1
+            g.identifier.index = int(ig + 1)
             g.identifier.description = "Native stitched NIMROD FE nodes (R,Z) replicated in phi; triangulated 2D connectivity per plane"
         except Exception:
             pass
@@ -3627,9 +4593,9 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
 
             s0 = g.grid_subset[0]
             try:
-                s0.dimension = 0
+                s0.dimension = 1
                 s0.identifier.name = "nodes"
-                s0.identifier.index = 0
+                s0.identifier.index = 1
                 s0.identifier.description = "Unstructured nodes"
             except Exception:
                 pass
@@ -3644,16 +4610,16 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
 
             s1 = g.grid_subset[1]
             try:
-                s1.dimension = 3
+                s1.dimension = 4
                 s1.identifier.name = "volumes"
-                s1.identifier.index = 1
+                s1.identifier.index = 43
                 s1.identifier.description = "Unstructured connectivity"
             except Exception:
                 pass
             try:
                 s1.base.resize(1)
                 s1.base[0].index = 0
-                s1.base[0].grid_subset_index = 0
+                s1.base[0].grid_subset_index = 1
             except Exception:
                 pass
             try:
@@ -3761,8 +4727,8 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
             except Exception:
                 qt = container
             try:
-                qt.grid_index = 1
-                qt.grid_subset_index = 0
+                qt.grid_index = int(ig + 1)
+                qt.grid_subset_index = 1
             except Exception:
                 pass
             nr_, nz_, nphi_ = V3.shape
@@ -3895,6 +4861,7 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
         # Species metadata (incl. qe and zeff_input)
         sp = getattr(args, '_nimrod_species', {}) or {}
         qe = float(sp.get('qe_c', 1.602176634e-19))
+        n_scale = float(getattr(args, "n_scale", 1.0) or 1.0)
         zeff_input = sp.get('zeff_input', None)
 
         # Electron density (species 0)
@@ -3995,6 +4962,131 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
         except Exception:
             pass
 
+        # --- Extra density-related leaves (when present in the DD) ---
+        # IMAS 4.1.x `mhd` IDS provides n_i_total, zeff, and mass_density, but does **not**
+        # define an electron density leaf. We still reconstruct n_e internally (ne3) for
+        # computing zeff and for convenience, but it may not be storable in mhd.
+        try:
+            # ion charges/masses from nimrod.in (if available)
+            z_ions = list(sp.get('z_ions', []) or sp.get('z_ion', []) or [])
+            m_ions = list(sp.get('m_ions_kg', []) or [])
+            amu = 1.66053906660e-27
+
+            # Helper: default mass when metadata is missing (assume deuterium)
+            def _mi_default(idx: int) -> float:
+                try:
+                    if idx < len(m_ions) and float(m_ions[idx]) > 0.0:
+                        return float(m_ions[idx])
+                except Exception:
+                    pass
+                return 2.0 * amu
+
+            # --- mass density ---
+            if hasattr(q, 'mass_density'):
+                rho3 = None
+                if ni3 is not None:
+                    if ion_index is not None:
+                        # Per-ion occurrence: rho = m_i * n_i
+                        rho3 = _mi_default(int(ion_index)) * np.asarray(ni3, dtype=float)
+                    else:
+                        # Total occurrence: rho = sum_i m_i * n_i
+                        if nqA is not None and nqA.ndim >= 3 and nqA.shape[2] >= 2:
+                            nion2 = int(nqA.shape[2] - 1)
+                            rho_acc = None
+                            for ii in range(nion2):
+                                ni_eq_i = nqA[:, :, 1 + ii]
+                                if ni_eq_i.shape != Rloc.shape and ni_eq_i.T.shape == Rloc.shape:
+                                    ni_eq_i = ni_eq_i.T
+                                # pick ion-i modes
+                                reN = fields.get('rend', None)
+                                imN = fields.get('imnd', None)
+                                re_i = im_i = None
+                                try:
+                                    if reN is not None and imN is not None:
+                                        reN = np.asarray(reN); imN = np.asarray(imN)
+                                        if reN.ndim == 4 and reN.shape[2] >= (2 + ii):
+                                            re_i = reN[:, :, 1 + ii, :]
+                                            im_i = imN[:, :, 1 + ii, :]
+                                except Exception:
+                                    re_i = im_i = None
+                                ni3_i = _recon_from(ni_eq_i, re_i, im_i)
+                                if ni3_i is None:
+                                    continue
+                                mi = _mi_default(ii)
+                                term = mi * np.asarray(ni3_i, dtype=float)
+                                rho_acc = term if rho_acc is None else (rho_acc + term)
+                            rho3 = rho_acc
+                        else:
+                            # Fallback: treat ni3 as single-ion density
+                            rho3 = _mi_default(0) * np.asarray(ni3, dtype=float)
+
+                if rho3 is not None:
+                    try:
+                        _write_node_scalar(q.mass_density, rho3)
+                    except Exception:
+                        pass
+
+            # --- zeff ---
+            if hasattr(q, 'zeff'):
+                zeff3 = None
+                if ion_index is None:
+                    # Prefer a density-based estimate: zeff = sum(Z_i^2 n_i) / sum(Z_i n_i)
+                    if nqA is not None and nqA.ndim >= 3 and nqA.shape[2] >= 2:
+                        nion2 = int(nqA.shape[2] - 1)
+                        sumZ2n = None
+                        sumZn  = None
+                        for ii in range(nion2):
+                            Zi = 1.0
+                            try:
+                                if ii < len(z_ions) and float(z_ions[ii]) > 0.0:
+                                    Zi = float(z_ions[ii])
+                            except Exception:
+                                Zi = 1.0
+                            ni_eq_i = nqA[:, :, 1 + ii]
+                            if ni_eq_i.shape != Rloc.shape and ni_eq_i.T.shape == Rloc.shape:
+                                ni_eq_i = ni_eq_i.T
+                            reN = fields.get('rend', None)
+                            imN = fields.get('imnd', None)
+                            re_i = im_i = None
+                            try:
+                                if reN is not None and imN is not None:
+                                    reN = np.asarray(reN); imN = np.asarray(imN)
+                                    if reN.ndim == 4 and reN.shape[2] >= (2 + ii):
+                                        re_i = reN[:, :, 1 + ii, :]
+                                        im_i = imN[:, :, 1 + ii, :]
+                            except Exception:
+                                re_i = im_i = None
+                            ni3_i = _recon_from(ni_eq_i, re_i, im_i)
+                            if ni3_i is None:
+                                continue
+                            ni3_i = np.asarray(ni3_i, dtype=float)
+                            termZn  = Zi * ni3_i
+                            termZ2n = (Zi * Zi) * ni3_i
+                            sumZn  = termZn  if sumZn  is None else (sumZn  + termZn)
+                            sumZ2n = termZ2n if sumZ2n is None else (sumZ2n + termZ2n)
+
+                        if sumZn is not None and sumZ2n is not None:
+                            with np.errstate(divide='ignore', invalid='ignore'):
+                                zeff3 = np.asarray(sumZ2n, dtype=float) / np.asarray(sumZn, dtype=float)
+                    # Minimal fallback when no ion-resolved densities exist
+                    if zeff3 is None and zeff_input not in (None, ''):
+                        try:
+                            if ni3 is not None:
+                                _ones = np.ones_like(np.asarray(ni3, dtype=float))
+                            else:
+                                _ones = np.ones((int(Rloc.shape[0]), int(Rloc.shape[1]), int(nphi)), dtype=float)
+                            zeff3 = float(zeff_input) * _ones
+                        except Exception:
+                            zeff3 = None
+                # For per-ion occurrences, zeff is redundant; skip.
+                if zeff3 is not None:
+                    try:
+                        _write_node_scalar(q.zeff, zeff3)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         # Ion pressure and ion temperature derived if needed
         pi3 = None
         if pr3 is not None and pe3 is not None:
@@ -4021,26 +5113,40 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
             except Exception:
                 pass
 
-        # Toroidal current density (toroidal/phi component index 2)
-        j_eq = None
+        # Current density components (J). NIMROD provides J in (R,Z,phi) components in jq[...,0:3].
+        # Reconstruct full fields as eq + sum_m (Re*cos(m*phi)+Im*sin(m*phi)).
+        jqA = None
         try:
             jqA = np.asarray(data.get('jq'), dtype=float) if data.get('jq') is not None else None
-            if jqA is not None and jqA.ndim >= 3:
-                j_eq = jqA[:, :, 2]
-                if j_eq.shape != Rloc.shape and j_eq.T.shape == Rloc.shape:
-                    j_eq = j_eq.T
+            if jqA is not None and jqA.ndim >= 3 and Rloc is not None:
+                # Some dumps store transposed arrays; align to Rloc.
+                if jqA.shape[0:2] != Rloc.shape and jqA[:, :, 0].T.shape == Rloc.shape:
+                    jqA = np.transpose(jqA, (1, 0, 2))
         except Exception:
+            jqA = None
+
+        def _write_J_component(comp: int, leaf_candidates: tuple[str, ...]) -> None:
             j_eq = None
-        j3 = _recon_from(j_eq, fields.get('reja', None), fields.get('imja', None), comp=2)
-        if j3 is not None:
-            # DD leaf name varies across IMAS versions; try common candidates
-            for _leaf in ("j_tor", "j_phi", "jtor", "current_density_tor", "current_density_phi", "current_density_tor_s"):
+            try:
+                if jqA is not None and jqA.ndim >= 3 and jqA.shape[2] > comp:
+                    j_eq = jqA[:, :, comp]
+            except Exception:
+                j_eq = None
+            j_full = _recon_from(j_eq, fields.get('reja', None), fields.get('imja', None), comp=comp)
+            if j_full is None:
+                return
+            for _leaf in leaf_candidates:
                 if hasattr(q, _leaf):
                     try:
-                        _write_node_scalar(getattr(q, _leaf), j3)
+                        _write_node_scalar(getattr(q, _leaf), j_full)
                         break
                     except Exception:
                         continue
+
+        # Toroidal/phi (comp=2) + poloidal plane components (comp=0:R, comp=1:Z)
+        _write_J_component(2, ("j_tor", "j_phi", "jtor", "current_density_tor", "current_density_phi", "current_density_tor_s"))
+        _write_J_component(0, ("j_r", "j_R", "jr", "current_density_r", "current_density_R", "current_density_radial"))
+        _write_J_component(1, ("j_z", "j_Z", "jz", "current_density_z", "current_density_Z", "current_density_axial"))
 
         # Toroidal rotation frequency omega = v_phi / R
         v_eq = None
@@ -4233,6 +5339,33 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
 
     def _make_values(eq_key: str, re_key: str, im_key: str):
         eq = data.get(eq_key, None)
+        # If equilibrium temperature fields are not written by NIMROD (common for no-impurity dumps),
+        # derive a consistent equilibrium baseline from (peq, prq, nq) so "full" fields include equilibrium
+        # + all available Fourier content.
+        if eq is None:
+            try:
+                qe = 1.602176634e-19
+                if eq_key == "teq":
+                    peq = data.get("peq", None)
+                    nq  = data.get("nq", None)
+                    if peq is not None and nq is not None:
+                        nqA = np.asarray(nq, dtype=float)
+                        ne2d = nqA[..., 0] if nqA.ndim >= 3 else nqA
+                        with np.errstate(divide="ignore", invalid="ignore"):
+                            eq = np.asarray(peq, dtype=float) / (np.asarray(ne2d, dtype=float) * qe)
+                elif eq_key == "tiq":
+                    prq = data.get("prq", None)
+                    peq = data.get("peq", None)
+                    nq  = data.get("nq", None)
+                    if prq is not None and peq is not None and nq is not None:
+                        nqA = np.asarray(nq, dtype=float)
+                        if nqA.ndim >= 3 and nqA.shape[-1] >= 2:
+                            ni2d = np.nansum(np.asarray(nqA[..., 1:], dtype=float), axis=2)
+                            pi2d = np.asarray(prq, dtype=float) - np.asarray(peq, dtype=float)
+                            with np.errstate(divide="ignore", invalid="ignore"):
+                                eq = np.asarray(pi2d, dtype=float) / (np.asarray(ni2d, dtype=float) * qe)
+            except Exception:
+                eq = None
         reA = fields.get(re_key, None)
         imA = fields.get(im_key, None)
         if eq is None and (reA is None or imA is None):
@@ -4329,9 +5462,10 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
 
     it, ig = _append_time_ggd(mhd, t, write_grid=_ggd_should_write_grid(args), reuse_grid=bool(getattr(args, "ggd_reuse_grid", False)))
     g = mhd.grid_ggd[ig]
+    gidx = int(ig + 1)
     try:
         g.identifier.name = "nimrod_rzphi_regular"
-        g.identifier.index = -1
+        g.identifier.index = int(ig + 1)
         g.identifier.description = "Regular R-Z(-phi) grid for NIMROD full-field export (downsampled)"
     except Exception:
         pass
@@ -4364,9 +5498,9 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
             # Subset 0: nodes (dimension=0)
             s0 = g.grid_subset[0]
             try:
-                s0.dimension = 0
+                s0.dimension = 1
                 s0.identifier.name = "nodes"
-                s0.identifier.index = 0
+                s0.identifier.index = 1
                 s0.identifier.description = "Unstructured nodes"
             except Exception:
                 pass
@@ -4391,9 +5525,9 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
             # Subset 1: volumes (dimension=3)
             s1 = g.grid_subset[1]
             try:
-                s1.dimension = 3
+                s1.dimension = 4
                 s1.identifier.name = "volumes"
-                s1.identifier.index = 1
+                s1.identifier.index = 43
                 s1.identifier.description = "Unstructured connectivity"
             except Exception:
                 pass
@@ -4401,7 +5535,7 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
                 # Base points to nodes subset
                 s1.base.resize(1)
                 s1.base[0].index = 0
-                s1.base[0].grid_subset_index = 0
+                s1.base[0].grid_subset_index = 1
             except Exception:
                 pass
             try:
@@ -4442,6 +5576,18 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
     except Exception:
         pass
 
+    # In structured mode, define at least the nodes subset per IMAS GGD specification.
+    if not getattr(args, 'ggd_unstructured', False):
+        try:
+            g.grid_subset.resize(1)
+            gs = g.grid_subset[0]
+            gs.identifier.name = 'nodes'
+            gs.identifier.index = 1
+            gs.identifier.description = 'All nodes of the structured grid'
+            gs.dimension = 1
+        except Exception:
+            pass
+
     def _fill_space(space_obj, coord_name: str, coord_vals: np.ndarray, geom_type_index: int = 0, geom_type_name: str = "standard"):
         """Populate grid_ggd.space for one coordinate axis.
 
@@ -4457,9 +5603,10 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
             pass
         try:
             space_obj.coordinates_type.resize(1)
-            space_obj.coordinates_type[0].name = coord_name
-            space_obj.coordinates_type[0].index = -1
-            space_obj.coordinates_type[0].description = coord_name
+            _cn = str(coord_name).strip().lower()
+            space_obj.coordinates_type[0].name = _cn
+            space_obj.coordinates_type[0].index = {'r': 4, 'z': 3, 'phi': 5}.get(_cn, -1)
+            space_obj.coordinates_type[0].description = _cn
         except Exception:
             pass
         try:
@@ -4529,10 +5676,27 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
         # up to max(axis_len) across R/Z/phi. To make the true nphi recoverable
         # without DD-dependent heuristics, we write a phi vector padded with
         # NaNs beyond the physical nphi.
-        _fill_space(g.space[0], "R", np.asarray([0.0, 1.0]))
-        _fill_space(g.space[1], "Z", np.asarray([0.0, 1.0]))
+        # Define explicit coordinate axes for the structured product grid (R, Z, phi).
+        try:
+            Rm = np.asarray(R, dtype=float).ravel(order='F')
+            Zm = np.asarray(Z, dtype=float).ravel(order='F')
+            msk = np.isfinite(Rm) & np.isfinite(Zm)
+            Rm = Rm[msk]; Zm = Zm[msk]
+            if Rm.size > 0 and Zm.size > 0:
+                rmin, rmax = np.quantile(Rm, [0.001, 0.999])
+                zmin, zmax = np.quantile(Zm, [0.001, 0.999])
+            else:
+                rmin, rmax = float(np.nanmin(R)), float(np.nanmax(R))
+                zmin, zmax = float(np.nanmin(Z)), float(np.nanmax(Z))
+        except Exception:
+            rmin, rmax = float(np.nanmin(R)), float(np.nanmax(R))
+            zmin, zmax = float(np.nanmin(Z)), float(np.nanmax(Z))
+        rc0 = np.linspace(float(rmin), float(rmax), int(nb))
+        zc0 = np.linspace(float(zmin), float(zmax), int(nb))
+        _fill_space(g.space[0], "R", rc0)
+        _fill_space(g.space[1], "Z", zc0)
         if nphi > 1:
-            _fill_space(g.space[2], "phi", np.asarray([0.0, 1.0]))
+            _fill_space(g.space[2], "phi", np.asarray(phi_list, dtype=float))
 
         try:
             g.grid_subset.resize(1)
@@ -4548,7 +5712,7 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
 
     # In unstructured mode, node-centered fields must reference the nodes subset (grid_subset_index=0).
     # In structured mode we keep the historical identifier.index=1 convention.
-    gs_nodes = 0 if getattr(args, 'ggd_unstructured', False) else 1
+    gs_nodes = 1  # nodes subset identifier.index per IMAS ggd_subset_identifier
 
 
     def _density_reduce_eq(eqA, mode: str):
@@ -4658,8 +5822,8 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
         try:
             q.electrons.temperature.resize(1)
             qt = q.electrons.temperature[0]
-            qt.grid_index = 1
-            qt.grid_subset_index = gs_nodes
+            qt.grid_index = gidx
+            qt.grid_subset_index = 1
             _set_values_and_shape(qt, vals, (len(rc), len(zc), int(Te3.shape[2])))
         except Exception:
             pass
@@ -4679,8 +5843,8 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
         try:
             q.electrons.density.resize(1)
             qn = q.electrons.density[0]
-            qn.grid_index = 1
-            qn.grid_subset_index = gs_nodes
+            qn.grid_index = gidx
+            qn.grid_subset_index = 1
             _set_values_and_shape(qn, vals, (len(rcN), len(zcN), int(ne3.shape[2])))
         except Exception:
             pass
@@ -4699,8 +5863,8 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
         try:
             q.t_i_average.resize(1)
             qt = q.t_i_average[0]
-            qt.grid_index = 1
-            qt.grid_subset_index = gs_nodes
+            qt.grid_index = gidx
+            qt.grid_subset_index = 1
             _set_values_and_shape(qt, vals, (len(rc2), len(zc2), int(Ti3.shape[2])))
         except Exception:
             pass
@@ -4719,8 +5883,8 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
         try:
             q.n_i_total.resize(1)
             qt = q.n_i_total[0]
-            qt.grid_index = 1
-            qt.grid_subset_index = gs_nodes
+            qt.grid_index = gidx
+            qt.grid_subset_index = 1
             _set_values_and_shape(qt, vals, (len(rc3), len(zc3), int(n3.shape[2])))
         except Exception:
             pass
@@ -4739,8 +5903,8 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
             try:
                 getattr(q, _leaf).resize(1)
                 qt = getattr(q, _leaf)[0]
-                qt.grid_index = 1
-                qt.grid_subset_index = gs_nodes
+                qt.grid_index = gidx
+                qt.grid_subset_index = 1
                 _set_values_and_shape(qt, vals, (len(rcv), len(zcv), int(Vv3.shape[2])))
             except Exception:
                 pass
@@ -4760,8 +5924,8 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
             vals = _np.asarray(omega3, dtype=float).ravel(order='F')
             q.rotation_frequency_tor_s.resize(1)
             qt = q.rotation_frequency_tor_s[0]
-            qt.grid_index = 1
-            qt.grid_subset_index = gs_nodes
+            qt.grid_index = gidx
+            qt.grid_subset_index = 1
             _set_values_and_shape(qt, vals, (len(rcv), len(zcv), int(Vphi3.shape[2])))
         except Exception:
             pass
@@ -4778,12 +5942,36 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
                     vals = __import__('numpy').asarray(J3, dtype=float).ravel(order='F')
                     getattr(q, _leaf).resize(1)
                     qt = getattr(q, _leaf)[0]
-                    qt.grid_index = 1
-                    qt.grid_subset_index = gs_nodes
+                    qt.grid_index = gidx
+                    qt.grid_subset_index = 1
                     _set_values_and_shape(qt, vals, (len(rcj), len(zcj), int(J3.shape[2])))
                     break
                 except Exception:
                     continue
+    # Poloidal-plane current density components j_r and j_z (equilibrium + perturbations)
+    for _leaf, _comp, _cands in (
+        ("j_r", 0, ("j_r", "current_density_r")),
+        ("j_z", 1, ("j_z", "current_density_z")),
+    ):
+        try:
+            rcj, zcj, Jc3 = _make_values_comp("jq", "reja", "imja", _comp)
+        except Exception:
+            rcj = zcj = Jc3 = None
+        if Jc3 is None:
+            continue
+        vals = __import__('numpy').asarray(Jc3, dtype=float).ravel(order='F')
+        for _nm in _cands:
+            if hasattr(q, _nm):
+                try:
+                    getattr(q, _nm).resize(1)
+                    qt = getattr(q, _nm)[0]
+                    qt.grid_index = gidx
+                    qt.grid_subset_index = 1
+                    _set_values_and_shape(qt, vals, (len(rcj), len(zcj), int(Jc3.shape[2])))
+                    break
+                except Exception:
+                    continue
+
 
 
 
@@ -5126,9 +6314,9 @@ def _write_edge_profiles_ion_velocity_component_ggd_h5(entry_dir, occ, *, compon
                                                    nion=1, grid_index=1, grid_subset_index=0, overwrite=True):
     """Write edge_profiles.ggd ion velocity component datasets directly via h5py.
 
-    We write both commonly-seen IMAS tokenizations:
+    We write DD4-compliant ion velocity tokenizations:
       - ggd[]&ion[]&velocity&<comp>[]&...
-      - ggd[]&ion[]&velocity_<comp>[]&...
+      - ggd[]&ion[]&velocity[]&<comp> (AoS component leaf)
 
     values_1d is a single-ion bulk-flow value list (flattened over nodes). We replicate it over nion ions,
     since per-ion flows are typically not available in dumpgll.
@@ -5150,7 +6338,7 @@ def _write_edge_profiles_ion_velocity_component_ggd_h5(entry_dir, occ, *, compon
     # replicate for all ions
     values_all = np.tile(values_1d, int(nion))
 
-    bases = [f"ggd[]&ion[]&velocity&{comp}[]", f"ggd[]&ion[]&velocity_{comp}[]"]
+    bases = [f"ggd[]&ion[]&velocity&{comp}[]"]
 
     h5_path = os.path.join(entry_dir, f"edge_profiles_{occ}.h5")
     grp = f"/edge_profiles_{occ}"
@@ -5165,6 +6353,19 @@ def _write_edge_profiles_ion_velocity_component_ggd_h5(entry_dir, occ, *, compon
         gi = np.asarray([[grid_index] * int(nion)], dtype=np.int32)
         gsi = np.asarray([[grid_subset_index] * int(nion)], dtype=np.int32)
         vshape = np.tile(shp.reshape(1, 1, 3), (1, int(nion), 1))
+
+
+        # DD-native tokenization (edge_profiles 4.1.x): ggd[]&ion[]&velocity[]&{r,phi,z}
+        base_native = "ggd[]&ion[]&velocity[]"
+        _h5_write_dataset(g, f"{base_native}&AOS_SHAPE", aos, dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f"{base_native}&grid_index", gi, dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f"{base_native}&grid_subset_index", gsi, dtype=np.int32, overwrite=overwrite)
+        try:
+            v_native = np.asarray(values_all, dtype=np.float64).reshape((1, int(nion), -1), order='C')
+        except Exception:
+            v_native = np.asarray(values_all, dtype=np.float64)
+        _h5_write_dataset(g, f"{base_native}&{comp}", v_native, dtype=np.float64, overwrite=overwrite)
+        _h5_write_dataset(g, f"{base_native}&{comp}_SHAPE", vshape, dtype=np.int32, overwrite=overwrite)
 
         for base in bases:
             _h5_write_dataset(g, f"{base}&AOS_SHAPE", aos, dtype=np.int32, overwrite=overwrite)
@@ -5188,6 +6389,34 @@ def _h5_write_dataset(g, name, data, *, dtype=None, overwrite=True, **kwargs):
     if dtype is not None:
         data = np.asarray(data, dtype=dtype)
     g.create_dataset(name, data=data, **kwargs)
+
+
+def _ids_backend_h5_loc(entry_dir: str, ids_name: str, occ: int):
+    """Return (h5_path, group_name) for an IDS occurrence in the HDF5 backend.
+
+    IMAS convention: occurrence 0 typically uses <ids>.h5 and group /<ids> (no '_0' suffix).
+    Some older tooling writes <ids>_0.h5 and /<ids>_0. We prefer the standard path but
+    fall back to an existing alternative if present.
+    """
+    import os
+    occ = int(occ)
+    ids_name = str(ids_name)
+    if occ == 0:
+        cands = [
+            (os.path.join(entry_dir, f"{ids_name}.h5"), f"/{ids_name}"),
+            (os.path.join(entry_dir, f"{ids_name}_0.h5"), f"/{ids_name}_0"),
+        ]
+    else:
+        cands = [
+            (os.path.join(entry_dir, f"{ids_name}_{occ}.h5"), f"/{ids_name}_{occ}"),
+            # Rare layout: all occurrences in a single file
+            (os.path.join(entry_dir, f"{ids_name}.h5"), f"/{ids_name}_{occ}"),
+        ]
+    for p, g in cands:
+        if os.path.exists(p):
+            return p, g
+    return cands[0]
+
 
 
 def _write_edge_profiles_electrons_pressure_ggd_h5(entry_dir, occ, *, values_1d, shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True):
@@ -5244,6 +6473,558 @@ def _write_edge_profiles_ion_z_ion_ggd_h5(entry_dir, occ, *, z_ions, overwrite=T
         g = f[f'edge_profiles_{occ}']
         _h5_write_dataset(g, 'ggd[]&ion[]&AOS_SHAPE', np.array([[1, int(nion)]], dtype=np.int32), dtype=np.int32, overwrite=False)
         _h5_write_dataset(g, base, z.reshape((1, int(nion))), dtype=np.int32, overwrite=overwrite)
+def _write_edge_profiles_zeff_ggd_h5(entry_dir, occ, *, values_1d, shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True):
+    """Write edge_profiles.ggd zeff values (DD: ggd(itime)/zeff(i1)/values)."""
+    import h5py
+    base = 'ggd[]&zeff[]'
+    fpath = os.path.join(entry_dir, f'edge_profiles_{occ}.h5')
+    with h5py.File(fpath, 'a') as f:
+        g = f[f'edge_profiles_{occ}']
+        _h5_write_dataset(g, f'{base}&AOS_SHAPE', np.array([[1]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_index', np.array([[grid_index]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_subset_index', np.array([[grid_subset_index]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&values', np.asarray(values_1d, dtype=np.float64).reshape((1, 1, -1)), dtype=np.float64, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&values_SHAPE', np.array([[list(shape_rzp)]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+
+
+def _write_edge_profiles_n_i_total_over_n_e_ggd_h5(entry_dir, occ, *, values_1d, shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True):
+    """Write edge_profiles.ggd n_i_total_over_n_e (DD: ggd(itime)/n_i_total_over_n_e(i1)/values)."""
+    import h5py
+    base = 'ggd[]&n_i_total_over_n_e[]'
+    fpath = os.path.join(entry_dir, f'edge_profiles_{occ}.h5')
+    with h5py.File(fpath, 'a') as f:
+        g = f[f'edge_profiles_{occ}']
+        _h5_write_dataset(g, f'{base}&AOS_SHAPE', np.array([[1]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_index', np.array([[grid_index]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_subset_index', np.array([[grid_subset_index]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&values', np.asarray(values_1d, dtype=np.float64).reshape((1, 1, -1)), dtype=np.float64, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&values_SHAPE', np.array([[list(shape_rzp)]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+
+        # Common alias used in some downstream scripts
+        base2 = 'ggd[]&ni_total_over_ne[]'
+        _h5_write_dataset(g, f'{base2}&AOS_SHAPE', np.array([[1]], dtype=np.int32), dtype=np.int32, overwrite=False)
+        _h5_write_dataset(g, f'{base2}&grid_index', np.array([[grid_index]], dtype=np.int32), dtype=np.int32, overwrite=False)
+        _h5_write_dataset(g, f'{base2}&grid_subset_index', np.array([[grid_subset_index]], dtype=np.int32), dtype=np.int32, overwrite=False)
+        _h5_write_dataset(g, f'{base2}&values', np.asarray(values_1d, dtype=np.float64).reshape((1, 1, -1)), dtype=np.float64, overwrite=False)
+        _h5_write_dataset(g, f'{base2}&values_SHAPE', np.array([[list(shape_rzp)]], dtype=np.int32), dtype=np.int32, overwrite=False)
+
+
+def _write_edge_profiles_j_total_component_ggd_h5(entry_dir, occ, *, component, values_1d, shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True):
+    """Write edge_profiles.ggd j_total component.
+
+    DD defines ggd(itime)/j_total(i1)/{r,phi,z}(:) among other components.
+    Here we populate only cylindrical components available directly from NIMROD.
+    """
+    import h5py
+    comp = str(component).lower().strip()
+    if comp not in ('r', 'z', 'phi'):
+        raise ValueError(f'component must be r|z|phi, got {component!r}')
+    base = 'ggd[]&j_total[]'
+    fpath = os.path.join(entry_dir, f'edge_profiles_{occ}.h5')
+    with h5py.File(fpath, 'a') as f:
+        g = f[f'edge_profiles_{occ}']
+        _h5_write_dataset(g, f'{base}&AOS_SHAPE', np.array([[1]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_index', np.array([[grid_index]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_subset_index', np.array([[grid_subset_index]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&{comp}', np.asarray(values_1d, dtype=np.float64).reshape((1, 1, -1)), dtype=np.float64, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&{comp}_SHAPE', np.array([[list(shape_rzp)]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+
+# -----------------------------------------------------------------------------
+# Additional core_profiles GGD writers (HDF5 backend; h5py direct)
+# -----------------------------------------------------------------------------
+
+def _write_core_profiles_electrons_temperature_ggd_h5(entry_dir, occ, *, values_1d, shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True):
+    import h5py
+    base = 'ggd[]&electrons&temperature[]'
+    fpath, grp = _ids_backend_h5_loc(entry_dir, 'core_profiles', occ)
+    with h5py.File(fpath, 'a') as f:
+        if grp not in f:
+            f.create_group(grp)
+        g = f[grp]
+        _h5_write_dataset(g, f'{base}&AOS_SHAPE', np.array([[1]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_index', np.array([[grid_index]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_subset_index', np.array([[grid_subset_index]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&values', np.asarray(values_1d, dtype=np.float64).reshape((1, 1, -1)), dtype=np.float64, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&values_SHAPE', np.array([[list(shape_rzp)]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+
+def _write_core_profiles_electrons_density_ggd_h5(entry_dir, occ, *, values_1d, shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True):
+    import h5py
+    base = 'ggd[]&electrons&density[]'
+    fpath, grp = _ids_backend_h5_loc(entry_dir, 'core_profiles', occ)
+    with h5py.File(fpath, 'a') as f:
+        if grp not in f:
+            f.create_group(grp)
+        g = f[grp]
+        _h5_write_dataset(g, f'{base}&AOS_SHAPE', np.array([[1]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_index', np.array([[grid_index]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_subset_index', np.array([[grid_subset_index]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&values', np.asarray(values_1d, dtype=np.float64).reshape((1, 1, -1)), dtype=np.float64, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&values_SHAPE', np.array([[list(shape_rzp)]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+
+def _write_core_profiles_electrons_pressure_ggd_h5(entry_dir, occ, *, values_1d, shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True):
+    import h5py
+    base = 'ggd[]&electrons&pressure[]'
+    fpath, grp = _ids_backend_h5_loc(entry_dir, 'core_profiles', occ)
+    with h5py.File(fpath, 'a') as f:
+        if grp not in f:
+            f.create_group(grp)
+        g = f[grp]
+        _h5_write_dataset(g, f'{base}&AOS_SHAPE', np.array([[1]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_index', np.array([[grid_index]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_subset_index', np.array([[grid_subset_index]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&values', np.asarray(values_1d, dtype=np.float64).reshape((1, 1, -1)), dtype=np.float64, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&values_SHAPE', np.array([[list(shape_rzp)]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+
+def _write_core_profiles_t_i_average_ggd_h5(entry_dir, occ, *, values_1d, shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True):
+    import h5py
+    base = 'ggd[]&t_i_average[]'
+    fpath, grp = _ids_backend_h5_loc(entry_dir, 'core_profiles', occ)
+    with h5py.File(fpath, 'a') as f:
+        if grp not in f:
+            f.create_group(grp)
+        g = f[grp]
+        _h5_write_dataset(g, f'{base}&AOS_SHAPE', np.array([[1]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_index', np.array([[grid_index]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_subset_index', np.array([[grid_subset_index]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&values', np.asarray(values_1d, dtype=np.float64).reshape((1, 1, -1)), dtype=np.float64, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&values_SHAPE', np.array([[list(shape_rzp)]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+
+def _write_core_profiles_ion_scalar_ggd_h5(entry_dir, occ, *, field, values_all_1d, shape_rzp, nion=1, grid_index=1, grid_subset_index=0, overwrite=True):
+    # field in {'density','pressure','temperature'}
+    base = f'ggd[]&ion[]&{field}[]'
+    import h5py
+    fpath, grp = _ids_backend_h5_loc(entry_dir, 'core_profiles', occ)
+    with h5py.File(fpath, 'a') as f:
+        if grp not in f:
+            f.create_group(grp)
+        g = f[grp]
+        _h5_write_dataset(g, 'ggd[]&ion[]&AOS_SHAPE', np.array([[1, int(nion)]], dtype=np.int32), dtype=np.int32, overwrite=False)
+        _h5_write_dataset(g, f'{base}&AOS_SHAPE', np.array([[1, int(nion)]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_index', np.full((1, int(nion)), int(grid_index), dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_subset_index', np.full((1, int(nion)), int(grid_subset_index), dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&values', np.asarray(values_all_1d, dtype=np.float64).reshape((1, int(nion), -1)), dtype=np.float64, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&values_SHAPE', np.tile(np.array([[list(shape_rzp)]], dtype=np.int32), (1, int(nion), 1)), dtype=np.int32, overwrite=overwrite)
+
+def _write_core_profiles_ion_z_ion_ggd_h5(entry_dir, occ, *, z_ions, overwrite=True):
+    base = 'ggd[]&ion[]&z_ion'
+    import h5py
+    fpath, grp = _ids_backend_h5_loc(entry_dir, 'core_profiles', occ)
+    z = np.asarray(z_ions)
+    if z.ndim == 0:
+        z = z.reshape((1,))
+    z = z.astype(np.int32, copy=False)
+    with h5py.File(fpath, 'a') as f:
+        if grp not in f:
+            f.create_group(grp)
+        g = f[grp]
+        _h5_write_dataset(g, 'ggd[]&ion[]&AOS_SHAPE', np.array([[1, int(z.size)]], dtype=np.int32), dtype=np.int32, overwrite=False)
+        _h5_write_dataset(g, f'{base}&AOS_SHAPE', np.array([[1, int(z.size)]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, base, z.reshape((1, int(z.size))), dtype=np.int32, overwrite=overwrite)
+
+def _write_core_profiles_zeff_ggd_h5(entry_dir, occ, *, values_1d, shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True):
+    """Write core_profiles.ggd zeff values (DD: ggd(itime)/zeff(i1)/values)."""
+    import h5py
+    base = 'ggd[]&zeff[]'
+    fpath, grp = _ids_backend_h5_loc(entry_dir, 'core_profiles', occ)
+    with h5py.File(fpath, 'a') as f:
+        if grp not in f:
+            f.create_group(grp)
+        g = f[grp]
+        _h5_write_dataset(g, f'{base}&AOS_SHAPE', np.array([[1]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_index', np.array([[grid_index]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_subset_index', np.array([[grid_subset_index]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&values', np.asarray(values_1d, dtype=np.float64).reshape((1, 1, -1)), dtype=np.float64, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&values_SHAPE', np.array([[list(shape_rzp)]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+
+def _write_core_profiles_n_i_total_over_n_e_ggd_h5(entry_dir, occ, *, values_1d, shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True):
+    import h5py
+    base = 'ggd[]&n_i_total_over_n_e[]'
+    fpath, grp = _ids_backend_h5_loc(entry_dir, 'core_profiles', occ)
+    with h5py.File(fpath, 'a') as f:
+        if grp not in f:
+            f.create_group(grp)
+        g = f[grp]
+        _h5_write_dataset(g, f'{base}&AOS_SHAPE', np.array([[1]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_index', np.array([[grid_index]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_subset_index', np.array([[grid_subset_index]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&values', np.asarray(values_1d, dtype=np.float64).reshape((1, 1, -1)), dtype=np.float64, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&values_SHAPE', np.array([[list(shape_rzp)]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+
+def _write_core_profiles_j_total_component_ggd_h5(entry_dir, occ, *, component, values_1d, shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True):
+    import h5py
+    comp = str(component).lower().strip()
+    if comp not in ('r', 'z', 'phi'):
+        raise ValueError(f'component must be r|z|phi, got {component!r}')
+    base = 'ggd[]&j_total[]'
+    fpath, grp = _ids_backend_h5_loc(entry_dir, 'core_profiles', occ)
+    with h5py.File(fpath, 'a') as f:
+        if grp not in f:
+            f.create_group(grp)
+        g = f[grp]
+        _h5_write_dataset(g, f'{base}&AOS_SHAPE', np.array([[1]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_index', np.array([[grid_index]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&grid_subset_index', np.array([[grid_subset_index]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&{comp}', np.asarray(values_1d, dtype=np.float64).reshape((1, 1, -1)), dtype=np.float64, overwrite=overwrite)
+        _h5_write_dataset(g, f'{base}&{comp}_SHAPE', np.array([[list(shape_rzp)]], dtype=np.int32), dtype=np.int32, overwrite=overwrite)
+
+def _write_core_profiles_ion_velocity_component_ggd_h5(entry_dir, occ, *, component, values_1d, shape_rzp,
+                                                   nion=1, grid_index=1, grid_subset_index=0, overwrite=True):
+    """Write core_profiles.ggd ion velocity component datasets directly via h5py.
+
+    Mirrors edge_profiles writer and writes DD-native tokenization:
+      - ggd[]&ion[]&velocity[]&{r,phi,z}
+    plus legacy aliases:
+      - ggd[]&ion[]&velocity&<comp>[]&...
+      - ggd[]&ion[]&velocity_<comp>[]&...
+    """
+    import h5py
+    comp = str(component).lower().strip()
+    if comp not in ("r", "z", "phi"):
+        raise ValueError(f"component must be one of r,z,phi; got {component!r}")
+
+    values_1d = np.asarray(values_1d, dtype=np.float64).ravel(order='F')
+    shp = np.asarray(shape_rzp, dtype=np.int32).ravel(order='C')
+    if shp.size != 3:
+        raise ValueError(f"shape_rzp must be (nr,nz,nphi); got {shape_rzp}")
+
+    if int(nion) < 1:
+        nion = 1
+
+    values_all = np.tile(values_1d, int(nion))
+
+    bases = [f"ggd[]&ion[]&velocity&{comp}[]", f"ggd[]&ion[]&velocity_{comp}[]"]
+
+    h5_path, grp = _ids_backend_h5_loc(entry_dir, "core_profiles", occ)
+
+    with h5py.File(h5_path, 'a') as h5:
+        if grp not in h5:
+            h5.create_group(grp)
+        g = h5[grp]
+
+        aos = np.asarray([[1, int(nion)]], dtype=np.int32)
+        gi = np.asarray([[grid_index] * int(nion)], dtype=np.int32)
+        gsi = np.asarray([[grid_subset_index] * int(nion)], dtype=np.int32)
+        vshape = np.tile(shp.reshape(1, 1, 3), (1, int(nion), 1))
+
+        base_native = "ggd[]&ion[]&velocity[]"
+        _h5_write_dataset(g, f"{base_native}&AOS_SHAPE", aos, dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f"{base_native}&grid_index", gi, dtype=np.int32, overwrite=overwrite)
+        _h5_write_dataset(g, f"{base_native}&grid_subset_index", gsi, dtype=np.int32, overwrite=overwrite)
+        v_native = np.asarray(values_all, dtype=np.float64).reshape((1, int(nion), -1), order='C')
+        _h5_write_dataset(g, f"{base_native}&{comp}", v_native, dtype=np.float64, overwrite=overwrite)
+        _h5_write_dataset(g, f"{base_native}&{comp}_SHAPE", vshape, dtype=np.int32, overwrite=overwrite)
+
+        # Also write legacy aliases for compatibility with older plotters
+        for base in bases:
+            _h5_write_dataset(g, f"{base}&AOS_SHAPE", aos, dtype=np.int32, overwrite=overwrite)
+            _h5_write_dataset(g, f"{base}&grid_index", gi, dtype=np.int32, overwrite=overwrite)
+            _h5_write_dataset(g, f"{base}&grid_subset_index", gsi, dtype=np.int32, overwrite=overwrite)
+            _h5_write_dataset(g, f"{base}&values", v_native, dtype=np.float64, overwrite=overwrite)
+            _h5_write_dataset(g, f"{base}&values_SHAPE", vshape, dtype=np.int32, overwrite=overwrite)
+
+
+def populate_core_profiles_ggd(cp: Any, data: Dict[str, Any], args) -> None:
+    """Populate core_profiles GGD using the same equilibrium-only strategy as edge_profiles.
+
+    This ensures core_profiles and edge_profiles export the same 2D equilibrium quantities in GGD form
+    (when the DD provides ggd/grid_ggd containers).
+    """
+    try:
+        # Reuse the edge_profiles implementation: it only assumes .ggd and .grid_ggd exist.
+        populate_edge_profiles_ggd(cp, data, args)
+    except Exception:
+        # Never fail the conversion on optional GGD population
+        return
+
+
+def _patch_core_profiles_ggd_required_leaves_h5(entry_dir: str, occ: int, data: Dict[str, Any], args, log: "logging.Logger") -> None:
+    """Ensure core_profiles GGD leaves needed for tooling are present and (optionally) write full equilibrium fields.
+
+    - Always write grid_ggd.space geometry vectors (R,Z,phi) to the backend if we can infer node coordinates.
+    - If --ggd-unstructured is enabled, write the full set of equilibrium fields (electrons/ions + j_total + flows)
+      directly to the backend using the native FE-node ordering, preserving the original node structure.
+    """
+    import numpy as np
+
+    nb = max(4, int(getattr(args, 'ggd_nbins', 128) or 128))
+    conn_kind = str(getattr(args, 'ggd_connectivity', 'none')).lower()
+
+    use_unstructured_nodes = (
+        bool(getattr(args, 'ggd_unstructured', False))
+        and bool(getattr(args, 'ggd_unstructured_fe_nodes', False))
+        and (conn_kind in ('fe_tri', 'fe_wedge', 'fe_pointcloud'))
+    )
+
+    use_fe_hex = (
+        bool(getattr(args, 'ggd_unstructured', False))
+        and (conn_kind == 'hex')
+    )
+
+    # Node coordinate vectors for grid_ggd.space geometry
+    try:
+        if use_unstructured_nodes:
+            Rbase = np.asarray(data.get('R'), dtype=float)
+            Zbase = np.asarray(data.get('Z'), dtype=float)
+            r_nodes = Rbase.ravel(order='F')
+            z_nodes = Zbase.ravel(order='F')
+            phi_nodes = np.zeros_like(r_nodes)
+        else:
+            Rm = np.asarray(data.get('R'), dtype=float)
+            Zm = np.asarray(data.get('Z'), dtype=float)
+            Vref = data.get('psi_eq', None)
+            if Vref is None:
+                Vref = data.get('teq', None)
+            if Vref is None:
+                Vref = Rm
+            rc, zc, _ = _interp2d_linear(Rm, Zm, np.asarray(Vref, dtype=float), nbins=int(nb), log=log)
+            r_nodes = rc.ravel(order='F')
+            z_nodes = zc.ravel(order='F')
+            phi_nodes = np.zeros_like(r_nodes)
+        _write_gridggd_space_geometry_vectors_h5(str(entry_dir), 'core_profiles', int(occ), r_nodes, z_nodes, phi_nodes, log=log)
+    except Exception as e:
+        log.debug('core_profiles grid_ggd geometry vectors patch skipped: %s', e)
+
+    # Only full-field patching in unstructured mode (preserve FE nodes ordering)
+    if not bool(getattr(args, 'ggd_unstructured', False)):
+        return
+
+    # For unstructured hex connectivity, we currently still store values on the product (R,Z) grid.
+    # Preserve the original FE ordering only for the FE-node cases above.
+    if (not use_unstructured_nodes) and (not use_fe_hex):
+        return
+
+    try:
+        nq = data.get('nq', None)
+        peq = data.get('peq', None)
+        teq = data.get('teq', None)
+        prq = data.get('prq', None)
+        tiq = data.get('tiq', None)
+        vq = data.get('vq', None)
+        jq = data.get('jq', None)
+
+        sp = getattr(args, '_nimrod_species', {}) or {}
+        qe = float(sp.get('qe_c', 1.602176634e-19))
+        n_scale = float(getattr(args, 'n_scale', 1.0) or 1.0)
+        z_ions = sp.get('z_ions', None)
+
+        def _to_grid(a):
+            if a is None:
+                return None
+            A = np.asarray(a, dtype=float)
+            if use_unstructured_nodes:
+                # Already node-centered in stitched FE order
+                return A
+            # Product grid downsample
+            try:
+                Rm = np.asarray(data.get('R'), dtype=float)
+                Zm = np.asarray(data.get('Z'), dtype=float)
+                rc, zc, val = _interp2d_linear(Rm, Zm, A, nbins=int(nb), log=log)
+                return val
+            except Exception:
+                return None
+
+        # Establish shape_rzp for values_SHAPE (nr,nz,nphi). Always nphi=1 here.
+        if use_unstructured_nodes:
+            nnode = int(np.asarray(data.get('R')).size)
+            shape_rzp = (nnode, 1, 1)
+        else:
+            Rm = np.asarray(data.get('R'), dtype=float)
+            Zm = np.asarray(data.get('Z'), dtype=float)
+            Vref = data.get('psi_eq', None)
+            if Vref is None:
+                Vref = data.get('teq', None)
+            if Vref is None:
+                Vref = Rm
+            rc, zc, _ = _interp2d_linear(Rm, Zm, np.asarray(Vref, dtype=float), nbins=int(nb), log=log)
+            shape_rzp = (int(rc.shape[0]), int(rc.shape[1]), 1)
+
+        # electrons
+        nqA = np.asarray(nq, dtype=float) if nq is not None else None
+        if nqA is not None:
+            nqA = nqA * float(n_scale)
+
+        ne2d = None
+        if nqA is not None:
+            if nqA.ndim == 2:
+                ne2d = nqA
+            elif nqA.ndim >= 3 and nqA.shape[-1] >= 1:
+                ne2d = nqA[..., 0]
+        ne2d = _to_grid(ne2d)
+
+        if ne2d is not None:
+            _write_core_profiles_electrons_density_ggd_h5(str(entry_dir), occ,
+                                                         values_1d=np.asarray(ne2d, dtype=float).ravel(order='F'),
+                                                         shape_rzp=shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True)
+
+        pe2d = _to_grid(peq)
+        if pe2d is not None:
+            _write_core_profiles_electrons_pressure_ggd_h5(str(entry_dir), occ,
+                                                          values_1d=np.asarray(pe2d, dtype=float).ravel(order='F'),
+                                                          shape_rzp=shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True)
+
+        te2d = _to_grid(teq)
+        if te2d is None and (pe2d is not None) and (ne2d is not None):
+            with np.errstate(divide='ignore', invalid='ignore'):
+                te2d = np.asarray(pe2d, dtype=float) / (np.asarray(ne2d, dtype=float) * qe)
+        if te2d is not None:
+            _write_core_profiles_electrons_temperature_ggd_h5(str(entry_dir), occ,
+                                                             values_1d=np.asarray(te2d, dtype=float).ravel(order='F'),
+                                                             shape_rzp=shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True)
+
+        # ions
+        pi2d = None
+        if (prq is not None) and (peq is not None):
+            try:
+                pi2d = _to_grid(np.asarray(prq, dtype=float) - np.asarray(peq, dtype=float))
+            except Exception:
+                pi2d = None
+
+        nqA = np.asarray(nq, dtype=float) if nq is not None else None
+        if nqA is not None:
+            nqA = nqA * float(n_scale)
+
+        nion = 1
+        if nqA is not None and nqA.ndim >= 3 and nqA.shape[-1] >= 2:
+            nion = int(nqA.shape[-1] - 1)
+        elif z_ions is not None:
+            try:
+                nion = max(1, int(np.size(z_ions)))
+            except Exception:
+                nion = 1
+
+        dens_list = []
+        if nqA is not None and nqA.ndim >= 3 and nqA.shape[-1] >= 2:
+            for k in range(nion):
+                dens_list.append(_to_grid(np.asarray(nqA[..., 1 + k], dtype=float)))
+        elif ne2d is not None:
+            dens_list = [np.asarray(ne2d, dtype=float)]
+        else:
+            dens_list = [np.full(shape_rzp[:2], np.nan, dtype=float)]
+
+        # t_i_average
+        ti2d = _to_grid(tiq)
+        if ti2d is None and (pi2d is not None):
+            ni_total = np.zeros(shape_rzp[:2], dtype=float)
+            for a in dens_list:
+                ni_total += np.asarray(a, dtype=float)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ti2d = np.asarray(pi2d, dtype=float) / (ni_total * qe)
+        if ti2d is not None:
+            _write_core_profiles_t_i_average_ggd_h5(str(entry_dir), occ,
+                                                   values_1d=np.asarray(ti2d, dtype=float).ravel(order='F'),
+                                                   shape_rzp=shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True)
+        else:
+            ti2d = np.full(shape_rzp[:2], np.nan, dtype=float)
+
+        pres_list = []
+        if pi2d is not None:
+            ni_total = np.zeros(shape_rzp[:2], dtype=float)
+            for a in dens_list:
+                ni_total += np.asarray(a, dtype=float)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                for a in dens_list:
+                    frac = np.asarray(a, dtype=float) / ni_total
+                    pres_list.append(np.asarray(pi2d, dtype=float) * frac)
+        else:
+            pres_list = [np.full(shape_rzp[:2], np.nan, dtype=float) for _ in dens_list]
+
+        def _cat(vals):
+            return np.concatenate([np.asarray(v, dtype=float).ravel(order='F') for v in vals], axis=0)
+
+        _write_core_profiles_ion_scalar_ggd_h5(str(entry_dir), occ, field='density',
+                                              values_all_1d=_cat(dens_list), shape_rzp=shape_rzp, nion=len(dens_list),
+                                              grid_index=1, grid_subset_index=0, overwrite=True)
+        _write_core_profiles_ion_scalar_ggd_h5(str(entry_dir), occ, field='pressure',
+                                              values_all_1d=_cat(pres_list), shape_rzp=shape_rzp, nion=len(pres_list),
+                                              grid_index=1, grid_subset_index=0, overwrite=True)
+        _write_core_profiles_ion_scalar_ggd_h5(str(entry_dir), occ, field='temperature',
+                                              values_all_1d=np.tile(np.asarray(ti2d, dtype=float).ravel(order='F'), len(dens_list)),
+                                              shape_rzp=shape_rzp, nion=len(dens_list), grid_index=1, grid_subset_index=0, overwrite=True)
+
+        # ion velocity (replicate bulk v for all ions)
+        if vq is not None:
+            vqA = np.asarray(vq, dtype=float)
+            if vqA.ndim >= 3 and vqA.shape[-1] >= 3:
+                vR = _to_grid(vqA[..., 0])
+                vZ = _to_grid(vqA[..., 1])
+                vP = _to_grid(vqA[..., 2])
+                _write_core_profiles_ion_velocity_component_ggd_h5(str(entry_dir), occ, component='r',
+                                                                  values_1d=np.asarray(vR, dtype=float).ravel(order='F'),
+                                                                  shape_rzp=shape_rzp, nion=len(dens_list),
+                                                                  grid_index=1, grid_subset_index=0, overwrite=True)
+                _write_core_profiles_ion_velocity_component_ggd_h5(str(entry_dir), occ, component='z',
+                                                                  values_1d=np.asarray(vZ, dtype=float).ravel(order='F'),
+                                                                  shape_rzp=shape_rzp, nion=len(dens_list),
+                                                                  grid_index=1, grid_subset_index=0, overwrite=True)
+                _write_core_profiles_ion_velocity_component_ggd_h5(str(entry_dir), occ, component='phi',
+                                                                  values_1d=np.asarray(vP, dtype=float).ravel(order='F'),
+                                                                  shape_rzp=shape_rzp, nion=len(dens_list),
+                                                                  grid_index=1, grid_subset_index=0, overwrite=True)
+
+        if z_ions is None:
+            z_ions = np.arange(1, 1 + len(dens_list), dtype=np.int32)
+        _write_core_profiles_ion_z_ion_ggd_h5(str(entry_dir), occ, z_ions=z_ions, overwrite=True)
+
+        # zeff and ni/ne
+        try:
+            if ne2d is None:
+                ne_use = np.zeros_like(ni_total, dtype=float)
+                if z_ions is None or len(z_ions) != len(dens_list):
+                    z_use = [1.0] * len(dens_list)
+                else:
+                    z_use = [float(z) for z in z_ions]
+                for _n, _z in zip(dens_list, z_use):
+                    ne_use += _z * np.asarray(_n, dtype=float)
+            else:
+                ne_use = np.asarray(ne2d, dtype=float)
+
+            ni_total = np.zeros(shape_rzp[:2], dtype=float)
+            for a in dens_list:
+                ni_total += np.asarray(a, dtype=float)
+
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ni_over_ne = np.where(ne_use != 0.0, np.asarray(ni_total, dtype=float) / ne_use, np.nan)
+                if z_ions is None or len(z_ions) != len(dens_list):
+                    zeff2d = np.ones_like(ni_over_ne, dtype=float)
+                else:
+                    num = np.zeros_like(ne_use, dtype=float)
+                    for _n, _z in zip(dens_list, [float(z) for z in z_ions]):
+                        num += (_z * _z) * np.asarray(_n, dtype=float)
+                    zeff2d = np.where(ne_use != 0.0, num / ne_use, np.nan)
+                if z_ions is not None and len(z_ions) == 1 and int(z_ions[0]) == 1:
+                    zeff2d = np.ones_like(ni_over_ne, dtype=float)
+
+            _write_core_profiles_zeff_ggd_h5(str(entry_dir), occ,
+                                             values_1d=zeff2d.ravel(order='F'),
+                                             shape_rzp=shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True)
+            _write_core_profiles_n_i_total_over_n_e_ggd_h5(str(entry_dir), occ,
+                                             values_1d=ni_over_ne.ravel(order='F'),
+                                             shape_rzp=shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True)
+        except Exception:
+            pass
+
+        # j_total components from jq
+        try:
+            if jq is not None and hasattr(jq, 'shape') and int(jq.shape[-1]) >= 3:
+                jR2d = _to_grid(np.asarray(jq[..., 0], dtype=float))
+                jZ2d = _to_grid(np.asarray(jq[..., 1], dtype=float))
+                jP2d = _to_grid(np.asarray(jq[..., 2], dtype=float))
+                _write_core_profiles_j_total_component_ggd_h5(str(entry_dir), occ, component='r',
+                                                             values_1d=np.asarray(jR2d, dtype=float).ravel(order='F'),
+                                                             shape_rzp=shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True)
+                _write_core_profiles_j_total_component_ggd_h5(str(entry_dir), occ, component='z',
+                                                             values_1d=np.asarray(jZ2d, dtype=float).ravel(order='F'),
+                                                             shape_rzp=shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True)
+                _write_core_profiles_j_total_component_ggd_h5(str(entry_dir), occ, component='phi',
+                                                             values_1d=np.asarray(jP2d, dtype=float).ravel(order='F'),
+                                                             shape_rzp=shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True)
+        except Exception:
+            pass
+
+    except Exception as e:
+        log.warning('core_profiles GGD required leaves write failed: %s', e)
+
+
 def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
     """Populate edge_profiles GGD (equilibrium-only).
 
@@ -5272,6 +7053,29 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
     ti2d = data.get("tiq", None)
     vq = data.get("vq", None)  # velocity (m/s)
     jq = data.get("jq", None)  # current density (A/m^2)
+    # Optional: override equilibrium GGD electron profiles from peqdsk when requested.
+    # Optional: override *temperature only* from PEQDSK when requested.
+    # Electron density is ALWAYS taken directly from dumpgll (nq), for both impurity and no-impurity cases.
+    edge_mode = str(getattr(args, 'edge_ggd_values', '') or '').strip().lower()
+    if edge_mode == 'equilibrium':
+        psi2d = data.get('psi_eq', None)
+        psi_axis = psi_lcfs = None
+        if psi2d is not None:
+            try:
+                _log = logging.getLogger(__name__) if log is None else log
+                psi_axis, psi_lcfs, _tag = _choose_psi_axis_lcfs(data, args, log=_log)
+                if np.isfinite(psi_axis) and np.isfinite(psi_lcfs) and abs(float(psi_lcfs) - float(psi_axis)) > 1e-12:
+                    den = float(psi_lcfs - psi_axis)
+                    psn2d = (np.asarray(psi2d, dtype=float) - float(psi_axis)) / den
+                    peqdsk_path = _resolve_optional_file(args, 'peqdsk', 'peqdsk')
+                    prof = _peqdsk_te_ne_si(peqdsk_path, log=_log) if peqdsk_path else None
+                    if prof is not None:
+                        ps1d, te_pe_ev, _ne_pe_m3 = prof
+                        psn_clip = np.clip(psn2d, float(ps1d[0]), float(ps1d[-1]))
+                        te2d = np.interp(psn_clip.ravel(order='F'), ps1d, te_pe_ev).reshape(psn_clip.shape, order='F')
+            except Exception:
+                pass
+
 
     # Bin configuration (reuse mhd GGD knobs)
     nb = max(4, int(getattr(args, "ggd_nbins", 128) or 128))
@@ -5302,7 +7106,7 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
         g = ep.grid_ggd[ig]
         try:
             g.identifier.name = "nimrod_fe_rz_nodes_tri"
-            g.identifier.index = -1
+            g.identifier.index = int(ig + 1)
             g.identifier.description = "Native stitched NIMROD FE nodes (R,Z); triangulated 2D connectivity; node-centered equilibrium fields"
         except Exception:
             pass
@@ -5324,15 +7128,35 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
         # Compute equilibrium-only node-centered fields on FE nodes.
         sp = getattr(args, '_nimrod_species', {}) or {}
         qe = float(sp.get('qe_c', 1.602176634e-19))
+        n_scale = float(getattr(args, "n_scale", 1.0) or 1.0)
         zeff_input = sp.get('zeff_input', None)
 
         nqA = np.asarray(nq, dtype=float) if nq is not None else None
-        ne2d = nqA[:, :, 0] if nqA is not None and nqA.ndim >= 3 else None
-        if ne2d is not None and ne2d.shape != Rloc.shape and ne2d.T.shape == Rloc.shape:
-            ne2d = ne2d.T
+        if nqA is not None:
+            nqA = np.asarray(nqA, dtype=float) * float(n_scale)
 
+
+        ne2d = None
+        try:
+            if nqA is not None:
+                if nqA.ndim == 2:
+                    ne2d = nqA
+                elif nqA.ndim >= 3 and nqA.shape[2] >= 1:
+                    ne2d = nqA[:, :, 0]
+            if ne2d is not None and ne2d.shape != Rloc.shape and ne2d.T.shape == Rloc.shape:
+                ne2d = ne2d.T
+        except Exception:
+            ne2d = None
         # electron temperature baseline
         te_eq = te2d
+
+        # If PEQDSK equilibrium override was requested, keep pressures consistent with (ne,Te) if possible.
+        try:
+            edge_mode = str(getattr(args, 'edge_ggd_values', '') or '').strip().lower()
+            if edge_mode == 'equilibrium' and te_eq is not None and ne2d is not None:
+                pe2d = np.asarray(ne2d, dtype=float) * float(qe) * np.asarray(te_eq, dtype=float)
+        except Exception:
+            pass
         if te_eq is None and pe2d is not None and ne2d is not None:
             with np.errstate(divide='ignore', invalid='ignore'):
                 te_eq = np.asarray(pe2d, dtype=float) / (np.asarray(ne2d, dtype=float) * qe)
@@ -5364,19 +7188,38 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
                 ti_eq = np.asarray(pi2d, dtype=float) / (np.asarray(ni2d_total, dtype=float) * qe)
             _log('edge_profiles(equilibrium): derived Ti = p_i/(n_i*qe) (tiq absent)')
 
-        # toroidal current density and rotation
-        jtor2d = None
-        if jq is not None:
-            jqA = np.asarray(jq, dtype=float)
-            if jqA.ndim >= 3:
-                jtor2d = jqA[:, :, 2]
-        omega2d = None
-        if vq is not None:
-            vqA = np.asarray(vq, dtype=float)
-            if vqA.ndim >= 3:
-                vphi2d = vqA[:, :, 2]
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    omega2d = np.asarray(vphi2d, dtype=float) / np.asarray(Rloc, dtype=float)
+        # Current density and flow (equilibrium; FE-node layout).
+        jr2d = jz2d = jtor2d = None
+        try:
+            if jq is not None:
+                jqA = np.asarray(jq, dtype=float)
+                if jqA.ndim >= 3:
+                    jr2d = jqA[:, :, 0]
+                    jz2d = jqA[:, :, 1]
+                    jtor2d = jqA[:, :, 2]
+                    if jr2d is not None and Rloc is not None and jr2d.shape != Rloc.shape and jr2d.T.shape == Rloc.shape:
+                        jr2d = jr2d.T
+                        jz2d = jz2d.T
+                        jtor2d = jtor2d.T
+        except Exception:
+            jr2d = jz2d = jtor2d = None
+
+        vr2d = vz2d = vphi2d = omega2d = None
+        try:
+            if vq is not None:
+                vqA = np.asarray(vq, dtype=float)
+                if vqA.ndim >= 3:
+                    vr2d = vqA[:, :, 0]
+                    vz2d = vqA[:, :, 1]
+                    vphi2d = vqA[:, :, 2]
+                    if vr2d is not None and Rloc is not None and vr2d.shape != Rloc.shape and vr2d.T.shape == Rloc.shape:
+                        vr2d = vr2d.T
+                        vz2d = vz2d.T
+                        vphi2d = vphi2d.T
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        omega2d = np.asarray(vphi2d, dtype=float) / np.asarray(Rloc, dtype=float)
+        except Exception:
+            vr2d = vz2d = vphi2d = omega2d = None
 
         # Write equilibrium scalars
         try:
@@ -5409,6 +7252,38 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
             _write_node_scalar(q.current_density_tor, jtor2d)
         except Exception:
             pass
+        # Also store J_R and J_Z if the DD provides leaves (common in some DD variants).
+        for _leaf, _arr in (
+            ("current_density_r", jr2d),
+            ("current_density_R", jr2d),
+            ("j_r", jr2d),
+            ("j_R", jr2d),
+            ("current_density_z", jz2d),
+            ("current_density_Z", jz2d),
+            ("j_z", jz2d),
+            ("j_Z", jz2d),
+        ):
+            try:
+                if hasattr(q, _leaf):
+                    _write_node_scalar(getattr(q, _leaf), _arr)
+            except Exception:
+                pass
+        # Also store J_R and J_Z if the DD provides leaves (common in some DD variants).
+        for _leaf, _arr in (
+            ("current_density_r", jr2d),
+            ("current_density_R", jr2d),
+            ("j_r", jr2d),
+            ("j_R", jr2d),
+            ("current_density_z", jz2d),
+            ("current_density_Z", jz2d),
+            ("j_z", jz2d),
+            ("j_Z", jz2d),
+        ):
+            try:
+                if hasattr(q, _leaf):
+                    _write_node_scalar(getattr(q, _leaf), _arr)
+            except Exception:
+                pass
         try:
             _write_node_scalar(q.rotation_frequency_tor_s, omega2d)
         except Exception:
@@ -5428,7 +7303,7 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
             except Exception:
                 qt = container
             try:
-                qt.grid_index = 1
+                qt.grid_index = int(ig)
                 qt.grid_subset_index = 0
             except Exception:
                 pass
@@ -5461,17 +7336,20 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
         sp = getattr(args, '_nimrod_species', {}) or {}
         qe = float(sp.get('qe_c', 1.602176634e-19))
         zeff_input = sp.get('zeff_input', None)
-
-        # Electron density
+        # Electron density (robust against nspec=1 and/or missing species axis)
         ne2d = None
         try:
             nqA = np.asarray(nq, dtype=float) if nq is not None else None
-            if nqA is not None and nqA.ndim >= 3:
-                ne2d = nqA[:, :, 0]
-                if ne2d.shape != Rloc.shape and ne2d.T.shape == Rloc.shape:
+            if nqA is not None:
+                if nqA.ndim == 2:
+                    ne2d = nqA
+                elif nqA.ndim >= 3 and nqA.shape[2] >= 1:
+                    ne2d = nqA[:, :, 0]
+                if ne2d is not None and ne2d.shape != Rloc.shape and getattr(ne2d, 'T', None) is not None and ne2d.T.shape == Rloc.shape:
                     ne2d = ne2d.T
         except Exception:
             ne2d = None
+
 
         # Electron pressure
         pe2d = np.asarray(pe2d, dtype=float) if pe2d is not None else None
@@ -5636,7 +7514,7 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
                 vel_obj = getattr(ion_k, 'velocity', None)
                 if vel_obj is None:
                     vel_obj = ion_k
-                for _leaf, _V2 in (('r', vr2d), ('z', vz2d), ('phi', vphi2d), ('velocity_r', vr2d), ('velocity_z', vz2d), ('velocity_phi', vphi2d)):
+                for _leaf, _V2 in (('r', vr2d), ('z', vz2d), ('phi', vphi2d)):
                     if hasattr(vel_obj, _leaf):
                         try:
                             _write_node_scalar(getattr(vel_obj, _leaf), _V2)
@@ -5680,38 +7558,74 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
 
     sp = getattr(args, "_nimrod_species", {}) or {}
     qe = float(sp.get("qe_c", 1.602176634e-19))
+    n_scale = float(getattr(args, "n_scale", 1.0) or 1.0)
 
-    # Derive missing equilibrium profiles if possible (2D).
-    if te2d is None and pe2d is not None and nq is not None and nq.shape[-1] >= 1:
+    # Electron density: ALWAYS prefer nq (even when peq/teq are present) to avoid unit mismatches.
+    ne2d = None
+    nqA = None
+    try:
+        nqA = np.asarray(nq, dtype=float) if nq is not None else None
+        if nqA is not None:
+            nqA = np.asarray(nqA, dtype=float) * float(n_scale)
+        if nqA is not None:
+            if nqA.ndim >= 3 and nqA.shape[-1] >= 1:
+                ne2d = nqA[..., 0]
+            elif nqA.ndim == 2:
+                ne2d = nqA
+    except Exception:
+        ne2d = None
+        nqA = None
+
+    # Derive missing equilibrium temperatures if needed (2D).  Te, Ti are stored in eV; pressure in Pa.
+    if te2d is None and (pe2d is not None) and (ne2d is not None):
         try:
-            ne2d = nq[..., 0]
             te2d = _as_f64(pe2d) / (_as_f64(ne2d) * qe)
         except Exception:
             te2d = None
 
-    if ti2d is None and pr2d is not None and pe2d is not None and nq is not None and nq.shape[-1] >= 2:
+    if ti2d is None and (pr2d is not None) and (pe2d is not None) and (nqA is not None) and (getattr(nqA, "ndim", 0) >= 3) and (nqA.shape[-1] >= 2):
         try:
-            ni2d = np.nansum(_as_f64(nq[..., 1:]), axis=2)
+            ni2d = np.nansum(_as_f64(nqA[..., 1:]), axis=2)
             pi2d = _as_f64(pr2d) - _as_f64(pe2d)
             ti2d = pi2d / (ni2d * qe)
         except Exception:
             ti2d = None
 
+    # Total ion density (needed by some DD variants that store only ratios).
     ni2d_total = None
-    if nq is not None and getattr(nq, "ndim", 0) >= 3 and nq.shape[-1] >= 2:
+    if (nqA is not None) and (getattr(nqA, "ndim", 0) >= 3) and (nqA.shape[-1] >= 2):
         try:
-            ni2d_total = np.nansum(_as_f64(nq[..., 1:]), axis=2)
+            ni2d_total = np.nansum(_as_f64(nqA[..., 1:]), axis=2)
+        except Exception:
+            ni2d_total = None
+    elif (ne2d is not None):
+        # No-impurity (single density channel) case: estimate main-ion density from constant Zeff.
+        try:
+            zeff = sp.get("zeff_input", None)
+            zeff = float(zeff) if zeff is not None else None
+            if zeff is not None and np.isfinite(zeff) and (zeff > 0.0):
+                ni2d_total = _as_f64(ne2d) / float(zeff)
         except Exception:
             ni2d_total = None
 
+
     # Toroidal components (common analysis targets). We store equilibrium-only fields.
-    vtor2d = None
+
+    vr2d = vz2d = vtor2d = None
     omega2d = None
     if vq is not None:
         try:
-            vtor2d = np.asarray(vq[..., 2], dtype=float)
+            vqA = np.asarray(vq, dtype=float)
+            if vqA.ndim >= 3:
+                vr2d = np.asarray(vqA[..., 0], dtype=float)
+                vz2d = np.asarray(vqA[..., 1], dtype=float)
+                vtor2d = np.asarray(vqA[..., 2], dtype=float)
+                if R is not None and vr2d is not None and vr2d.shape != R.shape and vr2d.T.shape == R.shape:
+                    vr2d = vr2d.T
+                    vz2d = vz2d.T
+                    vtor2d = vtor2d.T
         except Exception:
-            vtor2d = None
+            vr2d = vz2d = vtor2d = None
         if vtor2d is not None:
             try:
                 # omega = v_phi / R
@@ -5721,24 +7635,46 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
             except Exception:
                 omega2d = None
 
-    jtor2d = None
+    jr2d = jz2d = jtor2d = None
     if jq is not None:
         try:
-            jtor2d = np.asarray(jq[..., 2], dtype=float)
+            jqA = np.asarray(jq, dtype=float)
+            if jqA.ndim >= 3:
+                jr2d = np.asarray(jqA[..., 0], dtype=float)
+                jz2d = np.asarray(jqA[..., 1], dtype=float)
+                jtor2d = np.asarray(jqA[..., 2], dtype=float)
+                if R is not None and jr2d is not None and jr2d.shape != R.shape and jr2d.T.shape == R.shape:
+                    jr2d = jr2d.T
+                    jz2d = jz2d.T
+                    jtor2d = jtor2d.T
         except Exception:
-            jtor2d = None
+            jr2d = jz2d = jtor2d = None
 
     # Append time slice to GGD arrays.
     it, ig = _append_time_ggd(ep, t, write_grid=_ggd_should_write_grid(args), reuse_grid=bool(getattr(args, "ggd_reuse_grid", False)))
     g = ep.grid_ggd[ig]
+    gidx = int(ig)
 
     # Minimal grid identifier
     try:
         g.identifier.name = "nimrod_rz_regular"
-        g.identifier.index = -1
+        g.identifier.index = int(ig + 1)
         g.identifier.description = "Regular R-Z grid for NIMROD equilibrium export (downsampled)"
     except Exception:
         pass
+
+
+    # In structured mode, define at least the nodes subset per IMAS GGD specification.
+    if not getattr(args, 'ggd_unstructured', False):
+        try:
+            g.grid_subset.resize(1)
+            gs = g.grid_subset[0]
+            gs.identifier.name = 'nodes'
+            gs.identifier.index = 1
+            gs.identifier.description = 'All nodes of the structured grid'
+            gs.dimension = 1
+        except Exception:
+            pass
 
     # We reuse the structured/unstructured skeleton logic from mhd.ggd.
     if getattr(args, "ggd_unstructured", False):
@@ -5765,9 +7701,9 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
             # Subset 0: nodes (dimension=0) — placeholder scaffolding
             s0 = g.grid_subset[0]
             try:
-                s0.dimension = 0
+                s0.dimension = 1
                 s0.identifier.name = "nodes"
-                s0.identifier.index = 0
+                s0.identifier.index = 1
                 s0.identifier.description = "Unstructured nodes"
             except Exception:
                 pass
@@ -5783,19 +7719,19 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
             except Exception:
                 pass
 
-            # Subset 1: cells (dimension=2) — placeholder connectivity (quads)
+            # Subset 1: cells (dimension=3) — placeholder connectivity (quads)
             s1 = g.grid_subset[1]
             try:
-                s1.dimension = 2
+                s1.dimension = 3
                 s1.identifier.name = "cells"
-                s1.identifier.index = 1
+                s1.identifier.index = 5
                 s1.identifier.description = "Unstructured connectivity (quad placeholder)"
             except Exception:
                 pass
             try:
                 s1.base.resize(1)
                 s1.base[0].index = 0
-                s1.base[0].grid_subset_index = 0
+                s1.base[0].grid_subset_index = 1
             except Exception:
                 pass
             try:
@@ -5836,9 +7772,10 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
             pass
         try:
             space_obj.coordinates_type.resize(1)
-            space_obj.coordinates_type[0].name = coord_name
-            space_obj.coordinates_type[0].index = -1
-            space_obj.coordinates_type[0].description = coord_name
+            _cn = str(coord_name).strip().lower()
+            space_obj.coordinates_type[0].name = _cn
+            space_obj.coordinates_type[0].index = {'r': 4, 'z': 3, 'phi': 5}.get(_cn, -1)
+            space_obj.coordinates_type[0].description = _cn
         except Exception:
             pass
         try:
@@ -5922,8 +7859,8 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
             except Exception:
                 qt = container
             try:
-                qt.grid_index = 1
-                qt.grid_subset_index = 0 if getattr(args, "ggd_unstructured", False) else 1
+                qt.grid_index = int(ig)
+                qt.grid_subset_index = 0
             except Exception:
                 pass
             _set_values_and_shape(qt, vals, (len(rc), len(zc), int(nphi)))
@@ -5971,9 +7908,13 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
     _try_write(q, ('n_i_total_over_n_e', 'n_i_total_over_ne'), ni_over_ne)
 
     # current density (toroidal component)
+    _try_write(q, ("j_r", "j_R", "jr", "current_density_r", "current_density_R"), jr2d)
+    _try_write(q, ("j_z", "j_Z", "jz", "current_density_z", "current_density_Z"), jz2d)
     _try_write(q, ("j_tor", "j_phi", "jtor", "current_density_tor", "current_density_phi"), jtor2d)
 
     # velocity and rotation frequency (toroidal)
+    _try_write(q, ("v_r", "v_R", "vr", "velocity_r", "velocity_R"), vr2d)
+    _try_write(q, ("v_z", "vz", "velocity_z", "velocity_Z"), vz2d)
     _try_write(q, ("v_tor", "v_phi", "vtor", "velocity_tor", "velocity_phi"), vtor2d)
     # rotation_frequency_tor_s not written: edge_profiles DD stores ion velocity vector directly
 
@@ -6060,6 +8001,41 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
                         except Exception:
                             pass
 
+
+    # Fallback for simulations without explicit ion species in nq:
+    # populate a single main-ion entry from ni2d_total (computed above, typically ni = ne/Zeff).
+    if (hasattr(q, "ion") and (ni2d_total is not None) and not (nq is not None and getattr(nq, "ndim", 0) >= 3 and nq.shape[-1] >= 2)):
+        try:
+            if _aos_len(q.ion) < 1:
+                q.ion.resize(1)
+        except Exception:
+            pass
+        try:
+            ion0 = q.ion[0]
+            _try_write(ion0, ("density", "n", "number_density"), ni2d_total)
+            _try_write(ion0, ("temperature", "t_i", "t"), ti2d)
+            vel0 = getattr(ion0, 'velocity', None)
+            if vel0 is None:
+                vel0 = ion0
+            _try_write(vel0, ('r', 'velocity_r'), vr2d)
+            _try_write(vel0, ('z', 'velocity_z'), vz2d)
+            _try_write(vel0, ('phi', 'velocity_phi'), vtor2d)
+            if ti2d is not None:
+                try:
+                    pi0 = np.asarray(ni2d_total, dtype=float) * np.asarray(ti2d, dtype=float) * qe
+                except Exception:
+                    pi0 = None
+                _try_write(ion0, ("pressure", "p"), pi0)
+            # Best-effort metadata
+            for nm in ("z_ion", "z", "charge_state", "charge"):
+                if hasattr(ion0, nm):
+                    try:
+                        setattr(ion0, nm, 1.0)
+                        break
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
 def _build_unstructured_nodes_connectivity(
     data: Dict[str, Any],
@@ -6732,6 +8708,49 @@ def _write_gridggd_space_geometry_vectors_h5(
         else:
             g.create_dataset(ds_name, data=geom, maxshape=(1, 3, 1, 1, None, 1))
 
+        # Ensure minimal AoS metadata exists for downstream readers (e.g. GGD contour plotters).
+        # Some tools rely on these helper datasets to interpret coordinate ordering.
+        try:
+            nggd, nspace, nopd, nobj, npts, _ = geom.shape
+
+            def _ensure_int_dataset(name: str, payload):
+                if name in g:
+                    return
+                g.create_dataset(name, data=np.asarray(payload, dtype=np.int32), dtype=np.int32)
+
+            _ensure_int_dataset("grid_ggd[]&space[]&objects_per_dimension[]&AOS_SHAPE", [[nggd, nspace, nopd]])
+            _ensure_int_dataset("grid_ggd[]&space[]&objects_per_dimension[]&object[]&AOS_SHAPE", [[nggd, nspace, nopd, nobj]])
+            _ensure_int_dataset("grid_ggd[]&space[]&coordinates_type[]&AOS_SHAPE", [[nggd, nspace, 1]])
+
+            # Coordinate names and indices (r,z,phi). Write only if missing.
+            strdt = h5py.string_dtype("utf-8")
+            shp = (nggd, nspace, 1)
+
+            if "grid_ggd[]&space[]&coordinates_type[]&name" not in g:
+                nm = np.empty(shp, dtype=object)
+                desc = np.empty(shp, dtype=object)
+                idx = np.empty(shp, dtype=np.int32)
+
+                base_names = ["r", "z", "phi"]
+                base_idx = [4, 3, 5]
+
+                for ig in range(nggd):
+                    for ispace in range(nspace):
+                        n = base_names[ispace] if ispace < len(base_names) else f"coord{ispace}"
+                        nm[ig, ispace, 0] = n
+                        desc[ig, ispace, 0] = n
+                        idx[ig, ispace, 0] = base_idx[ispace] if ispace < len(base_idx) else -1
+
+                g.create_dataset("grid_ggd[]&space[]&coordinates_type[]&name", data=nm, dtype=strdt)
+                g.create_dataset("grid_ggd[]&space[]&coordinates_type[]&description", data=desc, dtype=strdt)
+                g.create_dataset("grid_ggd[]&space[]&coordinates_type[]&index", data=idx, dtype=np.int32)
+
+        except Exception as e:
+            try:
+                log.debug("space-geometry writer: could not write metadata datasets: %s", e)
+            except Exception:
+                pass
+
 def populate_mhd_linear(
     mhd: Any,
     data: Dict[str, Any],
@@ -7024,8 +9043,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run", type=int, required=True)
     p.add_argument("--backend", default="hdf5", choices=("hdf5",), help="IMAS backend")
     p.add_argument("--dbpath", default=".", help="DB root path (output directory)")
-    p.add_argument("--dd-version-dir", choices=["major", "full"], default="major",
-                   help="Directory component for DD version (default: major, e.g. 3 for 3.42.0)")
     p.add_argument("--dd-version", default=None, help="IMAS data dictionary version, e.g. 3.42.0")
 
     p.add_argument("--mode", default="a", help="DBEntry open mode: r/a/w/x (r+/rw accepted and mapped to a)")
@@ -7145,7 +9162,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--mem-limit-gb",
         type=float,
-        default=32.0,
+        default=64.0,
         help=(
             "Best-effort hard memory cap for this process in GB (Linux RLIMIT_AS). Default 32. "
             "Use to reduce risk of OS-level OOM/reboots on very large GGD exports."
@@ -7181,6 +9198,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Index in nq/rend/imnd corresponding to electrons (used to pair density with Te perturbation).",
     )
 
+    p.add_argument('--edge-psi-max', dest='edge_psi_max', type=float, default=None,
+        help='Maximum psi_pol_norm to include in edge_profiles.profiles_1d when extending beyond LCFS. If omitted, the extent is taken from PEQDSK tail (if available) or the maximum psi_pol_norm on the stitched (R,Z) grid.')
     
     p.add_argument("--p-scale", type=float, default=1.0,
                    help="Scale factor applied to pressure-like quantities from dump -> IMAS (e.g., kPa->Pa: 1e3).")
@@ -7209,6 +9228,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p.add_argument("--quiet", action="store_true")
+
+    p.add_argument("--no-checksums", dest="record_checksums", action="store_false",
+                   help="Disable provenance file checksums in workflow/dataset_fair IDSs.")
+    p.set_defaults(record_checksums=True)
+    p.add_argument("--checksum-algorithm", default="sha256",
+                   help="Hash algorithm for provenance checksums (sha256, sha1, md5, ...).")
 
 
     return p
@@ -7252,7 +9277,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     mode = _normalize_mode(str(args.mode))
 
     dbpath = Path(args.dbpath).expanduser().resolve()
-    entry_dir = _entry_dir(dbpath, str(args.dd), str(dd_version), int(args.pulse), int(args.run), dd_version_dir=str(args.dd_version_dir))
+    entry_dir = _entry_dir(dbpath, str(args.dd), str(dd_version), int(args.pulse), int(args.run), dd_version_dir=str(args.dd_version[0]))
 
     # Make entry_dir visible to helper routines (LCFS identification fallbacks)
     setattr(args, "_entry_dir", str(entry_dir))
@@ -7262,6 +9287,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     db = _open_db(imas, args.backend, entry_dir, mode, str(dd_version))
     factory = _ids_factory(imas, str(dd_version))
+    
+    # If input2imas ran before dump2imas, equilibrium/core_profiles may already exist in this entry.
+    # For --edge-ggd-values=equilibrium, prefer those preprocessed 1D profiles as the equilibrium source
+    # (avoids relying on external peqdsk discovery and avoids COCOS/sign mismatches).
+    try:
+        occ_try = int(getattr(args, 'occ_base', 1) or 1)
+    except Exception:
+        occ_try = 1
+
+    args._preproc_occ = None
+    args._preproc_eq = None
+    args._preproc_cp = None
+
+    try:
+        cp0 = _db_get(db, factory, 'core_profiles', occ_try)
+        eq0 = _db_get(db, factory, 'equilibrium', occ_try)
+        occ_found = occ_try if (cp0 is not None or eq0 is not None) else None
+
+        # Common workflow: input2imas writes occ=0, while dump2imas default occ_base=1.
+        if occ_found is None and occ_try != 0:
+            cp0 = cp0 or _db_get(db, factory, 'core_profiles', 0)
+            eq0 = eq0 or _db_get(db, factory, 'equilibrium', 0)
+            if cp0 is not None or eq0 is not None:
+                occ_found = 0
+
+        args._preproc_occ = occ_found
+        args._preproc_cp = cp0
+        args._preproc_eq = eq0
+
+        if occ_found is not None:
+            log.info('Preloaded existing equilibrium/core_profiles from IMAS entry (occ=%d) for edge_profiles equilibrium sourcing', int(occ_found))
+    except Exception:
+        pass
+
 
     # Important implementation detail:
     # We append time slices using put_slice() to avoid corruption issues observed
@@ -7300,6 +9359,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             nimrod_in_path = None
 
         nonlinear_flag = _nimrod_in_nonlinear(nimrod_in_path)
+        # Record run type for downstream helpers (edge/core perturbations only for nonlinear runs).
+        setattr(args, "_nonlinear_run", bool(nonlinear_flag is True))
+        if (not getattr(args, "_nonlinear_run", False)) and str(getattr(args, "edge_ggd_values", "equilibrium") or "equilibrium").strip().lower() == "full":
+            log.info("Linear run detected: forcing core_profiles/edge_profiles to equilibrium-only (ignoring --edge-ggd-values=full). Perturbations are written only to mhd_linear.")
         try:
             args._nimrod_species = _nimrod_species_info(nimrod_in_path)
         except Exception:
@@ -7310,6 +9373,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         #   - mhd:        reconstructed full fields in GGD form (time-dependent)
         # For linear runs, write only mhd_linear.
         write_mhd = (nonlinear_flag is True)
+
+        # Linear runs: mhd IDS is not written. For linear runs we ALWAYS keep core_profiles and edge_profiles
+        # equilibrium-only, regardless of --edge-ggd-values, to avoid contaminating equilibrium profiles with
+        # eigenfunction content. (Perturbations are stored only in mhd_linear.)
 
         # Always instantiate mhd_linear for output
         mhd_linear = factory.new("mhd_linear") if hasattr(factory, "new") else factory("mhd_linear")
@@ -7323,7 +9390,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 _log("[warn] Failed to instantiate mhd IDS (GGD-based). Continuing with mhd_linear only.", args.quiet)
                 mhd = None
 
-# By default, keep occurrences aligned: equilibrium/core_profiles occurrence == mhd(_linear) base occurrence.
+        # By default, keep occurrences aligned: equilibrium/core_profiles occurrence == mhd(_linear) base occurrence.
         # Occurrence handling:
         #   - Use --occ-base as the single source of truth.
         #   - Accept legacy flags (suppressed from --help) for backward compatibility.
@@ -7337,20 +9404,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         eq = factory.new("equilibrium") if hasattr(factory, "new") else factory("equilibrium")
         populate_equilibrium(eq, data, t_index=0, quiet=args.quiet)
         # Only write equilibrium if we actually appended a time_slice (avoid time-only placeholders)
-        try:
-            if hasattr(eq, "time_slice") and len(eq.time_slice) > 0:
-                _db_put_slice(db, eq, eq_occ)
-        except Exception:
-            pass
+        if hasattr(eq, "time_slice") and _aos_has_entries(eq.time_slice):
+            _db_put_slice(db, eq, eq_occ)
+            log.info("Wrote equilibrium (occ=%d)", int(eq_occ))
 
         cp = factory.new("core_profiles") if hasattr(factory, "new") else factory("core_profiles")
         populate_core_profiles(cp, data, t_index=0, args=args)
-        # Only write core_profiles if we actually appended profiles_1d (avoid empty placeholders)
+        populate_core_profiles_ggd(cp, data, args=args)
+
         try:
-            if hasattr(cp, "profiles_1d") and len(cp.profiles_1d) > 0:
-                _db_put_slice(db, cp, cp_occ)
+            has_1d = hasattr(cp, "profiles_1d") and _aos_has_entries(cp.profiles_1d)
         except Exception:
-            pass
+            has_1d = False
+        try:
+            has_ggd = hasattr(cp, "ggd") and hasattr(cp, "grid_ggd")
+            try:
+                has_ggd = has_ggd and _aos_has_entries(cp.ggd)
+            except Exception:
+                has_ggd = has_ggd
+        except Exception:
+            has_ggd = False
+
+        # Write core_profiles if we populated either profiles_1d or ggd (avoid empty placeholders)
+        if has_1d or has_ggd:
+            _db_put_slice(db, cp, cp_occ)
+            log.info("Wrote core_profiles (occ=%d)", int(cp_occ))
+            if has_ggd:
+                _patch_core_profiles_ggd_required_leaves_h5(str(entry_dir), int(cp_occ), data, args, log)
 
 
         # edge_profiles: equilibrium-only (profiles_1d + optional GGD)
@@ -7369,18 +9449,112 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             populate_edge_profiles_ggd(ep, data, args=args)
 
             try:
-                has_1d = hasattr(ep, "profiles_1d") and len(ep.profiles_1d) > 0
+                has_1d = hasattr(ep, "profiles_1d") and _aos_has_entries(ep.profiles_1d)
             except Exception:
                 has_1d = False
             try:
-                has_ggd = hasattr(ep, "ggd") and len(ep.ggd) > 0
+                # Some IMAS python bindings do not implement __len__ reliably for AOS containers.
+                # If ggd/grid_ggd exist but len() fails, assume GGD was populated and proceed with post-write geometry patching.
+                has_ggd = hasattr(ep, "ggd") and hasattr(ep, "grid_ggd")
+                try:
+                    has_ggd = has_ggd and (_aos_has_entries(ep.ggd))
+                except Exception:
+                    has_ggd = has_ggd
             except Exception:
                 has_ggd = False
 
             try:
                 if has_1d or has_ggd:
-                    _db_put_slice(db, ep, occ_base)
-                    # Ensure edge_profiles includes GGD node geometry and electrons.temperature values
+                    
+                    try:
+                        _db_put_slice(db, ep, occ_base)
+                        log.info("Wrote edge_profiles (occ=%d)", int(occ_base))
+                    except Exception as e:
+                        log.error("Failed to write edge_profiles (occ=%d): %s", int(occ_base), e, exc_info=True)
+                        raise
+
+                    # Always ensure grid_ggd node geometry vectors exist in the IMAS backend for edge_profiles.
+                    # plot_mhd.py expects the dataset:
+                    #   /edge_profiles_<occ>/grid_ggd[]&space[]&objects_per_dimension[]&object[]&geometry
+                    # The in-memory IDS population in structured mode may not materialize this dataset reliably,
+                    # so we write it explicitly via h5py.
+                    if has_ggd:
+                        try:
+                            nb = max(4, int(getattr(args, 'ggd_nbins', 128) or 128))
+                            conn_kind_ep = str(getattr(args, 'ggd_connectivity', 'none')).lower()
+                            use_unstructured_nodes = (
+                                bool(getattr(args, 'ggd_unstructured', False))
+                                and bool(getattr(args, 'ggd_unstructured_fe_nodes', False))
+                                and (conn_kind_ep in ('fe_tri', 'fe_wedge', 'fe_pointcloud'))
+                            )
+
+                            if use_unstructured_nodes:
+                                Rbase = np.asarray(data.get('R'), dtype=float)
+                                Zbase = np.asarray(data.get('Z'), dtype=float)
+                                r_nodes = Rbase.ravel(order='F')
+                                z_nodes = Zbase.ravel(order='F')
+                                phi_nodes = np.zeros_like(r_nodes)
+                            else:
+                                # Match the regular (R,Z) grid used by populate_edge_profiles_ggd() via _interp2d_linear().
+                                Rm = np.asarray(data.get('R'), dtype=float)
+                                Zm = np.asarray(data.get('Z'), dtype=float)
+                                Vref = data.get('psi_eq', None)
+                                if Vref is None:
+                                    Vref = data.get('teq', None)
+                                if Vref is None:
+                                    Vref = Rm
+                                rc, zc, _ = _interp2d_linear(Rm, Zm, np.asarray(Vref, dtype=float), nb, nb)
+                                RR, ZZ = np.meshgrid(rc, zc, indexing='ij')
+                                r_nodes = RR.ravel(order='F')
+                                z_nodes = ZZ.ravel(order='F')
+                                phi_nodes = np.zeros_like(r_nodes)
+
+                            _write_gridggd_space_geometry_vectors_h5(
+                                str(entry_dir),
+                                'edge_profiles',
+                                occ_base,
+                                r_nodes,
+                                z_nodes,
+                                phi_nodes,
+                                log=log,
+                            )
+                            log.info("edge_profiles: wrote grid_ggd.space geometry vectors (N=%d)", int(np.size(r_nodes)))
+                        except Exception as e:
+                            log.warning("edge_profiles: failed to ensure grid_ggd geometry vectors: %s", e)
+
+                    # Patch missing electrons.density in edge_profiles.ggd for structured (product-grid) outputs.
+                    # Some DD/python bindings omit this leaf; downstream tools may recompute ne from (p,T) and get wrong units.
+                    if has_ggd and (not bool(getattr(args, 'ggd_unstructured', False))):
+                        try:
+                            nb = max(4, int(getattr(args, 'ggd_nbins', 128) or 128))
+                            Rm = np.asarray(data.get('R'), dtype=float)
+                            Zm = np.asarray(data.get('Z'), dtype=float)
+                            nq = data.get('nq', None)
+                            ne_raw = None
+                            if nq is not None:
+                                nqA = np.asarray(nq, dtype=float)
+                                n_scale = float(getattr(args, "n_scale", 1.0) or 1.0)
+                                nqA = np.asarray(nqA, dtype=float) * float(n_scale)
+                                if nqA.ndim >= 3 and nqA.shape[-1] >= 1:
+                                    ne_raw = nqA[..., 0]
+                                elif nqA.ndim == 2:
+                                    ne_raw = nqA
+                            if ne_raw is not None:
+                                rc, zc, ne_grid = _interp2d_linear(Rm, Zm, np.asarray(ne_raw, dtype=float), nb, nb)
+                                shape_rzp = (int(ne_grid.shape[0]), int(ne_grid.shape[1]), 1)
+                                _write_edge_profiles_electrons_density_ggd_h5(
+                                    str(entry_dir), occ_base,
+                                    values_1d=np.asarray(ne_grid, dtype=float).ravel(order='F'),
+                                    shape_rzp=shape_rzp,
+                                    grid_index=1,
+                                    grid_subset_index=0,
+                                    overwrite=True,
+                                )
+                                log.info("edge_profiles: patched ggd.electrons.density (product grid)")
+                        except Exception as e:
+                            log.warning("edge_profiles: failed to patch ggd.electrons.density: %s", e)
+
+                    # Ensure edge_profiles includes GGD node geometry and electrons.temperature values and electrons.temperature values
                     # in standard IMAS backend paths (needed by plot_mhd.py).
 
                     if bool(getattr(args, 'ggd_unstructured', False)):
@@ -7452,9 +9626,111 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                 nq = data.get('nq', None)
                                 peq = data.get('peq', None)
                                 teq = data.get('teq', None)
+                                # If requested, reconstruct full-field edge quantities at phi=0 using modal coefficients.
+                                edge_mode_ep = str(getattr(args, 'edge_ggd_values', 'equilibrium') or 'equilibrium').strip().lower()
+                                if not bool(getattr(args, '_nonlinear_run', False)):
+                                    edge_mode_ep = 'equilibrium'
+                                if edge_mode_ep == 'full' and bool(getattr(args, '_nonlinear_run', False)):
+                                    fields_ep = data.get('fields', {}) or {}
+                                    keff_ep = np.asarray(data.get('keff'), dtype=float) if data.get('keff') is not None else np.arange(int(data.get('nmodes', 0) or 0), dtype=float)
+                                    phi0_ep = 0.0
+                                    try:
+                                        pscl_ep = float(getattr(args, 'pert_scale', 1.0) or 1.0)
+                                    except Exception:
+                                        pscl_ep = 1.0
+                                
+                                    def _slice_modes_ep(A, *, spec=None, comp=None):
+                                        if A is None:
+                                            return None
+                                        AA = np.asarray(A)
+                                        nm = int(len(keff_ep))
+                                        if comp is not None:
+                                            c = int(comp)
+                                            if AA.ndim == 4:
+                                                if AA.shape[-1] == 3 and AA.shape[-2] == nm:
+                                                    return AA[:, :, :, c]
+                                                if AA.shape[2] == 3 and AA.shape[3] == nm:
+                                                    return AA[:, :, c, :]
+                                            if AA.ndim == 3 and AA.shape[-1] == 3 * nm:
+                                                return AA[:, :, c * nm:(c + 1) * nm]
+                                            return None
+                                        if spec is not None:
+                                            s = int(spec)
+                                            if AA.ndim == 4:
+                                                if AA.shape[-1] == nm:
+                                                    return AA[:, :, s, :] if (0 <= s < AA.shape[2]) else None
+                                                if AA.shape[2] == nm:
+                                                    return AA[:, :, :, s] if (0 <= s < AA.shape[3]) else None
+                                            return None
+                                        if AA.ndim == 3 and AA.shape[-1] == nm:
+                                            return AA
+                                        return None
+                                
+                                    def _recon_ep(eq2d, rekey, imkey, *, spec=None, comp=None):
+                                        reA = _slice_modes_ep(fields_ep.get(rekey), spec=spec, comp=comp)
+                                        imA = _slice_modes_ep(fields_ep.get(imkey), spec=spec, comp=comp)
+                                        if eq2d is None and (reA is None or imA is None):
+                                            return None
+                                        return _reconstruct_full_from_modes(eq2d, reA, imA, keff_ep, float(phi0_ep), pert_scale=pscl_ep)
+                                
+                                    # Override native-mesh equilibrium arrays (before mapping to the chosen GGD grid)
+                                    if nq is not None:
+                                        try:
+                                            nqA_ep = np.asarray(nq, dtype=float) * float(getattr(args, 'n_scale', 1.0) or 1.0)
+                                            if nqA_ep.ndim == 2:
+                                                ne_native = nqA_ep
+                                            elif nqA_ep.ndim >= 3 and nqA_ep.shape[-1] >= 1:
+                                                ne_native = nqA_ep[..., 0]
+                                            else:
+                                                ne_native = None
+                                        except Exception:
+                                            ne_native = None
+                                        if ne_native is not None:
+                                            ne_native_full = _recon_ep(ne_native, 'rend', 'imnd', spec=0)
+                                            if ne_native_full is not None:
+                                                if 'nqA_ep' in locals() and getattr(nqA_ep, 'ndim', 0) >= 3 and nqA_ep.shape[-1] >= 1:
+                                                    nqA_ep[..., 0] = np.asarray(ne_native_full, dtype=float)
+                                                ne_native = ne_native_full
+                                
+                                    peq = _recon_ep(peq, 'repe', 'impe') or peq
+                                    teq = _recon_ep(teq, 'rete', 'imte') or teq
+                                
+                                    prq = _recon_ep(data.get('prq', None), 'repr', 'impr') or data.get('prq', None)
+                                    tiq = _recon_ep(data.get('tiq', None), 'reti', 'imti') or data.get('tiq', None)
+                                
+                                    vq_full = None
+                                    if data.get('vq', None) is not None:
+                                        try:
+                                            vqA0 = np.asarray(data.get('vq'), dtype=float)
+                                            vq_full = np.zeros_like(vqA0, dtype=float)
+                                            for _c in (0, 1, 2):
+                                                vq_full[..., _c] = _recon_ep(vqA0[..., _c], 'reve', 'imve', comp=_c) or vqA0[..., _c]
+                                        except Exception:
+                                            vq_full = None
+                                    jq_full = None
+                                    if data.get('jq', None) is not None:
+                                        try:
+                                            jqA0 = np.asarray(data.get('jq'), dtype=float)
+                                            jq_full = np.zeros_like(jqA0, dtype=float)
+                                            for _c in (0, 1, 2):
+                                                jq_full[..., _c] = _recon_ep(jqA0[..., _c], 'reja', 'imja', comp=_c) or jqA0[..., _c]
+                                        except Exception:
+                                            jq_full = None
+                                
+                                    if vq_full is not None:
+                                        vq = vq_full
+                                    if jq_full is not None:
+                                        jq = jq_full
+                                    data_prq_ep = prq
+                                    data_tiq_ep = tiq
                                 ne2d = None
-                                if nq is not None and getattr(nq, 'ndim', 0) >= 3 and nq.shape[-1] >= 1:
-                                    ne2d = _to_grid(np.asarray(nq[..., 0], dtype=float))
+                                if nq is not None:
+                                    n_scale = float(getattr(args, "n_scale", 1.0) or 1.0)
+                                    nqA = locals().get('nqA_ep', (np.asarray(nq, dtype=float) * float(n_scale)))
+                                    if nqA.ndim == 2:
+                                        ne2d = _to_grid(nqA)
+                                    elif nqA.ndim >= 3 and nqA.shape[-1] >= 1:
+                                        ne2d = _to_grid(np.asarray(nqA[..., 0], dtype=float))
                                 pe2d = _to_grid(peq)
 
                                 if ne2d is not None:
@@ -7493,13 +9769,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                     )
 
                                 # ions: density, pressure, temperature, velocity, z_ion, t_i_average
-                                prq = data.get('prq', None)
-                                tiq = data.get('tiq', None)
+                                prq = locals().get('data_prq_ep', data.get('prq', None))
+                                tiq = locals().get('data_tiq_ep', data.get('tiq', None))
                                 pi2d = None
                                 if (prq is not None) and (peq is not None):
                                     pi2d = _to_grid(np.asarray(prq, dtype=float) - np.asarray(peq, dtype=float))
 
-                                nqA = np.asarray(nq, dtype=float) if nq is not None else None
+                                nqA = locals().get('nqA_ep', (np.asarray(nq, dtype=float) if nq is not None else None))
                                 nion = 1
                                 if nqA is not None and nqA.ndim >= 3 and nqA.shape[-1] >= 2:
                                     nion = int(nqA.shape[-1] - 1)
@@ -7512,7 +9788,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                 dens_list = []
                                 if nqA is not None and nqA.ndim >= 3 and nqA.shape[-1] >= 2:
                                     for k in range(nion):
-                                        dens_list.append(_to_grid(np.asarray(nqA[..., 1 + k], dtype=float)))
+                                        _ni_native = np.asarray(nqA[..., 1 + k], dtype=float)
+                                        if locals().get('edge_mode_ep', 'equilibrium') == 'full':
+                                            try:
+                                                _ni_full = _recon_ep(_ni_native, 'rend', 'imnd', spec=1 + k)
+                                                if _ni_full is not None:
+                                                    _ni_native = np.asarray(_ni_full, dtype=float)
+                                            except Exception:
+                                                pass
+                                        dens_list.append(_to_grid(_ni_native))
                                 elif ne2d is not None:
                                     dens_list = [np.asarray(ne2d, dtype=float)]
                                 else:
@@ -7586,7 +9870,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                 )
 
                                 # ion velocity: replicate bulk v for all ions
-                                vq = data.get('vq', None)
+                                vq = (vq if vq is not None else data.get('vq', None))
                                 if vq is not None:
                                     vqA = np.asarray(vq, dtype=float)
                                     if vqA.ndim >= 3 and vqA.shape[-1] >= 3:
@@ -7628,14 +9912,86 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                 if z_ions is None:
                                     z_ions = np.arange(1, 1 + len(dens_list), dtype=np.int32)
                                 _write_edge_profiles_ion_z_ion_ggd_h5(str(entry_dir), occ_base, z_ions=z_ions, overwrite=ovw)
+                                # zeff (per-grid for impurities, constant for no-impurity cases) and n_i_total_over_n_e
+                                try:
+                                    # Electron density on the same RZ grid; if missing, estimate from quasi-neutrality
+                                    if ne2d is None:
+                                        ne_use = np.zeros_like(ni_total, dtype=float)
+                                        if z_ions is None or len(z_ions) != len(dens_list):
+                                            z_use = [1.0] * len(dens_list)
+                                        else:
+                                            z_use = [float(z) for z in z_ions]
+                                        for _n, _z in zip(dens_list, z_use):
+                                            ne_use += _z * np.asarray(_n, dtype=float)
+                                    else:
+                                        ne_use = np.asarray(ne2d, dtype=float)
+                                
+                                    with np.errstate(divide='ignore', invalid='ignore'):
+                                        ni_over_ne = np.where(ne_use != 0.0, np.asarray(ni_total, dtype=float) / ne_use, np.nan)
+                                        if z_ions is None or len(z_ions) != len(dens_list):
+                                            zeff2d = np.ones_like(ni_over_ne, dtype=float)
+                                        else:
+                                            num = np.zeros_like(ne_use, dtype=float)
+                                            for _n, _z in zip(dens_list, [float(z) for z in z_ions]):
+                                                num += (_z * _z) * np.asarray(_n, dtype=float)
+                                            zeff2d = np.where(ne_use != 0.0, num / ne_use, np.nan)
+                                        # Enforce constant Zeff=1 for no-impurity runs (single Z=1 thermal ion)
+                                        if z_ions is not None and len(z_ions) == 1 and int(z_ions[0]) == 1:
+                                            zeff2d = np.ones_like(ni_over_ne, dtype=float)
+                                
+                                    _write_edge_profiles_zeff_ggd_h5(str(entry_dir), occ_base,
+                                                                   values_1d=zeff2d.ravel(order='F'),
+                                                                   shape_rzp=shape_rzp, grid_index=1, grid_subset_index=0, overwrite=ovw)
+                                    _write_edge_profiles_n_i_total_over_n_e_ggd_h5(str(entry_dir), occ_base,
+                                                                   values_1d=ni_over_ne.ravel(order='F'),
+                                                                   shape_rzp=shape_rzp, grid_index=1, grid_subset_index=0, overwrite=ovw)
+                                except Exception:
+                                    pass
+
+                                # total current density components (R, Z, phi) from equilibrium jq
+                                try:
+                                    jq = (jq if jq is not None else data.get('jq', None))
+                                    if jq is not None:
+                                        jqA = np.asarray(jq, dtype=float)
+                                        if jqA.ndim >= 3 and jqA.shape[-1] >= 3:
+                                            jR2d = _to_grid(jqA[..., 0])
+                                            jZ2d = _to_grid(jqA[..., 1])
+                                            jP2d = _to_grid(jqA[..., 2])
+                                        elif jqA.ndim == 2 and jqA.shape[-1] >= 3:
+                                            # flattened points -> reshape back to (nr,nz) using the same ordering as other fields
+                                            jR2d = np.asarray(jqA[:, 0], dtype=float).reshape(shape_rzp[:2], order='F')
+                                            jZ2d = np.asarray(jqA[:, 1], dtype=float).reshape(shape_rzp[:2], order='F')
+                                            jP2d = np.asarray(jqA[:, 2], dtype=float).reshape(shape_rzp[:2], order='F')
+                                        else:
+                                            jR2d = jZ2d = jP2d = None
+                                        if jR2d is not None and jZ2d is not None and jP2d is not None:
+                                            _write_edge_profiles_j_total_component_ggd_h5(
+                                                str(entry_dir), occ_base, component='r',
+                                                values_1d=np.asarray(jR2d, dtype=float).ravel(order='F'),
+                                                shape_rzp=shape_rzp, grid_index=1, grid_subset_index=0, overwrite=ovw
+                                            )
+                                            _write_edge_profiles_j_total_component_ggd_h5(
+                                                str(entry_dir), occ_base, component='z',
+                                                values_1d=np.asarray(jZ2d, dtype=float).ravel(order='F'),
+                                                shape_rzp=shape_rzp, grid_index=1, grid_subset_index=0, overwrite=ovw
+                                            )
+                                            _write_edge_profiles_j_total_component_ggd_h5(
+                                                str(entry_dir), occ_base, component='phi',
+                                                values_1d=np.asarray(jP2d, dtype=float).ravel(order='F'),
+                                                shape_rzp=shape_rzp, grid_index=1, grid_subset_index=0, overwrite=ovw
+                                            )
+                                except Exception:
+                                    pass
+
 
                             except Exception as e:
                                 log.warning('edge_profiles GGD required leaves (h5py direct) write failed: %s', e)
                     # If unstructured GGD is requested, we'll mirror edge_profiles electrons.temperature from the mhd GGD
                     # after the mhd IDS is written (see below). This avoids fragile interpolation and keeps node ordering identical.
-                    edge_profiles_need_mirror = bool(getattr(args, 'ggd_unstructured', False) and getattr(args, 'edge_ggd_values', None))
-            except Exception:
-                pass
+                    edge_profiles_need_mirror = bool(getattr(args, 'ggd_unstructured', False) and (str(getattr(args, 'edge_ggd_values', 'equilibrium') or 'equilibrium').strip().lower() == 'full'))
+            except Exception as e:
+                log.error('edge_profiles processing failed: %s', e, exc_info=True)
+                raise
         # mhd_linear/mhd per-species occurrence:
         #   occurrence=occ_base+0 : electrons
         #   occurrence=occ_base+1 : main ions
@@ -7711,7 +10067,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             nion = int(nqA.shape[2] - 1)
                 except Exception:
                     nion = 1
-                nspec_mhd = 1 + max(1, int(nion))
+                # Occurrence policy for mhd:
+                #   - With impurities (nion>1): occ_base carries electrons/common; occ_base+1.. occ_base+nion carry per-ion fields.
+                #   - Without impurities (nion<=1): write ONLY occ_base (no redundant extra occurrence).
+                nspec_mhd = (1 if int(nion) <= 1 else (1 + int(nion)))
 
                 mhd0 = None
                 for s in range(nspec_mhd):
@@ -7806,6 +10165,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         _log(f"Appended IDS slices for {fn.name}", args.quiet)
 
+    # --- append per-step provenance (workflow + dataset_fair) ---
+    try:
+        pfiles = [str(p) for p in dump_files]
+        cmd = _sanitize_cli_command_common(list(sys.argv), known_files=pfiles)
+        _update_workflow_and_dataset_fair_common(
+            db, factory,
+            component_name="nimrod2imas:dump2imas",
+            component_description="Convert NIMROD dumpgll HDF5 outputs to IMAS IDSs (mhd_linear, equilibrium/core_profiles/edge_profiles, and optional mhd GGD snapshot)",
+            component_repository="https://github.com/PrincetonUniversity/nimrod2imas",
+            component_version=str(__version__),
+            exec_command=cmd,
+            input_files=pfiles,
+            record_checksums=bool(getattr(args, "record_checksums", True)),
+            checksum_algorithm=str(getattr(args, "checksum_algorithm", "sha256") or "sha256"),
+            workflow_occ=0,
+            dataset_fair_occ=0,
+            extra_kv={
+                "dd": str(args.dd),
+                "dd_version": str(dd_version),
+                "pulse": str(args.pulse),
+                "run": str(args.run),
+                "occ_base": str(int(getattr(args, "occ_base", 0) or 0)),
+                "ndumps": str(len(dump_files)),
+            },
+        )
+    except Exception as _e:
+        _log(f"[warn] provenance update failed: {_e}", args.quiet)
     try:
         db.close()
     except Exception:
@@ -7816,69 +10202,334 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 
-def _mirror_edge_profiles_from_mhd_h5(entry_dir: str, occ: int, args=None) -> None:
-    """Mirror selected node-centered GGD fields from mhd -> edge_profiles via h5py.
-
-    Used only when --edge-ggd-values full (or mirror) is requested.
-    Assumes both IDS files were created by the same converter invocation and therefore share
-    the same node ordering and nphi sampling.
-
-    Fields mirrored when present:
-      - electrons.temperature
-      - electrons.density
-      - electrons.pressure
-      - t_i_average
-      - n_i_total
-      - current_density_tor
-      - rotation_frequency_tor_s
-      - (optional) pressure / pressure_total (DD-dependent)
+def _mirror_edge_profiles_from_mhd_h5(
+    mhd_h5: str,
+    edge_h5: str,
+    mhd_occ: int,
+    edge_occ: int,
+    args,
+    log=None,
+) -> None:
     """
-    import os
+    Mirror selected edge-relevant quantities from the mhd IDS HDF5 into the edge_profiles IDS HDF5.
+
+    For IMAS DD >= 4.x, edge_profiles.ggd does **not** use legacy leaves such as
+    `current_density_tor`, `velocity_phi`, `pressure_total`, etc.  Instead, current density is
+    represented by `ggd(itime)/j_total(i1)/{r,phi,z}(:)` and (optionally) flow by
+    `ggd(itime)/electrons/velocity(i1)/{r,phi,z}(:)` or `ion(i1)/velocity(i2)/...`.
+    This helper therefore writes DD4-compliant leaves when DD major >= 4.
+
+    For DD < 4, we keep a conservative "best-effort" mirroring using legacy aliases (if present),
+    but we never create non-DD nodes.
+    """
+    if log is None:
+        log = logging.getLogger("dump2imas")
+
+    import re as _re
     import h5py as _h5py
 
-    mhd_h5 = os.path.join(entry_dir, 'mhd_1.h5')
-    ep_h5  = os.path.join(entry_dir, f'edge_profiles_{occ}.h5')
-    if not os.path.exists(mhd_h5):
-        raise FileNotFoundError(f'Missing IDS file: {mhd_h5}')
-    if not os.path.exists(ep_h5):
-        raise FileNotFoundError(f'Missing IDS file: {ep_h5}')
+    def _parse_dd(v: str) -> tuple[int, int, int]:
+        s = str(v or "").strip()
+        m = _re.match(r"^\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?\s*$", s)
+        if not m:
+            return (0, 0, 0)
+        return (int(m.group(1)), int(m.group(2) or 0), int(m.group(3) or 0))
 
-    # Map (mhd path suffix) -> (edge_profiles path suffix)
-    paths = [
-        ('/ggd[]&electrons&temperature[]&values', '/ggd[]&electrons&temperature[]&values'),
-        ('/ggd[]&electrons&density[]&values',     '/ggd[]&electrons&density[]&values'),
-        ('/ggd[]&electrons&pressure[]&values',    '/ggd[]&electrons&pressure[]&values'),
-        ('/ggd[]&t_i_average[]&values',           '/ggd[]&t_i_average[]&values'),
-        ('/ggd[]&n_i_total[]&values',             '/ggd[]&n_i_total[]&values'),
-        ('/ggd[]&current_density_tor[]&values',   '/ggd[]&current_density_tor[]&values'),
-        ('/ggd[]&rotation_frequency_tor_s[]&values', '/ggd[]&rotation_frequency_tor_s[]&values'),
-        # DD-dependent scalar pressure leaves
-        ('/ggd[]&pressure[]&values',              '/ggd[]&pressure[]&values'),
-        ('/ggd[]&pressure_total[]&values',        '/ggd[]&pressure_total[]&values'),
-        ('/ggd[]&p_total[]&values',               '/ggd[]&p_total[]&values'),
-    ]
+    ddv = str(getattr(args, "dd_version", None) or os.environ.get("IMAS_VERSION", "4.1.1"))
+    dd_major, dd_minor, dd_patch = _parse_dd(ddv)
 
-    with _h5py.File(mhd_h5, 'r') as fm, _h5py.File(ep_h5, 'r+') as fe:
-        for src_suf, dst_suf in paths:
-            src = f'/mhd_1{src_suf}'
-            dst = f'/edge_profiles_1{dst_suf}'
-            if src not in fm:
-                continue
-            if dst not in fe:
-                # edge_profiles may not include that quantity in this DD; skip silently
-                continue
-            mv = fm[src][()]
-            # Support both flattened and AOS layouts: write exactly what mhd holds
+    # --- utilities ---
+    def _first_existing(h5, full_paths: list[str]) -> Optional[str]:
+        for p in full_paths:
             try:
-                fe[dst][...] = mv
+                if p in h5:
+                    return p
             except Exception:
-                # if destination is a different shape, try best-effort reshape for the common case
-                try:
-                    fe[dst].resize(mv.shape)
-                    fe[dst][...] = mv
-                except Exception:
+                continue
+        return None
+
+    def _read_arr(h5, full_path: str) -> np.ndarray:
+        a = np.asarray(h5[full_path])
+        return a
+
+    def _scalar_int(a: Optional[np.ndarray], default: int = 0) -> int:
+        if a is None:
+            return int(default)
+        try:
+            v = np.asarray(a).ravel()
+            if v.size:
+                return int(v[0])
+        except Exception:
+            pass
+        return int(default)
+
+    def _as_1d(a: np.ndarray) -> np.ndarray:
+        A = np.asarray(a)
+        # common IMAS-HDF5: (1, N) or (1,1,N)
+        if A.ndim >= 2 and A.shape[0] == 1:
+            A = A[0]
+            if A.ndim >= 2 and A.shape[0] == 1:
+                A = A[0]
+        return np.asarray(A).ravel(order="C")
+
+    def _shape_rzp(shape_ds: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if shape_ds is None:
+            return None
+        s = np.asarray(shape_ds).astype(int).ravel()
+        if s.size >= 3:
+            return s[-3:]
+        return None
+
+    def _ensure_ds(g, name: str, data, dtype=None, overwrite: bool = True):
+        try:
+            if name in g:
+                if overwrite:
+                    del g[name]
+                else:
+                    return
+            if dtype is None:
+                g.create_dataset(name, data=data)
+            else:
+                g.create_dataset(name, data=data, dtype=dtype)
+        except Exception as e:
+            log.debug("HDF5 write failed for %s: %s", name, e)
+
+    def _write_vec_components_dd4(
+        g,
+        base: str,
+        comp_to_src: dict[str, tuple[np.ndarray, Optional[np.ndarray]]],
+        aos_shape: Optional[np.ndarray] = None,
+        grid_index_arr: Optional[np.ndarray] = None,
+        grid_subset_index_arr: Optional[np.ndarray] = None,
+        default_grid_index: int = 0,
+        default_grid_subset_index: int = 0,
+    ):
+        """
+        Write DD4-compliant AoS leaf `base` with components {r,phi,z} as FLT_1D arrays.
+
+        base examples:
+          - "ggd[]&j_total[]"
+          - "ggd[]&electrons&velocity[]"
+        """
+        # AoS bookkeeping (copy from source when possible).
+        if aos_shape is None:
+            aos_shape_ds = np.array([[1]], dtype=np.int32)
+        else:
+            aos_shape_ds = np.asarray(aos_shape).astype(np.int32)
+            # IMAS-HDF5 typically stores AOS_SHAPE as a 2D int array (ntime x 1) or (1 x 1).
+            if aos_shape_ds.ndim == 1:
+                aos_shape_ds = aos_shape_ds.reshape(1, -1)
+
+        if grid_index_arr is None:
+            gi_ds = np.array([default_grid_index], dtype=np.int32)
+        else:
+            gi_ds = np.asarray(grid_index_arr).astype(np.int32).ravel()
+
+        if grid_subset_index_arr is None:
+            gs_ds = np.array([default_grid_subset_index], dtype=np.int32)
+        else:
+            gs_ds = np.asarray(grid_subset_index_arr).astype(np.int32).ravel()
+
+        _ensure_ds(g, f"{base}&AOS_SHAPE", aos_shape_ds, dtype="i4", overwrite=True)
+        _ensure_ds(g, f"{base}&grid_index", gi_ds, dtype="i4", overwrite=True)
+        _ensure_ds(g, f"{base}&grid_subset_index", gs_ds, dtype="i4", overwrite=True)
+
+        for comp, (vals, sh) in comp_to_src.items():
+            v1 = _as_1d(vals)
+            _ensure_ds(g, f"{base}&{comp}", v1.astype(float), dtype="f8", overwrite=True)
+            rzp = _shape_rzp(sh)
+            if rzp is not None:
+                _ensure_ds(
+                    g,
+                    f"{base}&{comp}_SHAPE",
+                    np.array(rzp, dtype=np.int32).reshape(1, 1, 3),
+                    dtype="i4",
+                    overwrite=True,
+                )
+
+    # --- main ---
+    src_root = f"/mhd_{mhd_occ}"
+    dst_root = f"/edge_profiles_{edge_occ}"
+
+    with _h5py.File(mhd_h5, "r") as mhd_f, _h5py.File(edge_h5, "r+") as ep_f:
+        if dst_root not in ep_f:
+            ep_f.create_group(dst_root)
+        dst_g = ep_f[dst_root]
+
+        # ------------------------------------------------------------
+        # 1) "same-name" mirroring (only if both sides already have it)
+        # ------------------------------------------------------------
+        if dd_major >= 4:
+            # DD4+ edge_profiles thermodynamic leaves are not mirrored from mhd typically,
+            # but keep these as harmless no-ops if upstream mhd happens to provide them.
+            simple_paths = [
+                ("/ggd[]&electrons&temperature[]&values", "/ggd[]&electrons&temperature[]&values"),
+                ("/ggd[]&electrons&density[]&values",     "/ggd[]&electrons&density[]&values"),
+                ("/ggd[]&electrons&pressure[]&values",    "/ggd[]&electrons&pressure[]&values"),
+                ("/ggd[]&t_i_average[]&values",           "/ggd[]&t_i_average[]&values"),
+                ("/ggd[]&n_i_total[]&values",             "/ggd[]&n_i_total[]&values"),
+            ]
+        else:
+            # Legacy (DD<4) best-effort alias set (kept small to avoid non-DD nodes)
+            simple_paths = [
+                ("/ggd[]&electrons&temperature[]&values", "/ggd[]&electrons&temperature[]&values"),
+                ("/ggd[]&electrons&density[]&values",     "/ggd[]&electrons&density[]&values"),
+                ("/ggd[]&electrons&pressure[]&values",    "/ggd[]&electrons&pressure[]&values"),
+                ("/ggd[]&t_i_average[]&values",           "/ggd[]&t_i_average[]&values"),
+                ("/ggd[]&n_i_total[]&values",             "/ggd[]&n_i_total[]&values"),
+                ("/ggd[]&j_phi[]&values",                 "/ggd[]&j_phi[]&values"),
+                ("/ggd[]&j_r[]&values",                   "/ggd[]&j_r[]&values"),
+                ("/ggd[]&j_z[]&values",                   "/ggd[]&j_z[]&values"),
+                ("/ggd[]&v_phi[]&values",                 "/ggd[]&v_phi[]&values"),
+                ("/ggd[]&v_r[]&values",                   "/ggd[]&v_r[]&values"),
+                ("/ggd[]&v_z[]&values",                   "/ggd[]&v_z[]&values"),
+            ]
+
+        for src_suf, dst_suf in simple_paths:
+            src_leaf = f"{src_root}{src_suf}"
+            dst_leaf = f"{dst_root}{dst_suf}"
+            try:
+                if src_leaf not in mhd_f:
                     continue
 
+                # For DD4+, keep density/pressure written from the dump (nq/peq/prq) intact.
+                # Only overwrite Te (if provided by mhd) to keep edge temperature consistent.
+                overwrite = (dd_major < 4) or (dst_suf == "/ggd[]&electrons&temperature[]&values")
+
+                if (dst_leaf in ep_f) and overwrite:
+                    del ep_f[dst_leaf]
+
+                if dst_leaf not in ep_f:
+                    ep_f.copy(mhd_f[src_leaf], ep_f, dst_leaf)
+                    log.debug("Mirrored %s -> %s", src_leaf, dst_leaf)
+            except Exception:
+                continue
+
+        # ------------------------------------------------------------
+        # 2) DD4+ spec-compliant mapping: mhd j_* -> edge_profiles j_total
+        #    and mhd velocity_* -> edge_profiles electrons/velocity
+        # ------------------------------------------------------------
+        if dd_major >= 4:
+            # ----- current density -----
+            # Prefer canonical mhd leaves
+            jphi_val_p = _first_existing(mhd_f, [f"{src_root}/ggd[]&j_phi[]&values", f"{src_root}/ggd[]&j_tor[]&values"])
+            jr_val_p   = _first_existing(mhd_f, [f"{src_root}/ggd[]&j_r[]&values"])
+            jz_val_p   = _first_existing(mhd_f, [f"{src_root}/ggd[]&j_z[]&values"])
+
+            # shapes (optional, but helps downstream tools)
+            jphi_sh_p = _first_existing(mhd_f, [f"{src_root}/ggd[]&j_phi[]&values_SHAPE", f"{src_root}/ggd[]&j_tor[]&values_SHAPE"])
+            jr_sh_p   = _first_existing(mhd_f, [f"{src_root}/ggd[]&j_r[]&values_SHAPE"])
+            jz_sh_p   = _first_existing(mhd_f, [f"{src_root}/ggd[]&j_z[]&values_SHAPE"])
+
+            # grid indices (optional)
+            j_gi_p = _first_existing(mhd_f, [f"{src_root}/ggd[]&j_phi[]&grid_index", f"{src_root}/ggd[]&j_tor[]&grid_index"])
+            j_gs_p = _first_existing(mhd_f, [f"{src_root}/ggd[]&j_phi[]&grid_subset_index", f"{src_root}/ggd[]&j_tor[]&grid_subset_index"])
+            j_aos_p = _first_existing(mhd_f, [f"{src_root}/ggd[]&j_phi[]&AOS_SHAPE", f"{src_root}/ggd[]&j_tor[]&AOS_SHAPE"])
+
+            if jphi_val_p or jr_val_p or jz_val_p:
+                grid_index = _scalar_int(_read_arr(mhd_f, j_gi_p) if j_gi_p else None, default=0)
+                grid_subset_index = _scalar_int(_read_arr(mhd_f, j_gs_p) if j_gs_p else None, default=0)
+
+                comp_map = {}
+                if jr_val_p:
+                    comp_map["r"] = (_read_arr(mhd_f, jr_val_p), _read_arr(mhd_f, jr_sh_p) if jr_sh_p else None)
+                if jphi_val_p:
+                    comp_map["phi"] = (_read_arr(mhd_f, jphi_val_p), _read_arr(mhd_f, jphi_sh_p) if jphi_sh_p else None)
+                if jz_val_p:
+                    comp_map["z"] = (_read_arr(mhd_f, jz_val_p), _read_arr(mhd_f, jz_sh_p) if jz_sh_p else None)
+
+                _write_vec_components_dd4(
+                    dst_g,
+                    base="ggd[]&j_total[]",
+                    comp_to_src=comp_map,
+                    aos_shape=_read_arr(mhd_f, j_aos_p) if j_aos_p else None,
+                    grid_index_arr=_read_arr(mhd_f, j_gi_p) if j_gi_p else None,
+                    grid_subset_index_arr=_read_arr(mhd_f, j_gs_p) if j_gs_p else None,
+                    default_grid_index=grid_index,
+                    default_grid_subset_index=grid_subset_index,
+                )
+
+            # ----- velocity -----
+            vphi_val_p = _first_existing(mhd_f, [f"{src_root}/ggd[]&velocity_phi[]&values", f"{src_root}/ggd[]&v_phi[]&values"])
+            vr_val_p   = _first_existing(mhd_f, [f"{src_root}/ggd[]&velocity_r[]&values", f"{src_root}/ggd[]&v_r[]&values"])
+            vz_val_p   = _first_existing(mhd_f, [f"{src_root}/ggd[]&velocity_z[]&values", f"{src_root}/ggd[]&v_z[]&values"])
+
+            vphi_sh_p = _first_existing(mhd_f, [f"{src_root}/ggd[]&velocity_phi[]&values_SHAPE", f"{src_root}/ggd[]&v_phi[]&values_SHAPE"])
+            vr_sh_p   = _first_existing(mhd_f, [f"{src_root}/ggd[]&velocity_r[]&values_SHAPE", f"{src_root}/ggd[]&v_r[]&values_SHAPE"])
+            vz_sh_p   = _first_existing(mhd_f, [f"{src_root}/ggd[]&velocity_z[]&values_SHAPE", f"{src_root}/ggd[]&v_z[]&values_SHAPE"])
+
+            v_gi_p = _first_existing(mhd_f, [f"{src_root}/ggd[]&velocity_phi[]&grid_index", f"{src_root}/ggd[]&v_phi[]&grid_index"])
+            v_gs_p = _first_existing(mhd_f, [f"{src_root}/ggd[]&velocity_phi[]&grid_subset_index", f"{src_root}/ggd[]&v_phi[]&grid_subset_index"])
+            v_aos_p = _first_existing(mhd_f, [f"{src_root}/ggd[]&velocity_phi[]&AOS_SHAPE", f"{src_root}/ggd[]&v_phi[]&AOS_SHAPE"])
+
+            if vphi_val_p or vr_val_p or vz_val_p:
+                grid_index = _scalar_int(_read_arr(mhd_f, v_gi_p) if v_gi_p else None, default=0)
+                grid_subset_index = _scalar_int(_read_arr(mhd_f, v_gs_p) if v_gs_p else None, default=0)
+
+                # Store bulk flow under ions (DD4.1+: ggd/ion(i1)/velocity(i2)/{r,phi,z}).
+                sp = getattr(args, "_nimrod_species", {}) or {}
+                z_ions = sp.get("z_ions") or sp.get("z_ion") or []
+                try:
+                    nion_mirror = int(getattr(args, "edge_mirror_nion", 0) or 0)
+                except Exception:
+                    nion_mirror = 0
+                if nion_mirror <= 0:
+                    nion_mirror = int(len(z_ions)) if isinstance(z_ions, (list, tuple)) and len(z_ions) > 0 else 1
+                nion_mirror = max(1, int(nion_mirror))
+
+                # infer grid shape (R,Z,Phi) for SHAPE datasets
+                shape_rzp = None
+                for _sh in (vr_sh_p, vphi_sh_p, vz_sh_p):
+                    if _sh:
+                        try:
+                            shape_rzp = _shape_rzp(_read_arr(mhd_f, _sh))
+                            if shape_rzp is not None:
+                                break
+                        except Exception:
+                            pass
+                if shape_rzp is None:
+                    # fall back to current density shape if available
+                    for _sh in (jr_sh_p, jphi_sh_p, jz_sh_p):
+                        if _sh:
+                            try:
+                                shape_rzp = _shape_rzp(_read_arr(mhd_f, _sh))
+                                if shape_rzp is not None:
+                                    break
+                            except Exception:
+                                pass
+                if shape_rzp is None:
+                    # last resort: infer from any 3D-like value array
+                    _arr0 = _read_arr(mhd_f, vphi_val_p or vr_val_p or vz_val_p)
+                    try:
+                        _a0 = np.asarray(_arr0)
+                        if _a0.ndim >= 3:
+                            shape_rzp = (int(_a0.shape[-3]), int(_a0.shape[-2]), int(_a0.shape[-1]))
+                    except Exception:
+                        shape_rzp = None
+
+                if shape_rzp is not None:
+                    base = "ggd[]&ion[]&velocity[]"
+                    aos = np.array([[1, nion_mirror]], dtype=np.int32)
+                    _write_arr(dst_g, f"{base}&AOS_SHAPE", aos, dtype="i4", overwrite=True)
+                    _write_arr(dst_g, f"{base}&grid_index", np.array([[grid_index] * nion_mirror], dtype=np.int32), dtype="i4", overwrite=True)
+                    _write_arr(dst_g, f"{base}&grid_subset_index", np.array([[grid_subset_index] * nion_mirror], dtype=np.int32), dtype="i4", overwrite=True)
+
+                    def _write_comp(_comp: str, _val_path: Optional[str], _sh_path: Optional[str]) -> None:
+                        if not _val_path:
+                            return
+                        vv = _as_1d(_read_arr(mhd_f, _val_path))
+                        # replicate the single-fluid field over all ions (when multiple species exist)
+                        v_all = np.tile(vv, nion_mirror).astype(np.float64, copy=False)
+                        s_rzp = np.asarray(shape_rzp, dtype=np.int32).reshape(1, 3)
+                        s_all = np.tile(s_rzp, (nion_mirror, 1))
+                        _write_arr(dst_g, f"{base}&{_comp}", v_all.reshape((1, nion_mirror, -1)), dtype="f8", overwrite=True)
+                        _write_arr(dst_g, f"{base}&{_comp}_SHAPE", s_all.reshape((1, nion_mirror, 3)), dtype="i4", overwrite=True)
+
+                    _write_comp("r",   vr_val_p,   vr_sh_p)
+                    _write_comp("phi", vphi_val_p, vphi_sh_p)
+                    _write_comp("z",   vz_val_p,   vz_sh_p)
+                else:
+                    log.warning("Skipping ion velocity mirroring: could not infer SHAPE for mhd velocity fields")
 
 if __name__ == "__main__":
     raise SystemExit(main())

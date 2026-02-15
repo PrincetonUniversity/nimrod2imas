@@ -84,15 +84,17 @@ _H5_X_EDGE_CANDIDATES = [
 _H5_Q_DS: Dict[str, List[str]] = {
     # electrons
     "te": ["profiles_1d[]&electrons&temperature", "profiles_1d[]&electrons&t_e", "profiles_1d[]&electrons&temp"],
-    "ne": ["profiles_1d[]&electrons&density"],
+    "ne": ["profiles_1d[]&electrons&density", "profiles_1d[]&electrons&density_thermal"],
     "pe": ["profiles_1d[]&electrons&pressure", "profiles_1d[]&electrons&p"],
     # ions (main-ion / averaged)
     "ti": ["profiles_1d[]&ion[]&temperature", "profiles_1d[]&ion[]&t_i", "profiles_1d[]&ion[]&temp"],
     "ni": ["profiles_1d[]&ion[]&density"],
     "pi": ["profiles_1d[]&ion[]&pressure", "profiles_1d[]&ion[]&p"],
+    "vtor": ["profiles_1d[]&ion[]&velocity&toroidal"],
+    "vpol": ["profiles_1d[]&ion[]&velocity&poloidal"],
     # totals
-    "ptot": ["profiles_1d[]&pressure"],
-    "pressure": ["profiles_1d[]&pressure"],
+    "ptot": ["profiles_1d[]&pressure_thermal", "profiles_1d[]&pressure_perpendicular", "profiles_1d[]&pressure_parallel"],
+    "pressure": ["profiles_1d[]&pressure", "profiles_1d[]&pressure_thermal"],
     "jtor": ["profiles_1d[]&j_tor", "profiles_1d[]&jtor", "profiles_1d[]&j_phi"],
     "omega": ["profiles_1d[]&ion[]&rotation_frequency_tor_s"],
 }
@@ -106,6 +108,8 @@ _Q_META: Dict[str, Dict[str, str]] = {
     "ni": {"alias": r"$n_i$", "unit": r"m$^{-3}$"},
     "pi": {"alias": r"$p_i$", "unit": "Pa"},
     "ptot": {"alias": r"$p$", "unit": "Pa"},
+    "vtor": {"alias": r"$v_{tor}$", "unit": "m/s"},
+    "vpol": {"alias": r"$v_{pol}$", "unit": "m/s"},
     "pressure": {"alias": r"$p$", "unit": "Pa"},
     "jtor": {"alias": r"$j_\phi$", "unit": r"A m$^{-2}$"},
     "omega": {"alias": r"$\omega_{\mathrm{tor}}$", "unit": r"s$^{-1}$"},
@@ -122,16 +126,59 @@ def _q_pretty(q: str, with_unit: bool = True) -> str:
 
 
 def _infer_ids_h5_path(entry: str, ids_name: str, occ: int) -> str:
+    """Infer IDS HDF5 filename for an entry.
+
+    Note: Many IMAS HDF5 backends store occurrence 0 without an "_0" suffix:
+      - file: <ids>.h5  group: /<ids>
+    while occurrences >0 typically use:
+      - file: <ids>_<occ>.h5 group: /<ids>_<occ>
+
+    We therefore try a small ordered set of candidates and return the first that exists.
+    """
     entry = entry.rstrip("/")
+    ids_name = str(ids_name).strip()
+
+    cands = []
+    if int(occ) == 0:
+        cands += [
+            os.path.join(entry, f"{ids_name}.h5"),
+            os.path.join(entry, f"{ids_name}_0.h5"),
+            os.path.join(entry, f"{ids_name}_{occ}.h5"),
+        ]
+    else:
+        cands += [
+            os.path.join(entry, f"{ids_name}_{occ}.h5"),
+            os.path.join(entry, f"{ids_name}.h5"),
+        ]
+
+    for fp in cands:
+        if os.path.exists(fp):
+            return fp
+
+    # Fall back to the conventional name to produce a clear error message upstream.
     return os.path.join(entry, f"{ids_name}_{occ}.h5")
 
 
 def _h5_open_group(h5_path: str, ids_name: str, occ: int) -> Tuple[h5py.File, h5py.Group]:
     f = h5py.File(h5_path, "r")
-    grp_name = f"{ids_name}_{occ}"
-    if grp_name not in f:
-        raise RuntimeError(f"Group /{grp_name} not found in {h5_path}")
-    return f, f[grp_name]
+
+    ids_name = str(ids_name).strip()
+    occ = int(occ)
+
+    # Occurrence 0 is often stored without a suffix.
+    if occ == 0:
+        group_candidates = [ids_name, f"{ids_name}_0", f"{ids_name}_{occ}"]
+    else:
+        group_candidates = [f"{ids_name}_{occ}", ids_name]
+
+    for grp_name in group_candidates:
+        if grp_name in f:
+            return f, f[grp_name]
+
+    f.close()
+    raise RuntimeError(
+        f"Group not found in {h5_path}. Tried: " + ", ".join([f"/{g}" for g in group_candidates])
+    )
 
 
 def _h5_get_first_existing(g: h5py.Group, names: Sequence[str]) -> Optional[str]:
@@ -182,6 +229,45 @@ def _h5_read_1d(g: h5py.Group, ds_name: str, time_index: int, ion_index: int = 0
 
 
 
+
+def _h5_list_available_profiles(g: h5py.Group) -> List[str]:
+    """List available profile datasets under the current IDS group.
+
+    We return dataset names (relative to the group) that start with 'profiles_1d[]&'
+    and exclude bookkeeping datasets such as '*_SHAPE' and 'AOS_SHAPE'.
+    """
+    out: List[str] = []
+    for k in g.keys():
+        if not isinstance(k, str):
+            continue
+        if not k.startswith("profiles_1d[]&"):
+            continue
+        if k.endswith("_SHAPE") or k.endswith("AOS_SHAPE"):
+            continue
+        out.append(k)
+    return sorted(out)
+
+
+def _print_quantity_help(ids_name: str, occ: int, time_index: int, entry: str, g: h5py.Group) -> None:
+    print("")
+    print(f"Available 1D profile datasets for ids='{ids_name}', occ={occ}, time_index={time_index}:")
+    avail = _h5_list_available_profiles(g)
+    if not avail:
+        print("  (none found under profiles_1d[]&... in this IDS group)")
+    else:
+        for k in avail:
+            print(f"  - {k}")
+    print("")
+    print("How to plot:")
+    print("  - Use --quantities with one or more aliases (comma-separated), e.g.:")
+    print("      --quantities ne,te,ni,ti,ptot,jtor")
+    print("  - Aliases supported by this script:")
+    print(f"      {', '.join(sorted(_H5_Q_DS.keys()))}")
+    print("")
+    print("Notes:")
+    print("  - For total pressure, the preferred storage is profiles_1d[]&pressure_thermal (or ...&pressure).")
+    print("  - If only ...&pressure_perpendicular exists (legacy), 'ptot' will be plotted as 3*p_perp.")
+    print("")
 def _choose_x_dataset(ids_name: str, g: h5py.Group) -> Optional[str]:
     ids_name = str(ids_name).strip().lower()
     cand = _H5_X_CORE_CANDIDATES if ids_name == "core_profiles" else _H5_X_EDGE_CANDIDATES
@@ -245,8 +331,17 @@ def _read_ids_time_from_h5(entry: str, ids_name: str, occ: int) -> Tuple[Optiona
         return None, "time:h5_not_found"
     try:
         with h5py.File(fp, "r") as f:
-            gn = f"{ids_name}_{occ}"
-            if gn not in f:
+            gn = None
+            # occurrence 0 may use group "/<ids>" (no suffix)
+            if int(occ) == 0:
+                gnames = [str(ids_name), f"{ids_name}_0", f"{ids_name}_{occ}"]
+            else:
+                gnames = [f"{ids_name}_{occ}", str(ids_name)]
+            for cand in gnames:
+                if cand in f:
+                    gn = cand
+                    break
+            if gn is None:
                 return None, "time:group_not_found"
             g = f[gn]
             for nm in ("time", "profiles_1d[]&time", "time_slice[]&time"):
@@ -483,8 +578,6 @@ def main() -> int:
     p.add_argument("--entry", default=None, help="IMAS entry directory (contains master.h5, core_profiles_*.h5, etc)")
     p.add_argument("--dbpath", default=".", help="DB root path")
     p.add_argument("--dd", default=None, help="DB name (directory name), e.g. nstx")
-    p.add_argument("--dd-version-dir", choices=["major", "full"], default="major",
-                   help="Directory component for DD version (default: major, e.g. 3 for 3.42.0)")
     p.add_argument("--pulse", type=int, default=None)
     p.add_argument("--run", type=int, default=None)
     p.add_argument("--dd-version", default=None, help="IMAS DD version for IMAS read (required unless --hdf5-only)")
@@ -511,7 +604,7 @@ def main() -> int:
                 str(args.dd_version),
                 int(args.pulse),
                 int(args.run),
-                dd_version_dir=str(args.dd_version_dir),
+                dd_version_dir=str(args.dd_version[0]),
             )
         ).rstrip("/") + "/"
 
@@ -602,13 +695,25 @@ def main() -> int:
             qk = q.strip().lower()
             cand = _H5_Q_DS.get(qk, _H5_Q_DS.get(qk.replace(" ", ""), []))
             if not cand:
-                raise RuntimeError(f"Unsupported quantity '{qk}'. Supported: {sorted(_H5_Q_DS)}")
+                print(f"ERROR: Unsupported quantity '{qk}'.")
+                _print_quantity_help(args.ids, args.occ, args.time_index, args.entry, g)
+                return 2
             ds_name = _h5_get_first_existing(g, cand)
             if ds_name is None:
-                raise RuntimeError(f"Could not find datasets for '{qk}'. Tried: {cand}")
+                print(f"ERROR: Could not find datasets for '{qk}'. Tried: {cand}")
+                _print_quantity_help(args.ids, args.occ, args.time_index, args.entry, g)
+                return 2
+
             y = _h5_read_1d(g, ds_name, args.time_index, ion_index=args.ion_index)
-            ys[qk] = np.asarray(y, dtype=float)
+            y = np.asarray(y, dtype=float)
+
+            # Legacy compatibility: older input2imas stored ptot as p_perp = ptot/3
+            if qk.strip().lower() == "ptot" and ds_name.endswith("&pressure_perpendicular"):
+                y = 3.0 * y
+
+            ys[qk] = y
             resolved[qk] = ds_name
+
 
         # Choose labels
         if len(qlist) == 1:

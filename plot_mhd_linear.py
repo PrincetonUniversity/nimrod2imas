@@ -34,7 +34,10 @@ from matplotlib.colors import LogNorm, SymLogNorm
 from pathlib import Path
 
 from nimrod2imas import (
-    entry_dir as _entry_dir_common,
+    add_entry_args as _add_entry_args_common,
+    resolve_entry_path as _resolve_entry_common,
+    open_ids_h5 as _open_ids_h5_common,
+    h5_list_keys as _h5_list_keys_common,
     open_dbentry as _open_db_common,
     ids_factory as _ids_factory_common,
     get_ids as _get_ids_common,
@@ -55,7 +58,7 @@ PLACEHOLDER_INT = -999999999
 
 
 # Field aliases (user -> canonical) for --field
-_FIELD_ALIASES = {
+_Q_ALIASES = {
     'p': ['p', 'pressure'],
     't': ['t', 'temperature'],
     'n': ['n', 'mass_density'],
@@ -66,10 +69,16 @@ _FIELD_ALIASES = {
 
 def _canonical_field(field: str) -> str:
     f = (field or '').strip().lower()
-    for canon, names in _FIELD_ALIASES.items():
+    for canon, names in _Q_ALIASES.items():
         if f == canon or f in names:
             return canon
     return f
+
+
+def _normalize_field_name(field: str) -> Optional[str]:
+    """Return canonical short name (p,t,n,b,v) or None if unknown."""
+    f = _canonical_field(field)
+    return f if f in _Q_ALIASES else None
 
 
 def _node_info(node: Any):
@@ -182,6 +191,52 @@ def _mode_number(tm: Any) -> Optional[int]:
         except Exception:
             pass
     return None
+
+
+def _resolve_time_index(mhd: Any, time_index: int) -> int:
+    """Map a logical --time-index to a raw mhd.time_slice index.
+
+    By default, plot_mhd_linear treats --time-index as indexing only the
+    *non-empty* time_slices (those with at least one toroidal_mode entry).
+    This avoids confusing gaps when the IDS contains placeholder time slices.
+
+    If no non-empty slices exist, falls back to raw indexing.
+    """
+    try:
+        nraw = len(mhd.time_slice)
+    except Exception:
+        nraw = 0
+
+    if nraw <= 0:
+        raise SystemExit("mhd_linear: no time_slice entries found")
+
+    nonempty: List[int] = []
+    for i in range(nraw):
+        try:
+            ts = mhd.time_slice[i]
+            if hasattr(ts, "toroidal_mode") and len(ts.toroidal_mode) > 0:
+                nonempty.append(i)
+        except Exception:
+            continue
+
+    # If filtering produced nothing, use raw indexing.
+    if not nonempty:
+        it = int(time_index)
+        if it < 0:
+            it = nraw + it
+        if it < 0 or it >= nraw:
+            raise SystemExit(f"--time-index {time_index} out of range for raw time_slice (n={nraw})")
+        return it
+
+    it = int(time_index)
+    if it < 0:
+        it = len(nonempty) + it
+    if it < 0 or it >= len(nonempty):
+        raise SystemExit(
+            f"--time-index {time_index} out of range for non-empty time_slices (n_nonempty={len(nonempty)}, n_raw={nraw}). "
+            "Use --raw-time-index to index raw time_slice array."
+        )
+    return nonempty[it]
 
 def _available_cmaps() -> List[str]:
     """Return available Matplotlib colormap names (sorted).
@@ -583,141 +638,251 @@ def _print_info(mhd: Any, occ: int):
 
 # --------------------------------- Main --------------------------------
 
+
+
+# ----------------- plotting helpers -----------------
+
+def _list_cmaps() -> None:
+    import matplotlib.pyplot as plt
+
+    cmaps = sorted(list(plt.colormaps()))
+    for c in cmaps:
+        print(c)
+
+
+def _plot_contour(
+    R,
+    Z,
+    F,
+    *,
+    title: str,
+    cmap: str,
+    levels: int,
+    norm: str | None,
+    linthresh: float,
+    out: str,
+    show: bool,
+    dpi: int,
+) -> None:
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm, SymLogNorm
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+
+    F_plot = F
+    mnorm = None
+
+    if norm == "log":
+        # Mask non-positive values for log scaling
+        F_plot = np.ma.masked_where(np.asarray(F) <= 0, F)
+        vmin = float(np.nanmin(F_plot))
+        vmax = float(np.nanmax(F_plot))
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin <= 0 or vmax <= 0:
+            raise SystemExit("--norm log requires positive data")
+        mnorm = LogNorm(vmin=vmin, vmax=vmax)
+
+    elif norm == "symlog":
+        vmax = float(np.nanmax(np.abs(F_plot)))
+        if not np.isfinite(vmax) or vmax == 0:
+            vmax = 1.0
+        mnorm = SymLogNorm(linthresh=linthresh, vmin=-vmax, vmax=vmax)
+
+    cf = ax.contourf(R, Z, F_plot, levels=levels, cmap=cmap, norm=mnorm)
+    fig.colorbar(cf, ax=ax)
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("R [m]")
+    ax.set_ylabel("Z [m]")
+    ax.set_title(title)
+
+    if show or out == "X11":
+        plt.show()
+    else:
+        fig.savefig(out, dpi=dpi, bbox_inches="tight")
+        print(f"Wrote {out}")
+    plt.close(fig)
+
 def main():
-    ap = argparse.ArgumentParser(description="Contour plot fields from IMAS mhd_linear IDS (RZ plane).")
+    ap = argparse.ArgumentParser(
+        description="Contour plot fields from IMAS mhd_linear IDS (RZ plane)."
+    )
 
-    ap.add_argument("--dd", required=True)
-    ap.add_argument("--dd-version", dest="dd_version", required=True)
-    ap.add_argument("--pulse", type=int, required=True)
-    ap.add_argument("--run", type=int, required=True)
-    ap.add_argument("--occ", type=int, default=0)
-    ap.add_argument("--backend", default="hdf5")
-    ap.add_argument("--dbpath", default=".")
+    _add_entry_args_common(
+        ap,
+        include_backend=True,
+        backend_default="hdf5",
+        include_ids=True,
+        ids_default="mhd_linear",
+        ids_choices=["mhd_linear"],
+        include_occ=True,
+        occ_default=0,
+    )
 
-    ap.add_argument("--entry", default=None,
-                    help="Optional explicit entry directory (overrides --dbpath/--dd/--dd-version/--pulse/--run)")
+    ap.add_argument("--time-index", type=int, default=0, help="Time slice index")
+    ap.add_argument(
+        "--raw-time-index",
+        action="store_true",
+        help="Use --time-index without filtering empty time_slices",
+    )
 
-    ap.add_argument("--time-index", type=int, default=0)
-    ap.add_argument("--raw-time-index", action="store_true")
-    ap.add_argument("--mode-index", type=int, default=None)
-    ap.add_argument("--keff", type=int, default=None, help="DEPRECATED alias for --n-tor (kept for backward compatibility)")
-    ap.add_argument("--n-tor", dest="n_tor", type=int, default=None)
+    ap.add_argument(
+        "--mode-index",
+        type=int,
+        default=None,
+        help="Toroidal mode index within time_slice (default: 0)",
+    )
+    ap.add_argument(
+        "--n-tor",
+        type=int,
+        default=None,
+        help="Select toroidal mode by n_tor (overrides --mode-index if provided)",
+    )
 
-    ap.add_argument("--info", action="store_true")
-    ap.add_argument("--field", default=None, help="Field to plot (aliases: p/pressure, t/temperature, n/mass_density, b/bfield, v/vel/velocity)")
-    ap.add_argument("--part", default="real", choices=["real", "imag", "amp"])
-    ap.add_argument("--component", default=None, choices=["r", "z", "phi"])
-    ap.add_argument("--help-fields", action="store_true", help="Print available fields/aliases for the selected time/mode and exit")
-    ap.add_argument("--norm", default="linear", choices=["linear", "log", "symlog"], help="Color normalization for contours")
-    ap.add_argument("--linthresh", type=float, default=1e-6, help="linthresh for symlog normalization")
-    ap.add_argument("--levels", type=int, default=80)
-    ap.add_argument("--cmap", default=None, help="Matplotlib colormap name (e.g. viridis, RdBu_r, cmr.gothic)")
-    ap.add_argument("--list-cmaps", action="store_true", help="List available colormap names and exit")
-    ap.add_argument("--title", default=None)
-    ap.add_argument("--out", default="X11", help="X11/show to display, or filename to save")
+    ap.add_argument(
+        "--quantity",
+        default=None,
+        help=(
+            "Field to plot. Canonical: p,t,n,b,v. Aliases include: "
+            "p->pressure_perturbed, t->temperature_perturbed, n->density_perturbed, "
+            "b->magnetic_field_perturbed, v->velocity_perturbed"
+        ),
+    )
+    ap.add_argument(
+        "--part",
+        default="real",
+        choices=["real", "imag", "amp"],
+        help="Use real/imag component or amplitude",
+    )
+    ap.add_argument("--component", default=None, choices=["r", "z", "phi"], help="Vector component")
+
+    ap.add_argument("--norm", default=None, choices=["log", "symlog"], help="Optional color normalization")
+    ap.add_argument(
+        "--linthresh",
+        type=float,
+        default=1e-6,
+        help="Symlog linear threshold (only for --norm symlog)",
+    )
+    ap.add_argument("--levels", type=int, default=50, help="Number of contour levels")
+
+    ap.add_argument("--cmap", default="viridis", help="Matplotlib colormap name")
+    ap.add_argument("--list-cmaps", action="store_true", help="List available Matplotlib colormaps and exit")
+
+    ap.add_argument("--title", default=None, help="Override plot title")
+    ap.add_argument("--out", default="X11", help="Output image path or 'X11' for interactive")
+    ap.add_argument("--show", action="store_true", help="Show plot interactively (even if --out is set)")
+    ap.add_argument("--dpi", type=int, default=150, help="Figure DPI when saving")
+
+    ap.add_argument("--info", action="store_true", help="Print a short summary of the entry contents")
+    ap.add_argument(
+        "--help-quantities",
+        action="store_true",
+        help="Print available datasets/aliases for this entry and exit",
+    )
 
     args = ap.parse_args()
 
-    # Backward compatibility: --keff is an alias for --n-tor.
-    # If both are provided, they must agree.
-    if args.keff is not None and args.n_tor is not None and int(args.keff) != int(args.n_tor):
-        raise RuntimeError(f"Conflicting inputs: --keff={args.keff} and --n-tor={args.n_tor}. Provide only one.")
-
     if args.list_cmaps:
-        avail = _available_cmaps()
-        if _HAS_CMASher:
-            print("cmasher: available (colormaps with prefix 'cmr.')")
-        else:
-            print("cmasher: not available (install with 'pip install cmasher' to enable 'cmr.*' colormaps)")
-        if not avail:
-            print("No colormaps discovered (unexpected).")
-        else:
-            print("Available colormaps:")
-            for name in avail:
-                print(f"  {name}")
+        _list_cmaps()
         return 0
-    if args.n_tor is None and args.keff is not None:
-        args.n_tor = int(args.keff)
 
-    if args.entry:
-        entry_dir = Path(args.entry).expanduser().resolve()
-    else:
-        entry_dir = _entry_dir_common(
-            args.dbpath,
-            str(args.dd),
-            str(args.dd_version),
-            int(args.pulse),
-            int(args.run),
-            dd_version_dir=str(args.dd_version[0]),
-        )
+    if args.dd_version is None:
+        raise SystemExit("--dd-version is required (e.g. 4.1.1)")
+
+    entry_dir = str(_resolve_entry_common(args))
     print(f"IMAS entry directory: {entry_dir}")
 
     db, uri, imas = _open_db_common(args.backend, entry_dir, mode="r", dd_version=str(args.dd_version))
-    print(f"IMAS URI: {uri}")
+    try:
+        mhd = _get_ids_common(db, _ids_factory_common(imas, str(args.dd_version)), "mhd_linear", occ=args.occ)
+        if args.help_quantities:
+            # Use a representative (time_slice, toroidal_mode) to report presence/shape.
+            try:
+                it0 = _resolve_time_index(mhd, 0)
+            except Exception:
+                it0 = 0
+            ts0 = mhd.time_slice[it0]
+            mi0 = _select_mode_index(ts0, mode_index=0, n_tor=None)
+            _print_field_help(ts0, mi0)
+            try:
+                f_h5, g_h5, _h5p, grp = _open_ids_h5_common(entry_dir, "mhd_linear", args.occ)
+                try:
+                    keys = _h5_list_keys_common(g_h5, exclude_shape=True)
+                finally:
+                    f_h5.close()
 
-    factory = _ids_factory_common(imas, str(args.dd_version))
-    mhd = _get_ids_common(db, factory, "mhd_linear", int(args.occ))
-
-    if args.info:
-        _print_info(mhd, int(args.occ))
-        if args.field is None:
+                if keys:
+                    print("")
+                    print(f"HDF5 keys under /{grp}:")
+                    ts_keys = [k for k in keys if k.startswith("time_slice[]&")]
+                    other = [k for k in keys if not k.startswith("time_slice[]&")]
+                    for k in ts_keys[:200]:
+                        print("  - " + k)
+                    if len(ts_keys) > 200:
+                        print(f"  ... ({len(ts_keys)-200} more time_slice keys omitted)")
+                    for k in other[:50]:
+                        print("  - " + k)
+                    if len(other) > 50:
+                        print(f"  ... ({len(other)-50} more non-time_slice keys omitted)")
+            except Exception as e:
+                print(f"Could not list HDF5 keys: {e}")
             return 0
 
-    if args.field is None and not args.help_fields:
-        raise RuntimeError("Provide --field (or use --info / --help-fields).")
+        if args.info:
+            _print_info(mhd)
 
-    raw_i, ts, nonempty = _pick_time_slice(mhd, int(args.time_index), bool(args.raw_time_index))
-    mi = _select_mode_index(ts, args.n_tor, args.mode_index)
+        if not args.quantity:
+            raise SystemExit("No --quantity provided. Use --help-quantities to see options.")
 
-    if args.help_fields:
-        _print_field_help(ts, mi)
-        return 0
+        # Resolve time index (optionally skipping empty time_slices)
+        if args.raw_time_index:
+            it = int(args.time_index)
+        else:
+            it = _resolve_time_index(mhd, int(args.time_index))
 
-    try:
-        R2d, Z2d, F2d, title = _extract_rz_and_field(ts, mi, args.field, args.part, args.component)
-    except Exception as e:
-        print(f"ERROR: {e}")
-        _print_field_help(ts, mi)
-        raise
+        ts = mhd.time_slice[it]
+        im = _select_mode_index(ts, mode_index=args.mode_index, n_tor=args.n_tor)
+        mode = ts.toroidal_mode[im]
 
-    # Prefer the stored toroidal mode number when present; otherwise show the requested selection.
-    stored_n_tor = None
-    try:
-        v = _mode_number(ts.toroidal_mode[mi])
-        if v != PLACEHOLDER_INT:
-            stored_n_tor = v
-    except Exception:
-        stored_n_tor = None
+        field = _normalize_field_name(str(args.quantity))
+        if field is None:
+            raise SystemExit(f"Unknown quantity '{args.quantity}'. Use --help-quantities.")
 
-    requested_n_tor = args.n_tor if args.n_tor is not None else args.keff
+        if field in ("b", "v") and args.component is None:
+            raise SystemExit(f"Quantity '{field}' requires --component (r|z|phi).")
 
-    if stored_n_tor is not None and requested_n_tor is not None and int(stored_n_tor) != int(requested_n_tor):
-        n_tor_label = f"{stored_n_tor} (requested {requested_n_tor})"
-    elif stored_n_tor is not None:
-        n_tor_label = f"{stored_n_tor}"
-    elif requested_n_tor is not None:
-        n_tor_label = f"{requested_n_tor} (not stored in IDS)"
-    else:
-        n_tor_label = f"mode_index={mi}"
+        R, Z, F = _extract_rz_and_field(mode, field, part=args.part, component=args.component)
 
-    if args.title is None:
-        args.title = f"occ={args.occ} raw_ts={raw_i} time={_ts_time(ts):.6g} n_tor={n_tor_label} {title} ({args.part})"
+        title = args.title
+        if title is None:
+            n = getattr(mode, "n_tor", None)
+            title = f"mhd_linear: {field} ({args.part})"
+            if args.component:
+                title += f" {args.component}"
+            if n is not None:
+                title += f", n_tor={n}"
+            if hasattr(ts, "time"):
+                try:
+                    title += f", t={float(ts.time):.6g}"
+                except Exception:
+                    pass
 
-    fig, ax = plt.subplots()
-    norm, lev = _build_norm_and_levels(F2d, int(args.levels), norm_kind=str(args.norm), linthresh=float(args.linthresh))
-    cf = ax.contourf(R2d, Z2d, F2d, levels=lev, cmap=_resolve_cmap(args.cmap, args.part), norm=norm)
-    fig.colorbar(cf, ax=ax)
-    ax.set_xlabel("R")
-    ax.set_ylabel("Z")
-    ax.set_title(args.title)
-    ax.set_aspect("equal", adjustable="box")
+        _plot_contour(
+            R,
+            Z,
+            F,
+            title=title,
+            cmap=args.cmap,
+            levels=int(args.levels),
+            norm=args.norm,
+            linthresh=float(args.linthresh),
+            out=args.out,
+            show=args.show,
+            dpi=int(args.dpi),
+        )
 
-    out = str(args.out)
-    if out.upper() == "X11" or out.lower() in ("show", "-"):
-        plt.show()
-    else:
-        fig.savefig(out, dpi=200, bbox_inches="tight")
-        print(f"Wrote {out}")
+    finally:
+        db.close()
 
     return 0
 

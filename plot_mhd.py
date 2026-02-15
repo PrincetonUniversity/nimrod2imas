@@ -42,6 +42,13 @@ import matplotlib.tri as mtri
 from matplotlib.tri import TriAnalyzer
 from matplotlib.colors import LogNorm, SymLogNorm
 
+from nimrod2imas import (
+    add_entry_args as _add_entry_args_common,
+    resolve_entry_path as _resolve_entry_common,
+    open_ids_h5 as _open_ids_h5_common,
+    normalize_out_and_show as _normalize_out_and_show_common,
+)
+
 # Optional: cmasher colormaps (https://cmasher.readthedocs.io/)
 # If installed, importing cmasher registers its colormaps with Matplotlib (names like 'cmr.gothic').
 _HAS_CMASher = False
@@ -59,55 +66,9 @@ VERSION = __version__
 
 # ----------------- filesystem helpers -----------------
 
-def _major(ddv: str) -> str:
-    try:
-        return str(int(ddv.split(".")[0]))
-    except Exception:
-        return ddv.split(".")[0]
-
-
-def _base(dd: str, ddv: str, pulse: int, run: int) -> str:
-    return os.path.join(dd, _major(ddv), str(pulse), str(run))
-
-
-def _ids_file(base: str, ids: str, occ: int) -> Tuple[str, str]:
-    """Return (filename, group_name) for an IDS occurrence.
-
-    IMAS HDF5 naming conventions differ for occ=0 across environments:
-      - some backends use <ids>.h5 with group /<ids>
-      - others use <ids>_0.h5 with group /<ids>_0
-
-    For occ>0 the conventional layout is:
-      - <ids>_<occ>.h5 with group /<ids>_<occ>
-      - (fallback) <ids>.h5 with group /<ids>_<occ>
-    """
-    candidates: List[Tuple[str, str]] = []
-
-    if int(occ) == 0:
-        candidates.extend([
-            (os.path.join(base, f"{ids}.h5"), f"{ids}"),
-            (os.path.join(base, f"{ids}_0.h5"), f"{ids}_0"),
-            # Rare fallback: group has suffix even in <ids>.h5
-            (os.path.join(base, f"{ids}.h5"), f"{ids}_0"),
-        ])
-    else:
-        candidates.extend([
-            (os.path.join(base, f"{ids}_{occ}.h5"), f"{ids}_{occ}"),
-            (os.path.join(base, f"{ids}.h5"), f"{ids}_{occ}"),
-        ])
-
-    for fp, grp in candidates:
-        if not os.path.exists(fp):
-            continue
-        try:
-            with h5py.File(fp, "r") as _f:
-                if f"/{grp}" in _f:
-                    return fp, grp
-        except Exception:
-            continue
-
-    tried = ", ".join([f"{Path(fp).name}:/{grp}" for fp, grp in candidates])
-    raise FileNotFoundError(f"Could not find IDS file/group for ids={ids!r} occ={occ}: tried {tried}")
+def _open_ids_group(entry_dir, ids, occ):
+    """Return (h5file, group, h5_path, group_name) for an IDS occurrence."""
+    return _open_ids_h5_common(entry_dir, ids, int(occ), mode="r")
 
 
 # ----------------- quantity / leaf resolution -----------------
@@ -934,12 +895,7 @@ def _filter_finite_nodes_and_remap_triangles(
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dd", required=True, help="Top directory of IMAS HDF5 tree (e.g. mast)")
-    ap.add_argument("--dd-version", required=True)
-    ap.add_argument("--pulse", required=True, type=int)
-    ap.add_argument("--run", required=True, type=int)
-    ap.add_argument("--occ", required=True, type=int)
-    ap.add_argument("--ids", required=True, help="IDS name (e.g. mhd)")
+    _add_entry_args_common(ap, include_backend=False, include_ids=True, ids_default='mhd', include_occ=True, occ_default=0)
     ap.add_argument("--time-index", default=0, type=int)
     ap.add_argument("--clamp-time-index", action="store_true", help="Clamp --time-index into available range instead of erroring")
     ap.add_argument("--quantity", required=False, help="Quantity or leaf (e.g. ni, te, ne, jphi, electrons&temperature)")
@@ -953,8 +909,8 @@ def main() -> int:
     ap.add_argument("--phi-index", default=0, type=int)
     ap.add_argument("--phi-tol", default=1e-6, type=float)
     ap.add_argument("--min-points", default=200, type=int)
-    ap.add_argument("--out", default=None, help="Output PNG path (optional)")
-    ap.add_argument("--show", action="store_true", help="Show plot interactively")
+    ap.add_argument("--out", default="X11", help="Output image path or 'X11' for interactive")
+    ap.add_argument("--show", action="store_true", help="Show plot interactively (even if --out is set)")
     ap.add_argument("--debug", action="store_true")
 
     ap.add_argument("--dedup-rz", action="store_true", help="De-duplicate near-identical (R,Z) before triangulation")
@@ -984,21 +940,21 @@ def main() -> int:
 
     if not args.help_quantities and (args.quantity is None or str(args.quantity).strip() == ''):
         raise RuntimeError('Provide --quantity (or use --help-quantities).')
+    entry_dir = _resolve_entry_common(args)
+    print(f"IMAS entry directory: {entry_dir}")
 
-    base = _base(args.dd, args.dd_version, args.pulse, args.run)
-    ids_file, grp = _ids_file(base, args.ids, args.occ)
+    f, g, ids_file, grp = _open_ids_group(entry_dir, args.ids, args.occ)
+    try:
+        if args.debug:
+            print(f"[{__version__}] file={ids_file} group=/{grp}")
 
-    if args.debug:
-        print(f"[{__version__}] file={ids_file} group=/{grp}")
+        leaf_cands = _leaf_candidates(args.ids, str(args.quantity)) if args.quantity is not None else []
 
-    leaf_cands = _leaf_candidates(args.ids, str(args.quantity)) if args.quantity is not None else []
-
-    with h5py.File(ids_file, "r") as f:
         if f"/{grp}" not in f:
             raise RuntimeError(f"Missing group /{grp} in {ids_file}")
 
         if args.help_quantities:
-            _print_quantity_help(args.ids, args.occ, base, f[f"/{grp}"])
+            _print_quantity_help(args.ids, args.occ, str(entry_dir), g)
             return 0
 
         # Resolve/validate requested quantity (aliases -> leaf candidates)
@@ -1006,7 +962,7 @@ def main() -> int:
             leaf_used, vpath = _find_values_dataset(f, grp, leaf_cands, debug=args.debug)
         except Exception as e:
             print(f"ERROR: Could not find datasets for {args.quantity!r}. Tried: {leaf_cands}")
-            _print_quantity_help(args.ids, args.occ, base, f[f"/{grp}"])
+            _print_quantity_help(args.ids, args.occ, str(entry_dir), g)
             raise
 
         v = _read_values(f, grp, leaf_used, vpath, args.time_index, args.ion_index, clamp_time_index=args.clamp_time_index, debug=args.debug)
@@ -1053,10 +1009,12 @@ def main() -> int:
         cmap_name = _resolve_cmap(args.cmap, v3, norm_kind=args.norm)
         norm, lev = _build_norm_and_levels(v3, int(args.levels), norm_kind=args.norm, linthresh=float(args.linthresh))
 
+        outpng, do_show = _normalize_out_and_show_common(args.out, show=bool(args.show))
+
         _plot_tricontour(
             r3, z3, v3, title,
-            outpng=args.out,
-            show=args.show,
+            outpng=outpng,
+            show=do_show,
             triangles=triangles,
             mask_flat_tris=args.mask_flat_tris,
             min_circle_ratio=args.min_circle_ratio,
@@ -1065,8 +1023,13 @@ def main() -> int:
             levels=lev,
         )
 
-    if args.out and not args.show:
-        print(f"Wrote {args.out}")
+        if outpng and not do_show:
+            print(f"Wrote {outpng}")
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
 
     return 0
 

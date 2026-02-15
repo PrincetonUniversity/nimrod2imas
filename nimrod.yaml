@@ -1,0 +1,33 @@
+imas:
+  machine: NSTX
+  pulse: 120968
+  run: 1
+
+dataset:
+  description: "NIMROD run for <case>; inputs converted to IMAS."
+  identifier: "https://doi.org/<future-doi-or-http-pid>"
+  rights_holder: "Princeton Plasma Physics Laboratory"
+  license: "https://creativecommons.org/licenses/by/4.0/"
+  valid: "2026-02-09/"   # YYYY-MM-DD/ (open-ended)
+  replaces: ""
+  is_replaced_by: ""
+
+nimrod:
+  name: "NIMROD"
+  description: "Extended-MHD simulation"
+  repository: "<git-url>"
+  version: "<tag-or-version>"
+  commit: "<git-commit-sha>"
+  parameters_xml: ""   # optional: pre-built XML blob if you want
+
+converter:
+  repository: "https://github.com/PrincetonUniversity/nimrod2imas"
+  commit: "<nimrod2imas-commit-sha>"     # optional but recommended
+  record_checksums: true
+  checksum_algorithm: "sha256"
+
+fgnimeq:
+  repository: "<git-url>"
+  version: "<tag>"
+  commit: "<sha>"
+

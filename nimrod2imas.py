@@ -1,84 +1,85 @@
 #!/usr/bin/env python3
-"""nimrod2imas.py
+"""
+nimrod2imas.py — shared helpers for input2imas/dump2imas/gamma2imas.
 
-Shared utilities for the NIMROD ⇄ IMAS toolchain.
+Exports expected by tools:
+  - ensure_entry_dir
+  - dd_version_dirname
+  - entry_dir
+  - open_dbentry
+  - ids_factory
+  - put_ids
+  - value_to_string
+  - namelist_file_to_xml
+  - compute_file_checksum
+  - sanitize_cli_command
+  - update_workflow_and_dataset_fair
 
-This module centralizes:
-  * IMAS entry directory layout under a filesystem DB root
-  * Robust DBEntry open logic across imas-python variants
-  * Robust IDS retrieval (fill-in-place vs return)
-  * Consistent Fortran-like value serialization for XML
-  * A lightweight fallback parser for Fortran namelist syntax
-
-Directory layout
-----------------
-We follow the same layout as dump2imas.py (and update other tools to match):
-
-  <dbpath>/<dd>/<dd_version_dir>/<pulse>/<run>/
-
-Where <dd_version_dir> is usually the *major* DD version (e.g. "3") to
-match existing workflows, but can be switched to "full" (e.g. "3.42.0").
+Workflow provenance is appended by writing workflow.h5 datasets directly (h5py),
+to avoid imas-python AoS truncation bugs.
 """
 
 from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-import xml.etree.ElementTree as ET
-import scipy.integrate as integrate
+try:
+    import numpy as np
+except Exception:
+    np = None  # type: ignore
 
-__version__ = "0.3.0"
+# Default unit scalings used by dump2imas/gamma2imas when converting NIMROD quantities to IMAS SI units.
+# NIMROD dumps used in this workflow store:
+#   - densities in units of 1e20 m^-3
+#   - temperatures in keV
+# IMAS expects:
+#   - densities in m^-3
+#   - temperatures in eV
+DEFAULT_N_SCALE = 1e20  # (1e20 m^-3) -> m^-3
+DEFAULT_T_SCALE = 1e3   # keV -> eV
 
-# SciPy >= 1.11 removed cumtrapz; OMFIT still expects it
-if not hasattr(integrate, "cumtrapz"):
-    from scipy.integrate import cumulative_trapezoid
-    integrate.cumtrapz = cumulative_trapezoid
+
+# --------------------------- filesystem layout ---------------------------
+
+def ensure_entry_dir(ed: str | Path) -> None:
+    Path(ed).mkdir(parents=True, exist_ok=True)
 
 
-# --------------------------- Path / DB helpers ---------------------------
-
-def dd_version_dirname(dd_version: str, mode: str = "major") -> str:
-    """Return the directory component to use for a DD version.
-
-    mode:
-      - "major": "3.42.0" -> "3"
-      - "full" : "3.42.0" -> "3.42.0"
+def dd_version_dirname(dd_version: str | None) -> str:
     """
-    dv = str(dd_version).strip()
-    if not dv:
-        return dv
-    if mode == "full":
-        return dv
-    # default: major
-    return dv.split(".")[0]
+    Return the numeric major DD version directory name, e.g.
+      '4.1.1' -> '4'
+      '3.39.0' -> '3'
+    """
+    if not dd_version:
+        return "4"
+    s = str(dd_version).strip()
+    m = re.match(r"^\s*(\d+)", s)
+    return m.group(1) if m else "4"
 
 
 def entry_dir(
-    dbpath: str | Path,
+    dbroot: str | Path,
     dd: str,
     dd_version: str,
     pulse: int,
     run: int,
-    dd_version_dir: str = "major",
+    dd_version_dir: str = "4",
 ) -> Path:
-    root = Path(dbpath).expanduser().resolve()
-    return root / str(dd) / dd_version_dirname(str(dd_version), dd_version_dir) / str(int(pulse)) / str(int(run))
-
-
-def ensure_entry_dir(p: str | Path) -> Path:
-    p = Path(p)
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    """Entry directory: <dbroot>/<dd>/<dd_version_dir>/<pulse>/<run>."""
+    return Path(dbroot) / str(dd) / str(dd_version_dir) / str(int(pulse)) / str(int(run))
 
 
 def build_uri(backend: str, entry_dir_path: str | Path) -> str:
     return f"imas:{backend}?path={str(entry_dir_path)}"
 
+
+# --------------------------- IMAS open / factory / put ---------------------------
 
 def open_dbentry(
     backend: str,
@@ -86,10 +87,7 @@ def open_dbentry(
     mode: str = "r",
     dd_version: Optional[str] = None,
 ):
-    """Open an IMAS DBEntry from an entry directory.
-
-    Returns (db, uri, imas_module).
-    """
+    """Open an IMAS DBEntry from an entry directory. Returns (db, uri, imas_module)."""
     import imas  # type: ignore
 
     uri = build_uri(backend, entry_dir_path)
@@ -113,7 +111,6 @@ def open_dbentry(
     if db is None:
         db = imas.DBEntry(uri, mode)
 
-    # Some versions open in __init__, some require open().
     try:
         db.open()
     except Exception as e:
@@ -140,217 +137,495 @@ def ids_factory(imas_module: Any, dd_version: str):
     except Exception:
         return imas_module.IDSFactory()
 
-
 def get_ids(db: Any, factory: Any, ids_name: str, occ: int):
-    """Robust IDS getter across IMAS python variants."""
+    """Robust IDS getter across imas-python variants.
+
+    Preferred behavior:
+      - if the entry exists, return the existing IDS (return-by-value)
+      - else return a new IDS instance (factory) so callers can populate it
+
+    Some imas-python builds support both:
+      - db.get(ids_name, occ) -> returns IDS
+      - db.get(ids_obj, occ)  -> fills in-place
+    We try both.
+    """
+    # Try return-by-value first (safer for AoS-containing IDSs on some builds)
     try:
-        ids = factory.new(ids_name)
+        obj = db.get(str(ids_name), int(occ))
+        if obj is not None:
+            return obj
     except Exception:
-        ids = factory.__getattr__(ids_name)()  # type: ignore[attr-defined]
+        pass
+
+    # Otherwise create a new IDS and attempt fill-in-place
+    try:
+        ids = factory.new(str(ids_name))
+    except Exception:
+        ids = factory.__getattr__(str(ids_name))()  # type: ignore[attr-defined]
 
     try:
         db.get(ids, int(occ))
-        return ids
+    except Exception:
+        # Entry does not exist; return empty IDS
+        pass
+    return ids
+
+
+
+def _infer_homogeneous_time(ids: Any) -> int:
+    """Infer a valid ids_properties.homogeneous_time value.
+
+    IMAS DD expects:
+      0: heterogeneous time
+      1: homogeneous time
+      2: independent of time (static)
+    """
+    try:
+        t = getattr(ids, "time", None)
+        if t is None:
+            return 2
+        # numpy arrays / lists
+        try:
+            if hasattr(t, "__len__") and len(t) > 0:
+                return 1
+        except Exception:
+            pass
+        # scalar time
+        if isinstance(t, (int, float)) and np.isfinite(t):
+            return 1
     except Exception:
         pass
-
-    obj = db.get(ids_name, int(occ))
-    return ids if obj is None else obj
+    return 2
 
 
 def put_ids(db: Any, ids: Any, occ: int) -> None:
-    """Robust IDS writer across IMAS python variants."""
-    # 1) Preferred: ids.put(db_entry=db, occurrence=occ)
+    """Put IDS to DB, ensuring mandatory ids_properties fields are valid."""
     try:
-        ids.put(db_entry=db, occurrence=int(occ))
-        return
+        ht = _infer_homogeneous_time(ids)
+        _ensure_ids_properties(ids, homogeneous_time=ht)
     except Exception:
+        # best-effort; validation will catch if still invalid
         pass
-    # 2) Some versions accept ids.put(db, occ)
-    try:
-        ids.put(db, int(occ))
-        return
-    except Exception:
-        pass
-    # 3) DBEntry.put(ids, occ)
+
     try:
         db.put(ids, int(occ))
-        return
     except Exception as e:
-        raise RuntimeError(f"Failed to write IDS occurrence={occ}: {e}")
+        # One more attempt if validation complains about homogeneous_time
+        try:
+            _ensure_ids_properties(ids, homogeneous_time=2)
+            db.put(ids, int(occ))
+            return
+        except Exception:
+            raise
 
 
-@dataclass
-class IMASContext:
-    """Filesystem-backed IMAS context used consistently across NIMROD tools."""
-
-    backend: str
-    dbpath: str | Path
-    dd: str
-    dd_version: str
-    pulse: int
-    run: int
-    dd_version_dir: str = "major"
-
-    def entry_dir(self) -> Path:
-        return entry_dir(self.dbpath, self.dd, self.dd_version, self.pulse, self.run, dd_version_dir=self.dd_version_dir)
-
-    def uri(self) -> str:
-        return build_uri(self.backend, self.entry_dir())
-
-    def open(self, mode: str = "r"):
-        p = self.entry_dir()
-        if mode in ("a", "w", "x"):
-            ensure_entry_dir(p)
-        db, uri, imas_mod = open_dbentry(self.backend, p, mode=mode, dd_version=self.dd_version)
-        factory = ids_factory(imas_mod, self.dd_version)
-        return db, uri, imas_mod, factory
+def _get_or_create(db: Any, factory: Any, ids_name: str, occ: int):
+    try:
+        obj = db.get(ids_name, int(occ))
+        if obj is not None:
+            return obj
+    except Exception:
+        pass
+    try:
+        return factory.new(ids_name)
+    except Exception:
+        return factory.__getattr__(ids_name)()  # type: ignore[attr-defined]
 
 
-# --------------------------- Namelist helpers ---------------------------
+def _ensure_ids_properties(ids_obj: Any, homogeneous_time: int = 2) -> None:
+    try:
+        ip = getattr(ids_obj, "ids_properties", None)
+        if ip is None:
+            return
+        if hasattr(ip, "homogeneous_time"):
+            try:
+                ip.homogeneous_time = int(homogeneous_time)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _append_ids_comment(ids_obj: Any, text: str) -> None:
+    try:
+        ip = getattr(ids_obj, "ids_properties", None)
+        if ip is None:
+            return
+        prev = ""
+        try:
+            prev = str(getattr(ip, "comment", "") or "")
+        except Exception:
+            prev = ""
+        new = (prev.rstrip() + "\n" if prev.strip() else "") + str(text).rstrip()
+        try:
+            ip.comment = new
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+# --------------------------- text / namelist utilities ---------------------------
 
 def value_to_string(val: Any) -> str:
-    """Convert a Python value to a Fortran-like token string for XML.
-
-    Important: strings that contain whitespace are quoted so they round-trip
-    through restore logic without being split into arrays.
-    """
-    if isinstance(val, np.ndarray):
+    """Convert Python value to Fortran-ish token string for XML."""
+    if np is not None and isinstance(val, np.ndarray):
         val = val.tolist()
 
-    # Arrays/lists: emit space-separated token stream
     if isinstance(val, (list, tuple)):
         return " ".join(value_to_string(v) for v in val)
 
-    # Booleans
-    if isinstance(val, (bool, np.bool_)):
+    if isinstance(val, (bool,)) or (np is not None and isinstance(val, np.bool_)):  # type: ignore[attr-defined]
         return ".true." if bool(val) else ".false."
 
-    # Strings: quote when needed (whitespace/special chars), using double quotes + backslash escapes
     if isinstance(val, str):
         s = val
         if s == "":
             return '""'
         if re.search(r"\s|,|\"|\\", s):
-            s2 = s.replace("\\", "\\\\").replace('"', '\"')
+            s2 = s.replace("\\", "\\\\").replace('"', r"\"")
             return f'"{s2}"'
         return s
 
     return str(val)
-def parse_fortran_namelist_text(text: str) -> Dict[str, Dict[str, Any]]:
-    """Very small namelist parser.
 
-    This is *not* a full Fortran parser; it's meant as a best-effort fallback
-    when f90nml is unavailable. It handles typical NIMROD-style namelists:
 
-      &group
-        var = 1,
-        flag = .true.
-      /
-
-    Arrays like a(1)=..., repeated assignments, and expressions are preserved
-    as raw strings.
+def namelist_file_to_xml(root_tag: str, path: str | Path) -> str:
     """
-    groups: Dict[str, Dict[str, Any]] = {}
-    if not text:
-        return groups
+    Convert a Fortran namelist file into a simple XML representation.
 
-    # Strip comments (! ...)
-    lines = []
-    for ln in text.splitlines():
-        # Keep string literals simple: remove ! only if not in quotes (best-effort)
-        if "!" in ln and (ln.count("'") % 2 == 0) and (ln.count('"') % 2 == 0):
-            ln = ln.split("!", 1)[0]
-        lines.append(ln)
-    text2 = "\n".join(lines)
+    Uses f90nml if present; otherwise embeds raw text.
+    """
+    import xml.etree.ElementTree as ET
 
-    # Split into group blocks.
-    pos = 0
-    while True:
-        m = _NML_GROUP_RE.search(text2, pos)
-        if not m:
-            break
-        grp = m.group("grp").strip()
-        start = m.end()
-        # find group terminator: / at line start or &end (rare)
-        end_m = re.search(r"(?im)^\s*/\s*$", text2[start:])
-        if end_m:
-            end = start + end_m.start()
-            pos = start + end_m.end()
-        else:
-            # No '/', consume to end
-            end = len(text2)
-            pos = len(text2)
-        body = text2[start:end]
-
-        # Tokenize assignments in body. We do a conservative split on commas/newlines.
-        assigns = re.split(r"[,\n]", body)
-        d: Dict[str, Any] = {}
-        for a in assigns:
-            if "=" not in a:
-                continue
-            k, v = a.split("=", 1)
-            k = k.strip()
-            v = v.strip()
-            if not k:
-                continue
-            # Normalize logicals
-            vl = v.lower().strip()
-            if vl in (".true.", "true", "t"):
-                d[k] = True
-            elif vl in (".false.", "false", "f"):
-                d[k] = False
-            else:
-                # Try numeric scalar
-                try:
-                    if re.match(r"^[+-]?(\d+\.\d*|\d*\.\d+)([edED][+-]?\d+)?$", v) or re.match(r"^[+-]?\d+([edED][+-]?\d+)?$", v):
-                        d[k] = float(v.replace("D", "E").replace("d", "e")) if ("." in v or "e" in vl or "d" in vl) else int(v)
-                    else:
-                        d[k] = v
-                except Exception:
-                    d[k] = v
-        groups[grp] = d
-
-    return groups
-
-
-def namelist_file_to_xml(root_tag: str, file_path: Optional[str]) -> str:
-    """Convert a Fortran namelist file into the XML format used by input2imas."""
-    if not file_path:
-        return ""
-    p = Path(os.path.expanduser(file_path))
+    p = Path(path).expanduser()
     if not p.is_file():
         return ""
 
-    # Prefer f90nml when available.
+    root = ET.Element(str(root_tag))
+
     try:
         import f90nml  # type: ignore
         nml = f90nml.read(str(p))
-        root = ET.Element(root_tag)
-        nml_el = ET.SubElement(root, root_tag.replace("_inputs", "_in"), filename=p.name)
-        for grp_name, grp in nml.items():
-            g_el = ET.SubElement(nml_el, "group", name=str(grp_name))
-            for var_name, val in grp.items():
-                v_el = ET.SubElement(g_el, "var", name=str(var_name))
-                v_el.text = value_to_string(val)
-        return ET.tostring(root, encoding="unicode")
+        # nml is dict-like: group -> dict
+        for grp, d in nml.items():
+            g = ET.SubElement(root, "group")
+            g.set("name", str(grp))
+            if isinstance(d, dict):
+                for k, v in d.items():
+                    it = ET.SubElement(g, "item")
+                    it.set("key", str(k))
+                    it.text = value_to_string(v)
+    except Exception:
+        raw = ET.SubElement(root, "raw")
+        raw.text = p.read_text(errors="replace")
+
+    return ET.tostring(root, encoding="unicode")
+
+
+# --------------------------- checksums / command sanitization ---------------------------
+
+def compute_file_checksum(path: str | Path, algo: str = "sha256", chunk_bytes: int = 1024 * 1024) -> str:
+    """Compute checksum. Returns '' if missing/unreadable."""
+    try:
+        p = Path(path).expanduser()
+        if not p.is_file():
+            return ""
+        h = hashlib.new(str(algo or "sha256"))
+        with p.open("rb") as f:
+            while True:
+                b = f.read(int(chunk_bytes))
+                if not b:
+                    break
+                h.update(b)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
+def sanitize_cli_command(argv: List[str], known_files: Optional[List[str | Path]] = None) -> str:
+    """Sanitize argv to avoid absolute paths for known input files."""
+    import shlex
+    kset = set()
+    if known_files:
+        for p in known_files:
+            try:
+                kset.add(str(Path(p).expanduser().resolve()))
+            except Exception:
+                pass
+            try:
+                kset.add(str(p))
+            except Exception:
+                pass
+
+    out: List[str] = []
+    for tok in (argv or []):
+        t = str(tok)
+        rp = ""
+        try:
+            rp = str(Path(t).expanduser().resolve())
+        except Exception:
+            rp = ""
+        if rp and (rp in kset):
+            out.append(Path(t).name)
+        else:
+            out.append(t)
+    return " ".join(shlex.quote(x) for x in out)
+
+
+# --------------------------- workflow.h5 writer (append-only) ---------------------------
+
+def _infer_entry_path_from_db(db: Any) -> Optional[Path]:
+    """Infer entry directory from DBEntry URI imas:<backend>?path=<entry_dir>."""
+    uri = ""
+    for attr in ("uri", "_uri", "__uri", "URI"):
+        try:
+            if hasattr(db, attr):
+                v = getattr(db, attr)
+                if callable(v):
+                    v = v()
+                if v:
+                    uri = str(v)
+                    break
+        except Exception:
+            pass
+    if not uri:
+        try:
+            uri = str(db.get_uri())
+        except Exception:
+            uri = ""
+
+    if not uri or "?" not in uri:
+        return None
+
+    try:
+        import urllib.parse
+        qs = urllib.parse.parse_qs(uri.split("?", 1)[1], keep_blank_values=True)
+        p = qs.get("path", [None])[0]
+        return Path(p) if p else None
+    except Exception:
+        return None
+
+
+def _merge_component_parameters(existing_xml: str, new_execution_el: Any) -> str:
+    """Append <execution> to nimrod2imas_provenance XML."""
+    import xml.etree.ElementTree as ET
+
+    def make_root():
+        return ET.Element("nimrod2imas_provenance")
+
+    if existing_xml:
+        try:
+            root = ET.fromstring(existing_xml)
+        except Exception:
+            root = make_root()
+            legacy = ET.SubElement(root, "legacy")
+            legacy.text = str(existing_xml)
+    else:
+        root = make_root()
+
+    execs = root.find("executions")
+    if execs is None:
+        execs = ET.SubElement(root, "executions")
+    execs.append(new_execution_el)
+
+    return ET.tostring(root, encoding="unicode")
+
+
+def _ensure_vlen_str_dset(f: Any, name: str):
+    import h5py
+    if name in f:
+        return f[name]
+    dt = h5py.string_dtype(encoding="utf-8")
+    return f.create_dataset(name, shape=(0,), maxshape=(None,), dtype=dt)
+
+
+def _h5_read_str(dset: Any, i: int) -> str:
+    try:
+        v = dset[i]
+        if isinstance(v, bytes):
+            return v.decode("utf-8", errors="replace")
+        return str(v)
+    except Exception:
+        return ""
+
+
+def _workflow_update_h5(
+    entry_path: Path,
+    *,
+    component_name: str,
+    component_description: str,
+    component_repository: str,
+    component_version: str,
+    new_execution_el: Any,
+) -> bool:
+    """Append/update workflow component datasets in workflow.h5 (append-only)."""
+    wf_path = Path(entry_path) / "workflow.h5"
+    try:
+        import h5py  # noqa: F401
+    except Exception:
+        return False
+
+    import h5py
+
+    ensure_entry_dir(entry_path)
+    if not wf_path.exists():
+        with h5py.File(wf_path, "w"):
+            pass
+
+    with h5py.File(wf_path, "r+") as f:
+        d_name = _ensure_vlen_str_dset(f, "time_loop&component[]&name")
+        d_par  = _ensure_vlen_str_dset(f, "time_loop&component[]&parameters")
+        d_desc = _ensure_vlen_str_dset(f, "time_loop&component[]&description")
+        d_repo = _ensure_vlen_str_dset(f, "time_loop&component[]&repository")
+        d_ver  = _ensure_vlen_str_dset(f, "time_loop&component[]&version")
+
+        n = max(int(d_name.shape[0]), int(d_par.shape[0]), int(d_desc.shape[0]), int(d_repo.shape[0]), int(d_ver.shape[0]))
+        for d in (d_name, d_par, d_desc, d_repo, d_ver):
+            if int(d.shape[0]) < n:
+                old = int(d.shape[0])
+                d.resize((n,))
+                for j in range(old, n):
+                    d[j] = ""
+
+        idx = -1
+        blank = -1
+        for i in range(n):
+            nm = _h5_read_str(d_name, i).strip()
+            pr = _h5_read_str(d_par, i).strip()
+            if nm == component_name:
+                idx = i
+                break
+            if blank < 0 and (not nm) and (not pr):
+                blank = i
+
+        if idx < 0:
+            if blank >= 0:
+                idx = blank
+            else:
+                new_n = n + 1
+                for d in (d_name, d_par, d_desc, d_repo, d_ver):
+                    d.resize((new_n,))
+                    d[new_n - 1] = ""
+                idx = new_n - 1
+
+        prev = _h5_read_str(d_par, idx)
+        d_par[idx] = _merge_component_parameters(prev, new_execution_el)
+
+        d_name[idx] = component_name
+        d_desc[idx] = str(component_description or "")
+        d_repo[idx] = str(component_repository or "")
+        d_ver[idx]  = str(component_version or "")
+
+    return True
+
+
+# --------------------------- public provenance entry point ---------------------------
+
+def update_workflow_and_dataset_fair(
+    db: Any,
+    factory: Any,
+    *,
+    component_name: str,
+    component_description: str,
+    component_repository: str,
+    component_version: str,
+    exec_command: str,
+    input_files: Optional[List[str | Path]] = None,
+    record_checksums: bool = True,
+    checksum_algorithm: str = "sha256",
+    workflow_occ: int = 0,
+    dataset_fair_occ: int = 0,
+    extra_kv: Optional[Dict[str, str]] = None,
+) -> None:
+    """Append per-step provenance into BOTH workflow and dataset_fair."""
+    import xml.etree.ElementTree as ET
+
+    input_files = list(input_files or [])
+    algo = str(checksum_algorithm or "sha256").strip() or "sha256"
+    ts = datetime.now(timezone.utc).isoformat()
+
+    exec_el = ET.Element("execution")
+    exec_el.set("timestamp", ts)
+
+    cmd_el = ET.SubElement(exec_el, "command")
+    cmd_el.text = str(exec_command or "").strip()
+
+    files_el = ET.SubElement(exec_el, "inputs")
+    files_el.set("checksum_algorithm", algo)
+
+    checksums: List[Tuple[str, str]] = []
+    missing: List[str] = []
+    for p in input_files:
+        name = Path(p).name if hasattr(p, "__fspath__") else str(p)
+        f_el = ET.SubElement(files_el, "file")
+        f_el.set("name", name)
+        if record_checksums:
+            h = compute_file_checksum(p, algo=algo)
+            if h:
+                f_el.set("checksum", h)
+                checksums.append((name, h))
+            else:
+                missing.append(name)
+
+    if extra_kv:
+        meta_el = ET.SubElement(exec_el, "metadata")
+        for k, v in extra_kv.items():
+            kv = ET.SubElement(meta_el, "kv")
+            kv.set("key", str(k))
+            kv.text = str(v)
+
+    # workflow (append-only)
+    entry_path = _infer_entry_path_from_db(db)
+    if entry_path is not None:
+        try:
+            _workflow_update_h5(
+                entry_path,
+                component_name=component_name,
+                component_description=component_description,
+                component_repository=component_repository,
+                component_version=component_version,
+                new_execution_el=exec_el,
+            )
+        except Exception:
+            pass
+
+    # dataset_fair comment append
+    try:
+        df = _get_or_create(db, factory, "dataset_fair", int(dataset_fair_occ))
+        _ensure_ids_properties(df, homogeneous_time=2)
+
+        block: List[str] = []
+        block.append(f"nimrod2imas provenance: {component_name}")
+        block.append(f"timestamp_utc: {ts}")
+
+        if extra_kv:
+            kvs = "; ".join([f"{k}={extra_kv[k]}" for k in sorted(extra_kv.keys())])
+            if kvs:
+                block.append(f"metadata: {kvs}")
+
+        cmd_line = str(exec_command or "").strip()
+        if cmd_line:
+            block.append(f"command: {cmd_line}")
+
+        block.append(f"inputs: {len(input_files)} file(s)")
+
+        if record_checksums:
+            block.append(f"checksums ({algo}): {len(checksums)} computed; {len(missing)} missing/unreadable")
+            cap = 30
+            for name, h in checksums[:cap]:
+                block.append(f"  {name}: {h}")
+            if len(checksums) > cap:
+                block.append(f"  ... (+{len(checksums)-cap} more)")
+            if checksums:
+                hman = hashlib.new(algo)
+                for name, h in sorted(checksums, key=lambda x: x[0]):
+                    hman.update((name + " " + h + "\n").encode("utf-8"))
+                block.append(f"manifest_checksum ({algo}): {hman.hexdigest()}")
+        else:
+            block.append("checksums: disabled")
+
+        _append_ids_comment(df, "\n".join(block))
+        put_ids(db, df, int(dataset_fair_occ))
     except Exception:
         pass
-
-    # Fallback: small parser
-    try:
-        raw = p.read_text(errors="ignore")
-    except Exception:
-        return ""
-    groups = parse_fortran_namelist_text(raw)
-    if not groups:
-        return ""
-
-    root = ET.Element(root_tag)
-    nml_el = ET.SubElement(root, root_tag.replace("_inputs", "_in"), filename=p.name)
-    for grp_name, grp in groups.items():
-        g_el = ET.SubElement(nml_el, "group", name=str(grp_name))
-        for var_name, val in grp.items():
-            v_el = ET.SubElement(g_el, "var", name=str(var_name))
-            v_el.text = value_to_string(val)
-    return ET.tostring(root, encoding="unicode")

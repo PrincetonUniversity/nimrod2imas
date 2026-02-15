@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""plot_mhd_fixed.py (IMAS-only)
+"""plot_mhd.py (IMAS-only)
 
 Plot a scalar GGD quantity from an IMAS HDF5 IDS (mhd, edge_profiles, etc.)
 produced by dump2imas.
@@ -19,10 +19,10 @@ Values are read from:
   /<ids>_<occ>/ggd[]&<leaf>[]&values
 
 Examples
-  python plot_mhd_fixed.py --dd mast --dd-version 4.1.1 --pulse 45272 --run 9 --occ 1 \
+  python plot_mhd.py --dd mast --dd-version 4.1.1 --pulse 45272 --run 9 --occ 1 \
       --ids mhd --quantity ni --phi-index 0 --show --debug
 
-  python plot_mhd_fixed.py --dd mast --dd-version 4.1.1 --pulse 45272 --run 9 --occ 1 \
+  python plot_mhd.py --dd mast --dd-version 4.1.1 --pulse 45272 --run 9 --occ 1 \
       --ids edge_profiles --quantity vphi --ion-index 0 --show
 """
 
@@ -33,14 +33,28 @@ import math
 import os
 import sys
 from typing import Dict, List, Optional, Sequence, Tuple
+from pathlib import Path
 
 import h5py
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 from matplotlib.tri import TriAnalyzer
+from matplotlib.colors import LogNorm, SymLogNorm
 
-VERSION = "plot_mhd_fixed_v3"
+# Optional: cmasher colormaps (https://cmasher.readthedocs.io/)
+# If installed, importing cmasher registers its colormaps with Matplotlib (names like 'cmr.gothic').
+_HAS_CMASher = False
+try:
+    import cmasher as cmr  # type: ignore  # noqa: F401
+    _HAS_CMASher = True
+except Exception:
+    cmr = None  # type: ignore
+
+
+__version__ = "0.3.0"
+
+VERSION = __version__
 
 
 # ----------------- filesystem helpers -----------------
@@ -57,17 +71,105 @@ def _base(dd: str, ddv: str, pulse: int, run: int) -> str:
 
 
 def _ids_file(base: str, ids: str, occ: int) -> Tuple[str, str]:
-    """Return (filename, group_name)."""
-    p1 = os.path.join(base, f"{ids}_{occ}.h5")
-    if os.path.exists(p1):
-        return p1, f"{ids}_{occ}"
-    p2 = os.path.join(base, f"{ids}.h5")
-    if os.path.exists(p2):
-        return p2, f"{ids}_{occ}"
-    raise FileNotFoundError(f"Could not find {p1} or {p2}")
+    """Return (filename, group_name) for an IDS occurrence.
+
+    IMAS HDF5 naming conventions differ for occ=0 across environments:
+      - some backends use <ids>.h5 with group /<ids>
+      - others use <ids>_0.h5 with group /<ids>_0
+
+    For occ>0 the conventional layout is:
+      - <ids>_<occ>.h5 with group /<ids>_<occ>
+      - (fallback) <ids>.h5 with group /<ids>_<occ>
+    """
+    candidates: List[Tuple[str, str]] = []
+
+    if int(occ) == 0:
+        candidates.extend([
+            (os.path.join(base, f"{ids}.h5"), f"{ids}"),
+            (os.path.join(base, f"{ids}_0.h5"), f"{ids}_0"),
+            # Rare fallback: group has suffix even in <ids>.h5
+            (os.path.join(base, f"{ids}.h5"), f"{ids}_0"),
+        ])
+    else:
+        candidates.extend([
+            (os.path.join(base, f"{ids}_{occ}.h5"), f"{ids}_{occ}"),
+            (os.path.join(base, f"{ids}.h5"), f"{ids}_{occ}"),
+        ])
+
+    for fp, grp in candidates:
+        if not os.path.exists(fp):
+            continue
+        try:
+            with h5py.File(fp, "r") as _f:
+                if f"/{grp}" in _f:
+                    return fp, grp
+        except Exception:
+            continue
+
+    tried = ", ".join([f"{Path(fp).name}:/{grp}" for fp, grp in candidates])
+    raise FileNotFoundError(f"Could not find IDS file/group for ids={ids!r} occ={occ}: tried {tried}")
 
 
 # ----------------- quantity / leaf resolution -----------------
+
+# Canonical quantity aliases -> candidate IMAS leaf names (WITHOUT the ggd[]& prefix).
+# These are intentionally short and stable; users can always pass an explicit IMAS-ish leaf
+# (e.g. 'electrons&temperature' or 'ion[]&pressure') via --quantity.
+_H5_Q_LEAF_ALIASES = {
+    'ni': ['n_i_total', 'n_i', 'n_i_total_over_n_e'],
+    'ti': ['t_i_average', 't_i'],
+    'te': ['electrons&temperature', 't_e', 'te'],
+    'ne': ['electrons&density', 'n_e'],
+    'pe': ['electrons&pressure', 'p_e'],
+    'pi': ['p_i', 'ions&pressure'],
+    'jphi': ['j_phi', 'j_tor', 'current_density_phi', 'current_density_tor'],
+    'jtor': ['j_tor', 'j_phi', 'current_density_tor', 'current_density_phi'],
+    'j': ['j_total', 'j_phi', 'j_tor'],
+    'vr': ['velocity_r', 'v_r'],
+    'vz': ['velocity_z', 'v_z'],
+    'vphi': ['velocity_phi', 'velocity_tor', 'v_phi'],
+    'vtor': ['velocity_tor', 'velocity_phi', 'v_phi'],
+}
+
+
+def _h5_list_available_ggd_values(g):
+    """List available ggd[]&...[]&values datasets in an IDS group.
+
+    Returns dataset names (relative to the group) and excludes bookkeeping datasets such as '*_SHAPE'.
+    """
+    out = []
+    for k in g.keys():
+        if not isinstance(k, str):
+            continue
+        if not k.startswith('ggd[]&'):
+            continue
+        if not k.endswith('[]&values'):
+            continue
+        if k.endswith('_SHAPE') or k.endswith('AOS_SHAPE'):
+            continue
+        out.append(k)
+    return sorted(out)
+
+
+def _print_quantity_help(ids_name, occ, entry, g):
+    print('')
+    print(f"Available GGD value datasets for ids='{ids_name}', occ={occ}:")
+    avail = _h5_list_available_ggd_values(g)
+    if not avail:
+        print('  (none found under ggd[]&...[]&values in this IDS group)')
+    else:
+        for k in avail:
+            print(f'  - {k}')
+    print('')
+    print('How to plot:')
+    print('  - Use --quantity with an alias (e.g. ni, te, ne, jphi, vphi) or an explicit leaf (e.g. electrons&temperature).')
+    print('  - Aliases supported by this script:')
+    print('      ' + ', '.join(sorted(_H5_Q_LEAF_ALIASES.keys())))
+    print('')
+    print('Notes:')
+    print('  - For edge_profiles, ion velocities are stored under ion[]&velocity&{r,z,phi}; use --ion-index as needed.')
+    print('')
+
 
 def _leaf_candidates(ids: str, quantity: str) -> List[str]:
     """Return candidate IMAS leaf names (WITHOUT the ggd[]& prefix) for a user quantity."""
@@ -81,21 +183,7 @@ def _leaf_candidates(ids: str, quantity: str) -> List[str]:
         return [q]
 
     # Common short-hands
-    base: Dict[str, List[str]] = {
-        "ni": ["n_i_total", "n_i", "n_i_total_over_n_e"],
-        "ti": ["t_i_average", "t_i"],
-        "te": ["electrons&temperature", "t_e", "te"],
-        "ne": ["electrons&density", "n_e"],
-        "pe": ["electrons&pressure", "p_e"],
-        "pi": ["p_i", "ions&pressure"],
-        "jphi": ["j_phi", "j_tor", "current_density_phi", "current_density_tor"],
-        "jtor": ["j_tor", "j_phi", "current_density_tor", "current_density_phi"],
-        "j": ["j_total", "j_phi", "j_tor"],
-        "vr": ["velocity_r", "v_r"],
-        "vz": ["velocity_z", "v_z"],
-        "vphi": ["velocity_phi", "velocity_tor", "v_phi"],
-        "vtor": ["velocity_tor", "velocity_phi", "v_phi"],
-    }
+    base = _H5_Q_LEAF_ALIASES
 
     cand = base.get(ql, [q])
 
@@ -310,18 +398,52 @@ def _extract_geometry(f: h5py.File, grp: str, debug: bool = False) -> Tuple[np.n
 
 # ----------------- values extraction -----------------
 
-def _select_time_and_object(arr: np.ndarray, t_index: int) -> np.ndarray:
-    """Select time index and object index (0) from typical IMAS packed arrays."""
+def _select_time_and_object(arr: np.ndarray, t_index: int, *, ntime: int | None = None, clamp_time: bool = False) -> np.ndarray:
+    """Select time index and object index (0) from typical IMAS packed arrays.
+
+    Important: many IDS backends store single-time values as a 1-D vector (npts,)
+    rather than (1, npts). In that case, *do not* interpret axis0 as time.
+    """
     a = np.asarray(arr)
 
-    # select time if axis0 looks like time
-    if a.ndim >= 1 and a.shape[0] > 1:
-        ti = max(0, min(int(t_index), a.shape[0] - 1))
-        a = a[ti]
-    elif a.ndim >= 1 and a.shape[0] == 1:
-        a = a[0]
+    # 1-D arrays are assumed to be already flattened per-node/per-point values.
+    # If the IDS group advertises a time vector, enforce that time_index is in range,
+    # even if values are stored without an explicit leading time axis.
+    if a.ndim == 1:
+        if ntime is not None:
+            ntime_i = int(ntime)
+            ti = int(t_index)
+            if ti < 0 or ti >= ntime_i:
+                if clamp_time:
+                    ti = max(0, min(ti, ntime_i - 1))
+                else:
+                    raise IndexError(f"time-index {ti} out of range [0,{ntime_i-1}] (ntime={ntime_i})")
+        return a
 
-    # select object if next axis looks like object
+    # Select time only when we have an explicit time axis. Prefer matching /<grp>/time length (ntime).
+    if ntime is not None and a.ndim >= 2 and a.shape[0] == int(ntime):
+        ntime_i = int(ntime)
+        ti = int(t_index)
+        if ti < 0 or ti >= ntime_i:
+            if clamp_time:
+                ti = max(0, min(ti, ntime_i - 1))
+            else:
+                raise IndexError(f"time-index {ti} out of range [0,{ntime_i-1}] (ntime={ntime_i})")
+        a = a[ti] if ntime_i > 1 else a[0]
+    else:
+        # Legacy heuristic fallback (only for multi-d arrays): treat a small leading axis as time.
+        if a.ndim >= 2 and a.shape[0] <= 256 and a.shape[0] > 1:
+            ti = int(t_index)
+            if ti < 0 or ti >= a.shape[0]:
+                if clamp_time:
+                    ti = max(0, min(ti, a.shape[0] - 1))
+                else:
+                    raise IndexError(f"time-index {ti} out of range [0,{a.shape[0]-1}] (ntime={a.shape[0]})")
+            a = a[ti]
+        elif a.ndim >= 2 and a.shape[0] == 1:
+            a = a[0]
+
+    # Select object if next axis looks like object (small)
     if a.ndim >= 2 and a.shape[0] <= 8:
         a = a[0]
 
@@ -335,13 +457,27 @@ def _read_values(
     values_path: str,
     time_index: int,
     ion_index: int,
+    *,
+    clamp_time_index: bool = False,
     debug: bool = False,
 ) -> np.ndarray:
-    a = _select_time_and_object(f[values_path][()], time_index)
+    # Determine number of time slices from /<grp>/time if present.
+    ntime: int | None = None
+    tpath = f"/{grp}/time"
+    if tpath in f:
+        try:
+            tt = np.asarray(f[tpath][()])
+            ntime = int(tt.size) if tt.ndim != 0 else 1
+        except Exception:
+            ntime = None
+
+    a = _select_time_and_object(f[values_path][()], time_index, ntime=ntime, clamp_time=clamp_time_index)
 
     # Handle ion[] multi-ion arrays if present as (nion, npts)
     if "ion[]" in leaf and a.ndim >= 2 and a.shape[0] > 1:
-        ii = max(0, min(int(ion_index), a.shape[0] - 1))
+        ii = int(ion_index)
+        if ii < 0 or ii >= a.shape[0]:
+            ii = max(0, min(ii, a.shape[0] - 1))
         a = a[ii]
 
     v = np.asarray(a, dtype=float).reshape(-1)
@@ -353,7 +489,7 @@ def _read_values(
         v[bad] = np.nan
 
     if debug:
-        print(f"DEBUG: values_path={values_path} leaf={leaf} n={v.size}", file=sys.stderr)
+        print(f"DEBUG: values_path={values_path} leaf={leaf} n={v.size} ntime={ntime}", file=sys.stderr)
 
     return v
 
@@ -506,6 +642,87 @@ def _dedup_rz(r, z, v, tol=1e-10, debug=False):
     return r_u, z_u, vavg
 
 
+def _available_cmaps():
+    """Return available Matplotlib colormap names (sorted).
+
+    If cmasher is installed, its colormaps are included automatically once imported.
+    """
+    try:
+        return sorted(list(plt.colormaps()))
+    except Exception:
+        try:
+            return sorted(list(plt.cm.cmap_d.keys()))  # type: ignore[attr-defined]
+        except Exception:
+            return []
+
+
+def _default_cmap_for_data(v, norm_kind='linear'):
+    # Sequential by default; diverging if signed.
+    try:
+        vv = v[np.isfinite(v)]
+        if vv.size == 0:
+            return 'viridis'
+        vmin = float(vv.min())
+        vmax = float(vv.max())
+    except Exception:
+        return 'viridis'
+    if str(norm_kind).lower() == 'log':
+        return 'viridis'
+    if vmin < 0.0 and vmax > 0.0:
+        return 'RdBu_r'
+    return 'viridis'
+
+
+def _resolve_cmap(cmap, v, norm_kind='linear'):
+    if cmap is None or str(cmap).strip() == '':
+        return _default_cmap_for_data(v, norm_kind=norm_kind)
+    cmap = str(cmap).strip()
+    if cmap.lower().startswith('cmr.') and not _HAS_CMASher:
+        raise RuntimeError(
+            f"Requested colormap {cmap!r}, but cmasher is not available in this Python environment. "
+            "Install it (e.g. 'pip install cmasher') or choose a Matplotlib colormap."
+        )
+    avail = _available_cmaps()
+    if avail and cmap not in avail:
+        lower_map = {c.lower(): c for c in avail}
+        if cmap.lower() in lower_map:
+            return lower_map[cmap.lower()]
+        raise RuntimeError(f"Unknown colormap {cmap!r}. Use --list-cmaps to see available names.")
+    return cmap
+
+
+def _build_norm_and_levels(v, nlevels, norm_kind='linear', linthresh=1e-6):
+    norm_kind = (norm_kind or 'linear').lower()
+    vv = v[np.isfinite(v)]
+    if vv.size == 0:
+        return None, int(nlevels)
+
+    if norm_kind in ('linear', 'none'):
+        return None, int(nlevels)
+
+    if norm_kind == 'log':
+        pos = vv[vv > 0]
+        if pos.size == 0:
+            raise ValueError('Log normalization requires positive data. Use --norm symlog for signed data, or plot a non-negative quantity.')
+        vmin = float(pos.min())
+        vmax = float(pos.max())
+        if not (vmin > 0 and vmax > 0):
+            raise ValueError('Log normalization requires positive finite vmin/vmax.')
+        if vmax <= vmin:
+            vmax = vmin * 10.0
+        levels = np.logspace(np.log10(vmin), np.log10(vmax), int(nlevels))
+        return LogNorm(vmin=vmin, vmax=vmax), levels
+
+    if norm_kind == 'symlog':
+        absmax = float(np.max(np.abs(vv)))
+        if absmax == 0.0:
+            absmax = 1.0
+        lt = float(linthresh) if linthresh and linthresh > 0 else absmax * 1e-3
+        return SymLogNorm(linthresh=lt, vmin=-absmax, vmax=absmax), int(nlevels)
+
+    raise ValueError(f"Unknown --norm {norm_kind!r} (use linear|log|symlog).")
+
+
 def _plot_tricontour(
     r: np.ndarray,
     z: np.ndarray,
@@ -516,6 +733,9 @@ def _plot_tricontour(
     triangles: Optional[np.ndarray] = None,
     mask_flat_tris: bool = False,
     min_circle_ratio: float = 0.01,
+    cmap: Optional[str] = None,
+    norm=None,
+    levels=40,
 ):
     if triangles is None:
         tri = mtri.Triangulation(r, z)
@@ -542,7 +762,7 @@ def _plot_tricontour(
 
     fig = plt.figure()
     ax = fig.add_subplot(111)
-    cs = ax.tricontourf(tri, v_ma, levels=40)
+    cs = ax.tricontourf(tri, v_ma, levels=levels, cmap=cmap, norm=norm)
     fig.colorbar(cs, ax=ax)
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("R")
@@ -721,7 +941,14 @@ def main() -> int:
     ap.add_argument("--occ", required=True, type=int)
     ap.add_argument("--ids", required=True, help="IDS name (e.g. mhd)")
     ap.add_argument("--time-index", default=0, type=int)
-    ap.add_argument("--quantity", required=True, help="Quantity or leaf (e.g. ni, te, ne, jphi, electrons&temperature)")
+    ap.add_argument("--clamp-time-index", action="store_true", help="Clamp --time-index into available range instead of erroring")
+    ap.add_argument("--quantity", required=False, help="Quantity or leaf (e.g. ni, te, ne, jphi, electrons&temperature)")
+    ap.add_argument("--help-quantities", action="store_true", help="Print available datasets and aliases for this IDS occurrence and exit")
+    ap.add_argument("--levels", type=int, default=40, help="Number of contour levels")
+    ap.add_argument("--cmap", default=None, help="Matplotlib colormap name (e.g. viridis, RdBu_r, cmr.gothic)")
+    ap.add_argument("--list-cmaps", action="store_true", help="List available colormap names and exit")
+    ap.add_argument("--norm", default="linear", choices=["linear", "log", "symlog"], help="Color normalization for contours")
+    ap.add_argument("--linthresh", type=float, default=1e-6, help="linthresh for symlog normalization")
     ap.add_argument("--ion-index", type=int, default=0, help="Ion index for ion[] quantities (0-based)")
     ap.add_argument("--phi-index", default=0, type=int)
     ap.add_argument("--phi-tol", default=1e-6, type=float)
@@ -741,20 +968,48 @@ def main() -> int:
     ap.add_argument("--min-circle-ratio", type=float, default=0.01)
     args = ap.parse_args()
 
+    if args.list_cmaps:
+        avail = _available_cmaps()
+        if _HAS_CMASher:
+            print("cmasher: available (colormaps with prefix 'cmr.')")
+        else:
+            print("cmasher: not available (install with 'pip install cmasher' to enable 'cmr.*' colormaps)")
+        if not avail:
+            print("No colormaps discovered (unexpected).")
+        else:
+            print("Available colormaps:")
+            for name in avail:
+                print(f"  {name}")
+        return 0
+
+    if not args.help_quantities and (args.quantity is None or str(args.quantity).strip() == ''):
+        raise RuntimeError('Provide --quantity (or use --help-quantities).')
+
     base = _base(args.dd, args.dd_version, args.pulse, args.run)
     ids_file, grp = _ids_file(base, args.ids, args.occ)
 
     if args.debug:
-        print(f"[{VERSION}] file={ids_file} group=/{grp}")
+        print(f"[{__version__}] file={ids_file} group=/{grp}")
 
-    leaf_cands = _leaf_candidates(args.ids, args.quantity)
+    leaf_cands = _leaf_candidates(args.ids, str(args.quantity)) if args.quantity is not None else []
 
     with h5py.File(ids_file, "r") as f:
         if f"/{grp}" not in f:
             raise RuntimeError(f"Missing group /{grp} in {ids_file}")
 
-        leaf_used, vpath = _find_values_dataset(f, grp, leaf_cands, debug=args.debug)
-        v = _read_values(f, grp, leaf_used, vpath, args.time_index, args.ion_index, debug=args.debug)
+        if args.help_quantities:
+            _print_quantity_help(args.ids, args.occ, base, f[f"/{grp}"])
+            return 0
+
+        # Resolve/validate requested quantity (aliases -> leaf candidates)
+        try:
+            leaf_used, vpath = _find_values_dataset(f, grp, leaf_cands, debug=args.debug)
+        except Exception as e:
+            print(f"ERROR: Could not find datasets for {args.quantity!r}. Tried: {leaf_cands}")
+            _print_quantity_help(args.ids, args.occ, base, f[f"/{grp}"])
+            raise
+
+        v = _read_values(f, grp, leaf_used, vpath, args.time_index, args.ion_index, clamp_time_index=args.clamp_time_index, debug=args.debug)
 
         r, z, phi = _extract_geometry(f, grp, debug=args.debug)
         r, z, phi, v = _match_geometry_to_values(r, z, phi, v, args.phi_index, args.phi_tol, debug=args.debug)
@@ -795,6 +1050,9 @@ def main() -> int:
         # Update title with final point count.
         title = f"{args.ids} occ={args.occ} t_idx={args.time_index} {args.quantity} (phi~{phi_used:g}, n={r3.size})"
 
+        cmap_name = _resolve_cmap(args.cmap, v3, norm_kind=args.norm)
+        norm, lev = _build_norm_and_levels(v3, int(args.levels), norm_kind=args.norm, linthresh=float(args.linthresh))
+
         _plot_tricontour(
             r3, z3, v3, title,
             outpng=args.out,
@@ -802,6 +1060,9 @@ def main() -> int:
             triangles=triangles,
             mask_flat_tris=args.mask_flat_tris,
             min_circle_ratio=args.min_circle_ratio,
+            cmap=cmap_name,
+            norm=norm,
+            levels=lev,
         )
 
     if args.out and not args.show:

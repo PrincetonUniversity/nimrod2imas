@@ -356,6 +356,10 @@ def write_mhd_linear_mode_scalars(
     dbpath: str = ".",
     backend: str = "hdf5",
     mode: str = "a",
+    provenance_files: Optional[List[str | Path]] = None,
+    record_checksums: bool = True,
+    checksum_algorithm: str = "sha256",
+    exec_command: Optional[str] = None,
 ) -> None:
     """
     Write growthrate (and optionally frequency) into mhd_linear occurrence `occ`.
@@ -368,10 +372,12 @@ def write_mhd_linear_mode_scalars(
         from nimrod2imas import open_dbentry as open_dbentry_common
         from nimrod2imas import ids_factory as ids_factory_common
         from nimrod2imas import get_ids, put_ids
+        from nimrod2imas import update_workflow_and_dataset_fair
+        from nimrod2imas import sanitize_cli_command
     except Exception as e:
         raise RuntimeError(f"Failed to import nimrod2imas helpers (needed for consistent IMAS I/O): {e}")
 
-    ed = entry_dir_common(dbpath, dd, dd_version, pulse, run, dd_version_dir=dd_version_dir)
+    ed = entry_dir_common(dbpath, dd, dd_version, pulse, run, dd_version_dir=dd_version[0])
     ensure_entry_dir(ed)
 
     mode_n = _normalize_mode(mode)
@@ -454,6 +460,35 @@ def write_mhd_linear_mode_scalars(
                 tm.frequency = fr  # Hz
 
     put_ids(db, mhd, int(occ))
+    # Append provenance (workflow + dataset_fair). Only basenames are stored.
+    try:
+        pfiles = list(provenance_files or [])
+        cmd = str(exec_command or "")
+        if not cmd:
+            cmd = sanitize_cli_command(list(__import__("sys").argv), known_files=pfiles)
+        update_workflow_and_dataset_fair(
+            db, factory,
+            component_name="nimrod2imas:gamma2imas",
+            component_description="Compute growth rate/frequency from NIMROD diagnostics and store into IMAS mhd_linear",
+            component_repository="https://github.com/PrincetonUniversity/nimrod2imas",
+            component_version=str(__version__ if "__version__" in globals() else ""),
+            exec_command=cmd,
+            input_files=pfiles,
+            record_checksums=bool(record_checksums),
+            checksum_algorithm=str(checksum_algorithm or "sha256"),
+            workflow_occ=0,
+            dataset_fair_occ=0,
+            extra_kv={
+                "dd": str(dd),
+                "dd_version": str(dd_version),
+                "pulse": str(pulse),
+                "run": str(run),
+                "occ": str(occ),
+            },
+        )
+    except Exception as exc:
+        print(f"[warn] provenance update failed: {exc}", file=sys.stderr)
+
     try:
         db.close()
     except Exception:
@@ -486,8 +521,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run", type=int, required=True)
     p.add_argument("--backend", default="hdf5", choices=("hdf5",), help="IMAS backend")
     p.add_argument("--dbpath", default=".", help="DB root path")
-    p.add_argument("--dd-version-dir", choices=["major", "full"], default="major",
-                   help="Directory component for DD version (default: major, e.g. 4 for 4.1.1)")
     p.add_argument("--dd-version", default="4.1.1", help="IMAS data dictionary version")
     p.add_argument("--mode", default="a", help="DBEntry open mode: r/a/w/x (r+/rw mapped to a)")
 
@@ -503,6 +536,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Endianness for Fortran record markers and float payloads")
     p.add_argument("--file-kind", choices=("energy", "logen"), default=None,
                    help="Override file kind auto-detection (default: infer from filename containing 'logen')")
+
+    # provenance controls
+    p.add_argument("--no-checksums", dest="record_checksums", action="store_false",
+                   help="Disable provenance file checksums in workflow/dataset_fair IDSs.")
+    p.set_defaults(record_checksums=True)
+    p.add_argument("--checksum-algorithm", default="sha256",
+                   help="Hash algorithm for provenance checksums (sha256, sha1, md5, ...).")
 
     # positional files (as requested)
     p.add_argument("binfile", help="Input NIMROD energy diagnostic file (energy.bin or logen.bin)")
@@ -536,10 +576,41 @@ def main(argv: Optional[List[str]] = None) -> int:
         freq_stats = compute_frequency_from_history(histfile, nsteps_use=args.nsteps, endian=args.endian)
         print_frequency_summary(freq_stats)
 
+    # Provenance inputs for workflow/dataset_fair (no absolute paths stored)
+    # Absolute paths for checksum robustness
+    run_cwd = Path.cwd()
+
+    binfile_abs = Path(binfile).expanduser()
+    if not binfile_abs.is_absolute():
+        binfile_abs = (run_cwd / binfile_abs).resolve()
+
+    pfiles = [binfile_abs]
+
+    if args.history is not None:
+        hist_abs = Path(histfile).expanduser()
+        if not hist_abs.is_absolute():
+            hist_abs = (run_cwd / hist_abs).resolve()
+        pfiles.append(hist_abs)
+
+    # Include companion file if present (energy.bin <-> logen.bin)
+    try:
+        bname = binfile_abs.name.lower()
+        companion = binfile_abs.parent / ("logen.bin" if bname.startswith("energy") else "energy.bin")
+        if companion.is_file():
+            pfiles.append(companion.resolve())
+    except Exception:
+        pass
+
+    try:
+        from nimrod2imas import sanitize_cli_command as _sanitize_cli_command
+        cmd = _sanitize_cli_command(list(sys.argv), known_files=pfiles)
+    except Exception:
+        cmd = ""
+
     write_mhd_linear_mode_scalars(
         dd=args.dd,
         dd_version=args.dd_version,
-        dd_version_dir=args.dd_version_dir,
+        dd_version_dir=args.dd_version[0],
         pulse=args.pulse,
         run=args.run,
         occ=args.occ,
@@ -548,6 +619,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         dbpath=args.dbpath,
         backend=args.backend,
         mode=args.mode,
+        provenance_files=pfiles,
+        record_checksums=bool(getattr(args, "record_checksums", True)),
+        checksum_algorithm=str(getattr(args, "checksum_algorithm", "sha256")),
+        exec_command=cmd,
     )
 
     return 0

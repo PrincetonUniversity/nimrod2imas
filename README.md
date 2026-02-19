@@ -39,9 +39,8 @@ All tools that read/write IMAS via URI expect the same on-disk layout:
 Where:
 - `dbpath` is the DB root directory (often `.` or a shared project root)
 - `dd` is the database name (often a device name, e.g. `mast`, `nstx`, `d3d`)
-- `dd_version_dir` is derived from the DD version:
-  - `"major"`: `4.1.1 → 4`
-  - `"full"` : `4.1.1 → 4.1.1`
+- `dd_version_dir` is derived from the DD version as its **major** number (e.g. `4.1.1 → 4`).
+  - If your DB uses a non-standard layout (e.g. the full DD version as a directory), use `--entry` to point to the entry explicitly.
 - `pulse` and `run` identify the entry
 
 This layout is centralized in `nimrod2imas.py` and should be used by **all** scripts for consistency.
@@ -55,7 +54,6 @@ Most scripts follow the same argument set for selecting the entry:
 - `--dbpath <path>`: root directory containing the DB layout (default: `.`)
 - `--dd <name>`: DB/device directory name
 - `--dd-version <x.y.z>`: IMAS Data Dictionary (DD) version to use
-- `--dd-version-dir {major,full}`: directory convention for the DD version (default: `major`)
 - `--pulse <int>` and `--run <int>`
 - `--backend {hdf5,mdsplus}`: filesystem backend is typically `hdf5`
 
@@ -79,8 +77,7 @@ Some scripts also support:
 ```bash
 python input2imas.py GEQDSK PEQDSK \
   --dd mast --dd-version 4.1.1 --pulse 45272 --run 8 \
-  --backend hdf5 --dbpath /path/to/dbroot \
-  --dd-version-dir major
+  --backend hdf5 --dbpath /path/to/dbroot
 ```
 
 **Namelist input paths**
@@ -236,7 +233,7 @@ For workflows that need explicit node coordinates and explicit connectivity (e.g
 
 **CLI options**
 Dump2imas-compatible entry selection:
-- `--dd`, `--pulse`, `--run`, `--backend`, `--dbpath`, `--dd-version`, `--dd-version-dir`, `--mode`
+- `--dd`, `--pulse`, `--run`, `--backend`, `--dbpath`, `--dd-version`, `--mode`
 
 Gamma2imas-specific controls:
 - `--occ <int>`: occurrence for the `mhd_linear` IDS to update (default: 1)
@@ -279,8 +276,7 @@ python gamma2imas.py --dd mast --dd-version 4.1.1 --pulse 45272 --run 1 --occ 1 
 ```bash
 python nimrodInputRestore.py \
   --dd mast --dd-version 4.1.1 --pulse 45272 --run 8 \
-  --backend hdf5 --dbpath /path/to/dbroot \
-  --dd-version-dir major
+  --backend hdf5 --dbpath /path/to/dbroot
 ```
 
 #### String reconstruction semantics (important)
@@ -345,7 +341,7 @@ Provides R–Z contour plots of:
 ```bash
 python plot_mhd_linear.py \
   --dd mast --dd-version 4.1.1 --pulse 45272 --run 8 --occ 1 \
-  --field b --component r --part real --time-index 0 --n-tor 5
+  --quantity b --component r --part real --time-index 0 --n-tor 5
 ```
 
 Optional: `cmasher` colormaps can be used via `--cmap cmr.gothic` if installed.

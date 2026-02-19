@@ -74,6 +74,31 @@ def _log(msg: str, quiet: bool = False) -> None:
         print(msg, flush=True)
 
 
+
+def _use_h5py_patches(args) -> bool:
+    """Return True if this run should apply direct HDF5 patching (h5py)."""
+    w = str(getattr(args, "writer", "auto") or "auto").strip().lower()
+    if w == "h5py":
+        return True
+    if w == "imas":
+        return False
+    # auto
+    b = str(getattr(args, "backend", "hdf5") or "hdf5").strip().lower()
+    return (b == "hdf5")
+
+
+def _use_imas_connectivity_writer(args) -> bool:
+    """Return True if unstructured grid_ggd connectivity should be written via IMAS objects."""
+    w = str(getattr(args, "writer", "auto") or "auto").strip().lower()
+    if w == "imas":
+        return True
+    if w == "h5py":
+        return False
+    b = str(getattr(args, "backend", "hdf5") or "hdf5").strip().lower()
+    return (b != "hdf5")
+
+
+
 def _die(msg: str) -> None:
     raise SystemExit(f"ERROR: {msg}")
 
@@ -4333,6 +4358,139 @@ def _gridggd_write_node_vectors(g: Any, r_nodes: np.ndarray, z_nodes: np.ndarray
 
 
 
+
+def _gridggd_write_unstructured_grid_subset_imas(
+    g: Any,
+    nodes_xyz: np.ndarray,
+    connectivity: Optional[np.ndarray],
+    *,
+    log: Optional[logging.Logger] = None,
+) -> None:
+    """Populate grid_ggd.grid_subset connectivity using IMAS-Python objects.
+
+    Slow but DD-aware; use for --writer=imas or non-HDF5 backends.
+    """
+    if nodes_xyz is None:
+        raise ValueError("nodes_xyz is None")
+    nodes_xyz = np.asarray(nodes_xyz, dtype=float)
+    if nodes_xyz.ndim != 2 or nodes_xyz.shape[1] != 3:
+        raise ValueError(f"nodes_xyz must have shape (N,3); got {nodes_xyz.shape}")
+    n_nodes = int(nodes_xyz.shape[0])
+
+    if connectivity is None:
+        n_subsets = 1
+        n_cells = 0
+        n_verts = 0
+    else:
+        connectivity = np.asarray(connectivity, dtype=np.int32)
+        if connectivity.ndim != 2:
+            raise ValueError(f"connectivity must be 2D; got {connectivity.shape}")
+        n_cells = int(connectivity.shape[0])
+        n_verts = int(connectivity.shape[1]) if n_cells > 0 else 0
+        n_subsets = 2
+
+    try:
+        g.grid_subset.resize(n_subsets)
+    except Exception:
+        pass
+
+    # nodes subset
+    s0 = g.grid_subset[0]
+    try:
+        s0.dimension = 1
+    except Exception:
+        pass
+    try:
+        s0.identifier.name = "nodes"
+        s0.identifier.index = 1
+        s0.identifier.description = "Unstructured nodes"
+    except Exception:
+        pass
+
+    try:
+        s0.element.resize(n_nodes)
+    except Exception as e:
+        raise RuntimeError(f"Failed to resize nodes element to {n_nodes}: {e}") from e
+
+    for i in range(n_nodes):
+        el = s0.element[i]
+        try:
+            el.object.resize(3)
+        except Exception:
+            pass
+        for j in range(3):
+            obj = el.object[j]
+            val = float(nodes_xyz[i, j])
+            try:
+                obj.real = val
+                continue
+            except Exception:
+                pass
+            try:
+                obj.geometry = val
+                continue
+            except Exception:
+                pass
+            try:
+                setattr(obj, "real", np.float64(val))
+            except Exception:
+                pass
+
+    if log:
+        log.info("IMAS grid_ggd: wrote nodes subset (N=%d)", n_nodes)
+
+    if n_subsets < 2:
+        return
+
+    # connectivity subset
+    s1 = g.grid_subset[1]
+    try:
+        s1.dimension = 4
+    except Exception:
+        pass
+    try:
+        s1.identifier.name = "volumes"
+        s1.identifier.index = 43
+        s1.identifier.description = "Unstructured connectivity"
+    except Exception:
+        pass
+
+    try:
+        s1.base.resize(1)
+        s1.base[0].index = 0
+        s1.base[0].grid_subset_index = 1
+    except Exception:
+        pass
+
+    try:
+        s1.element.resize(n_cells)
+    except Exception as e:
+        raise RuntimeError(f"Failed to resize connectivity element to {n_cells}: {e}") from e
+
+    for i in range(n_cells):
+        el = s1.element[i]
+        try:
+            el.object.resize(n_verts)
+        except Exception:
+            pass
+        for j in range(n_verts):
+            obj = el.object[j]
+            idx = int(connectivity[i, j])
+            try:
+                obj.index = idx
+                continue
+            except Exception:
+                pass
+            try:
+                setattr(obj, "index", np.int32(idx))
+            except Exception:
+                pass
+
+    if log:
+        log.info("IMAS grid_ggd: wrote connectivity subset (Nc=%d, Nv=%d)", n_cells, n_verts)
+
+
+
 def _build_fe_tri_nodes_conn(R2d: "np.ndarray", Z2d: "np.ndarray", nphi: int, phi_list: "np.ndarray") -> tuple["np.ndarray","np.ndarray"]:
     """
     Build node coordinates and triangle connectivity for the stitched (R,Z) lattice.
@@ -4561,7 +4719,8 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
     )
 
     if use_fe_nodes:
-        it, ig = _append_time_ggd(mhd, t, write_grid=_ggd_should_write_grid(args), reuse_grid=bool(getattr(args, "ggd_reuse_grid", False)))
+        write_grid = _ggd_should_write_grid(args)
+        it, ig = _append_time_ggd(mhd, t, write_grid=write_grid, reuse_grid=bool(getattr(args, "ggd_reuse_grid", False)))
         g = mhd.grid_ggd[ig]
         gidx = int(ig + 1)
         try:
@@ -4660,13 +4819,20 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
         z_nodes = np.tile(z2d, int(nphi))
         phi_nodes = np.repeat(phi_list.astype(float), nn2d)
 
-        _gridggd_write_node_vectors(g, r_nodes, z_nodes, phi_nodes)
+        if write_grid:
+            _gridggd_write_node_vectors(g, r_nodes, z_nodes, phi_nodes)
 
+        # Connectivity (optional).
         if conn_kind != "fe_pointcloud":
-            mask2d = np.isfinite(np.asarray(Rloc, dtype=float)) & np.isfinite(np.asarray(Zloc, dtype=float))
-            tri2d = _fe_tri_connectivity_from_mask(mask2d)
-            tri = _replicate_tri_connectivity_per_phi(tri2d, nn2d, int(nphi))
-        pass  # connectivity populated later via packed HDF5 writer
+            if write_grid and _use_imas_connectivity_writer(args):
+                try:
+                    nodes_xyz, connectivity, _meta = _build_unstructured_nodes_connectivity(data, args)
+                    _gridggd_write_unstructured_grid_subset_imas(g, nodes_xyz, connectivity, log=None)
+                except Exception:
+                    # Non-fatal; downstream tools may still use the space geometry vectors.
+                    pass
+            else:
+                pass  # connectivity populated later via packed HDF5 writer (h5py)
 
         def _recon_native(eq_key: str, re_key: str, im_key: str):
             eq = data.get(eq_key, None)
@@ -7116,12 +7282,23 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
         r_nodes = np.asarray(Rloc, dtype=float).ravel(order="F")
         z_nodes = np.asarray(Zloc, dtype=float).ravel(order="F")
         phi_nodes = np.zeros_like(r_nodes, dtype=float)
-        _gridggd_write_node_vectors(g, r_nodes, z_nodes, phi_nodes)
+        if write_grid:
+            _gridggd_write_node_vectors(g, r_nodes, z_nodes, phi_nodes)
 
         if conn_kind != "fe_pointcloud":
             mask2d = np.isfinite(np.asarray(Rloc, dtype=float)) & np.isfinite(np.asarray(Zloc, dtype=float))
             tri = _fe_tri_connectivity_from_mask(mask2d)
-        pass  # connectivity populated later via packed HDF5 writer
+
+        if (conn_kind != "fe_pointcloud") and write_grid and _use_imas_connectivity_writer(args):
+            # Slow, DD-aware path: populate grid_ggd.grid_subset connectivity using IMAS objects.
+            try:
+                nodes_xyz = np.stack((r_nodes, z_nodes, phi_nodes), axis=1).astype(np.float64, copy=False)
+                _gridggd_write_unstructured_grid_subset_imas(g, nodes_xyz, tri, log=None)
+            except Exception:
+                # Non-fatal; downstream tools may still use the space geometry vectors.
+                pass
+        else:
+            pass  # connectivity populated later via packed HDF5 writer (h5py)
 
         q = ep.ggd[it]
 
@@ -9041,7 +9218,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dd", required=True, help="DB name (directory name), e.g. nstx")
     p.add_argument("--pulse", type=int, required=True)
     p.add_argument("--run", type=int, required=True)
-    p.add_argument("--backend", default="hdf5", choices=("hdf5",), help="IMAS backend")
+    p.add_argument(
+        "--backend",
+        default="hdf5",
+        help="IMAS backend (e.g. hdf5, ascii, netcdf). Use --writer=imas for non-HDF5 backends.",
+    )
+
+    p.add_argument(
+        "--writer",
+        default="auto",
+        choices=("auto", "h5py", "imas"),
+        help=(
+            "IDS write implementation: "
+            "auto=use direct HDF5 patching (h5py) only for backend=hdf5; "
+            "h5py=force direct HDF5 patching (fast, HDF5-only); "
+            "imas=IMAS-Python only (DD-aware; supports non-HDF5 backends; slower for GGD connectivity)."
+        ),
+    )
     p.add_argument("--dbpath", default=".", help="DB root path (output directory)")
     p.add_argument("--dd-version", default=None, help="IMAS data dictionary version, e.g. 3.42.0")
 
@@ -9242,6 +9435,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
 
+    # Normalize writer/backend combination.
+    args.writer = str(getattr(args, "writer", "auto") or "auto").strip().lower()
+    if args.writer not in ("auto", "h5py", "imas"):
+        args.writer = "auto"
+    args.backend = str(getattr(args, "backend", "hdf5") or "hdf5").strip()
+    if (str(args.backend).strip().lower() != "hdf5") and (args.writer == "h5py"):
+        # h5py patching can only target HDF5 backend directories.
+        args.writer = "imas"
+
     # Logging (explicitly show which psi reconstruction/fallback path is selected)
     logging.basicConfig(
         level=(logging.WARNING if getattr(args, "quiet", False) else logging.INFO),
@@ -9429,7 +9631,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if has_1d or has_ggd:
             _db_put_slice(db, cp, cp_occ)
             log.info("Wrote core_profiles (occ=%d)", int(cp_occ))
-            if has_ggd:
+            if has_ggd and _use_h5py_patches(args):
                 _patch_core_profiles_ggd_required_leaves_h5(str(entry_dir), int(cp_occ), data, args, log)
 
 
@@ -9478,7 +9680,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     #   /edge_profiles_<occ>/grid_ggd[]&space[]&objects_per_dimension[]&object[]&geometry
                     # The in-memory IDS population in structured mode may not materialize this dataset reliably,
                     # so we write it explicitly via h5py.
-                    if has_ggd:
+                    if has_ggd and _use_h5py_patches(args):
                         try:
                             nb = max(4, int(getattr(args, 'ggd_nbins', 128) or 128))
                             conn_kind_ep = str(getattr(args, 'ggd_connectivity', 'none')).lower()
@@ -9524,7 +9726,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
                     # Patch missing electrons.density in edge_profiles.ggd for structured (product-grid) outputs.
                     # Some DD/python bindings omit this leaf; downstream tools may recompute ne from (p,T) and get wrong units.
-                    if has_ggd and (not bool(getattr(args, 'ggd_unstructured', False))):
+                    if has_ggd and _use_h5py_patches(args) and (not bool(getattr(args, 'ggd_unstructured', False))):
                         try:
                             nb = max(4, int(getattr(args, 'ggd_nbins', 128) or 128))
                             Rm = np.asarray(data.get('R'), dtype=float)
@@ -9557,7 +9759,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     # Ensure edge_profiles includes GGD node geometry and electrons.temperature values and electrons.temperature values
                     # in standard IMAS backend paths (needed by plot_mhd.py).
 
-                    if bool(getattr(args, 'ggd_unstructured', False)):
+                    if _use_h5py_patches(args) and bool(getattr(args, 'ggd_unstructured', False)):
                         conn_kind_ep = str(getattr(args, 'ggd_connectivity', 'none')).lower()
                         use_unstructured_nodes = bool(getattr(args, 'ggd_unstructured_fe_nodes', False)) and conn_kind_ep in ('fe_tri', 'fe_wedge', 'fe_pointcloud')
                         use_fe_hex = (conn_kind_ep == 'hex')
@@ -10117,7 +10319,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         and bool(getattr(args, 'ggd_unstructured_fe_nodes', False))
                         and conn_kind in ('fe_tri', 'fe_wedge', 'fe_pointcloud')
                     )
-                    if use_fe_nodes:
+                    if use_fe_nodes and _use_h5py_patches(args):
                         import numpy as _np
                         nphi = max(1, int(getattr(args, 'ggd_nphi', 8) or 1))
                         phi_list = _np.linspace(0.0, 2.0*_np.pi, num=nphi, endpoint=False)
@@ -10138,7 +10340,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 # Optional: store unstructured node coordinates/connectivity into a NIMROD-specific
                 # auxiliary group. This is used by the packed grid_ggd writer and by lightweight
                 # downstream tools.
-                if getattr(args, 'ggd_unstructured', False):
+                if _use_h5py_patches(args) and getattr(args, 'ggd_unstructured', False):
                     try:
                         for _s in range(nspec_mhd):
                             _occ_s = occ_base + int(_s)
@@ -10152,7 +10354,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 # For --edge-ggd-values equilibrium we want edge_profiles to remain equilibrium-only.
                 _edge_mode = str(getattr(args, "edge_ggd_values", "")).strip().lower()
                 if (
-                    getattr(args, "ggd_unstructured", False)
+                    _use_h5py_patches(args)
+                    and getattr(args, "ggd_unstructured", False)
                     and _edge_mode in ("full", "mhd", "mirror")
                 ):
                     try:

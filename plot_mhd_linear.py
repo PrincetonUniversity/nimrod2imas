@@ -851,9 +851,9 @@ def main():
         if field in ("b", "v") and args.component is None:
             raise SystemExit(f"Quantity '{field}' requires --component (r|z|phi).")
 
-        R, Z, F = _extract_rz_and_field(mode, field, part=args.part, component=args.component)
+        R, Z, F, title = _extract_rz_and_field(ts, im, field, part=args.part, component=args.component)
 
-        title = args.title
+        #title = args.title
         if title is None:
             n = getattr(mode, "n_tor", None)
             title = f"mhd_linear: {field} ({args.part})"

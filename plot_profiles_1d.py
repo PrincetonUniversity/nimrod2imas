@@ -523,10 +523,64 @@ def _plot(
     if do_show:
         plt.show()
     plt.close(fig)
+
+
+def _plot_curves(
+    curves: List[Tuple[np.ndarray, np.ndarray, str]],
+    title: str,
+    x_label: str,
+    y_label: Optional[str] = None,
+    out: Optional[str] = None,
+    show: bool = False,
+    xlim: Optional[Tuple[float, float]] = None,
+    vline1: bool = False,
+) -> None:
+    """Plot one or more curves; each curve may have its own x-grid."""
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots()
+
+    for x, y, lab in curves:
+        ax.plot(x, y, label=lab)
+
+    ax.set_xlabel(x_label)
+    if y_label:
+        ax.set_ylabel(y_label)
+    else:
+        ax.set_ylabel("Value")
+    ax.set_title(title)
+
+    if xlim is not None:
+        try:
+            ax.set_xlim(xlim[0], xlim[1])
+        except Exception:
+            pass
+
+    if vline1:
+        try:
+            ax.axvline(1.0, linestyle="--", linewidth=1.0, alpha=0.5)
+        except Exception:
+            pass
+
+    if len(curves) > 1:
+        ax.legend()
+
+    ax.grid(True, which="both", alpha=0.3)
+
+    out_path, do_show = _normalize_out_and_show_common(out, show=show)
+
+    if out_path:
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        print(f"Wrote {out_path}")
+    if do_show:
+        plt.show()
+    plt.close(fig)
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Plot profiles_1d from core_profiles / edge_profiles")
     _add_entry_args_common(p, include_backend=False, include_ids=True, ids_default='core_profiles', ids_choices=['core_profiles','edge_profiles'], include_occ=True, occ_default=0)
-    p.add_argument("--time-index", type=int, default=0, help="Time slice index")
+    p.add_argument("--time-index", type=int, nargs="+", default=[0],
+                   help="One or more time slice indices (e.g. --time-index 0 1 2)")
     p.add_argument("--ion-index", type=int, default=0, help="Ion species index for ni/ti/pi/omega when applicable")
     p.add_argument("--quantity", default=None, help="Comma-separated list (e.g. te,ne,ptot,jtor)")
     p.add_argument("--hdf5-only", action="store_true", help="Force direct HDF5 mode (bypass IMAS)")
@@ -540,7 +594,7 @@ def main() -> int:
     if args.help_quantities:
         f_tmp, g_tmp, _h5p, _grp = _open_ids_h5_common(entry, args.ids, args.occ)
         try:
-            _print_quantity_help(args.ids, args.occ, args.time_index, entry, g_tmp)
+            _print_quantity_help(args.ids, args.occ, int(args.time_index[0]) if isinstance(args.time_index, list) and args.time_index else int(args.time_index), entry, g_tmp)
         finally:
             f_tmp.close()
         return 0
@@ -565,12 +619,16 @@ def main() -> int:
     h5_path = str(_h5_path_obj)
     # Read IDS time array (if available) to align equilibrium time slices for normalization
     t_arr, t_src = _read_ids_time_from_h5(entry, args.ids, args.occ)
-    target_time = None
-    if t_arr is not None and t_arr.size > 0:
-        ti = int(args.time_index)
-        if ti >= t_arr.size:
-            ti = t_arr.size - 1
-        target_time = float(t_arr[ti])
+
+    # Support one or more time indices (e.g. --time-index 0 1 2)
+    time_indices = list(args.time_index) if isinstance(args.time_index, list) else [int(args.time_index)]
+    if not time_indices:
+        time_indices = [0]
+    if t_arr is not None and getattr(t_arr, "size", 0) > 0:
+        ntime = int(t_arr.size)
+        time_indices = [min(max(0, int(ti)), ntime - 1) for ti in time_indices]
+    time_values = {int(ti): (float(t_arr[int(ti)]) if (t_arr is not None and getattr(t_arr, "size", 0) > 0) else None) for ti in time_indices}
+
     try:
         x_ds = _choose_x_dataset(args.ids, g)
         if x_ds is None:
@@ -578,147 +636,161 @@ def main() -> int:
                 "Could not locate x-axis dataset under profiles_1d[]&grid. "
                 "For core_profiles expected rho_tor_norm/psi_tor_norm; for edge_profiles expected psi_norm/psi_pol_norm."
             )
-        x, x_label, x_kind = _read_x_and_label(g, args.ids, x_ds, args.time_index, ion_index=args.ion_index)
 
-        psi_axis_abs = None
-        psi_lcfs_abs = None
-        psi_src = None
-
-
-        # Enforce edge_profiles x-axis: normalized poloidal flux.
-        if str(args.ids).strip().lower() == "edge_profiles" and x_kind == "psi_abs":
-            x, x_label, x_kind, psi_axis_abs, psi_lcfs_abs, psi_src = _edge_psi_abs_to_psi_pol_norm(entry, x, args.time_index, target_time=target_time)
-
-        # Resolve absolute psi at magnetic axis and LCFS for reporting (and for sanity checks).
         ids_lc = str(args.ids).strip().lower()
-        if ids_lc in ("edge_profiles", "core_profiles"):
-            if psi_axis_abs is None or psi_lcfs_abs is None:
-                # Prefer core_profiles-derived LCFS (guarantees psi_norm=1 at LCFS), else equilibrium.
-                pa, pl, src = _read_core_profiles_psi_axis_lcfs(entry, args.time_index, target_time=target_time, occ_hint=args.occ if ids_lc=="edge_profiles" else args.occ)
-                if pa is None or pl is None or not (np.isfinite(pa) and np.isfinite(pl)):
-                    pa, pl, src = _read_equilibrium_psi_axis_lcfs(entry, args.time_index, target_time=target_time)
-                psi_axis_abs = pa
-                psi_lcfs_abs = pl
-                psi_src = src
+        is_edge = ids_lc == "edge_profiles"
+        is_core = ids_lc == "core_profiles"
 
-            # Print once per run (useful for debugging normalization and SOL extent).
-            try:
-                xa = x[np.isfinite(x)]
-                xmin = float(np.nanmin(xa)) if xa.size else float("nan")
-                xmax = float(np.nanmax(xa)) if xa.size else float("nan")
-                nsol = int(np.count_nonzero(np.isfinite(x) & (x > 1.0)))
-            except Exception:
-                xmin, xmax, nsol = float("nan"), float("nan"), -1
+        curves: List[Tuple[np.ndarray, np.ndarray, str]] = []
+        resolved: Dict[Tuple[str, int], str] = {}
+        x_label_first: Optional[str] = None
+        xlims: List[float] = []
+        last_x_kind: Optional[str] = None
 
-            if psi_axis_abs is not None and psi_lcfs_abs is not None and np.isfinite(psi_axis_abs) and np.isfinite(psi_lcfs_abs):
-                print(
-                    f"{ids_lc}: psi_axis={float(psi_axis_abs):+.6e}  psi_lcfs={float(psi_lcfs_abs):+.6e}  (source: {psi_src}); "
-                    f"x_range=[{xmin:.3f},{xmax:.3f}]  n(x>1)={nsol}",
-                    file=sys.stderr,
+        for ti in time_indices:
+            ti = int(ti)
+            target_time = time_values.get(ti, None)
+
+            x, x_label, x_kind = _read_x_and_label(g, args.ids, x_ds, ti, ion_index=args.ion_index)
+            last_x_kind = x_kind
+
+            psi_axis_abs = None
+            psi_lcfs_abs = None
+            psi_src = None
+
+            # Enforce edge_profiles x-axis: normalized poloidal flux.
+            if is_edge and x_kind == "psi_abs":
+                x, x_label, x_kind, psi_axis_abs, psi_lcfs_abs, psi_src = _edge_psi_abs_to_psi_pol_norm(
+                    entry, x, ti, target_time=target_time
                 )
-            else:
-                print(
-                    f"{ids_lc}: psi_axis/psi_lcfs not available (source: {psi_src}); x_range=[{xmin:.3f},{xmax:.3f}] n(x>1)={nsol}",
-                    file=sys.stderr,
-                )
+                last_x_kind = x_kind
 
-        ys: Dict[str, np.ndarray] = {}
-        resolved: Dict[str, str] = {}
-        legend_labels: Dict[str, str] = {}
+            # Resolve absolute psi at magnetic axis and LCFS for reporting (and for sanity checks).
+            if is_edge or is_core:
+                if psi_axis_abs is None or psi_lcfs_abs is None:
+                    # Prefer core_profiles-derived LCFS (guarantees psi_norm=1 at LCFS), else equilibrium.
+                    pa, pl, src = _read_core_profiles_psi_axis_lcfs(entry, ti, target_time=target_time, occ_hint=args.occ)
+                    if pa is None or pl is None or not (np.isfinite(pa) and np.isfinite(pl)):
+                        pa, pl, src = _read_equilibrium_psi_axis_lcfs(entry, ti, target_time=target_time)
+                    psi_axis_abs, psi_lcfs_abs, psi_src = pa, pl, src
 
-        for q in qlist:
-            qk = q.strip().lower()
-            cand = _H5_Q_DS.get(qk, _H5_Q_DS.get(qk.replace(" ", ""), []))
-            if not cand:
-                print(f"ERROR: Unsupported quantity '{qk}'.")
-                _print_quantity_help(args.ids, args.occ, args.time_index, args.entry, g)
-                return 2
-            ds_name = _h5_get_first_existing(g, cand)
-            if ds_name is None:
-                print(f"ERROR: Could not find datasets for '{qk}'. Tried: {cand}")
-                _print_quantity_help(args.ids, args.occ, args.time_index, args.entry, g)
-                return 2
+                # Per-time diagnostics (useful for debugging normalization and SOL extent).
+                try:
+                    xa = x[np.isfinite(x)]
+                    xmin = float(np.nanmin(xa)) if xa.size else float("nan")
+                    xmax = float(np.nanmax(xa)) if xa.size else float("nan")
+                    nsol = int(np.count_nonzero(np.isfinite(x) & (x > 1.0)))
+                except Exception:
+                    xmin, xmax, nsol = float("nan"), float("nan"), -1
 
-            y = _h5_read_1d(g, ds_name, args.time_index, ion_index=args.ion_index)
-            y = np.asarray(y, dtype=float)
+                if psi_axis_abs is not None and psi_lcfs_abs is not None and np.isfinite(psi_axis_abs) and np.isfinite(psi_lcfs_abs):
+                    print(
+                        f"{ids_lc}: ti={ti}  psi_axis={float(psi_axis_abs):+.6e}  psi_lcfs={float(psi_lcfs_abs):+.6e}  (source: {psi_src}); "
+                        f"x_range=[{xmin:.3f},{xmax:.3f}]  n(x>1)={nsol}",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"{ids_lc}: ti={ti}  psi_axis/psi_lcfs not available (source: {psi_src}); x_range=[{xmin:.3f},{xmax:.3f}] n(x>1)={nsol}",
+                        file=sys.stderr,
+                    )
 
-            # Legacy compatibility: older input2imas stored ptot as p_perp = ptot/3
-            if qk.strip().lower() == "ptot" and ds_name.endswith("&pressure_perpendicular"):
-                y = 3.0 * y
+            if x_label_first is None:
+                x_label_first = x_label
 
-            ys[qk] = y
-            resolved[qk] = ds_name
+            xf = x[np.isfinite(x)]
+            if xf.size:
+                xlims.append(float(np.nanmax(xf)))
 
+            nx = int(np.asarray(x).size)
 
-        # Choose labels
-        if len(qlist) == 1:
-            q0 = qlist[0].strip().lower()
-            y_label = _q_pretty(q0, with_unit=True)
-            legend_labels = {}
-        else:
-            y_label = None
             for q in qlist:
                 qk = q.strip().lower()
-                legend_labels[qk] = _q_pretty(qk, with_unit=True)
-        # Align lengths: keep the full x grid; pad shorter y arrays with NaN (do not truncate x).
-        nx = int(x.size)
-        for k in list(ys.keys()):
-            y = np.asarray(ys[k], dtype=float).ravel()
-            ny = int(y.size)
-            if ny == nx:
-                ys[k] = y
-                continue
-            if ny < nx:
-                yy = np.full((nx,), np.nan, dtype=float)
-                yy[:ny] = y
-                ys[k] = yy
-                print(f"WARNING: quantity '{k}' has length {ny} < x length {nx}; padding with NaN (likely missing SOL/PF in profiles_1d).", file=sys.stderr)
-            else:  # ny > nx
-                ys[k] = y[:nx]
-                print(f"WARNING: quantity '{k}' has length {ny} > x length {nx}; truncating to {nx}.", file=sys.stderr)
+                cand = _H5_Q_DS.get(qk, _H5_Q_DS.get(qk.replace(" ", ""), []))
+                if not cand:
+                    print(f"ERROR: Unsupported quantity '{qk}'.")
+                    _print_quantity_help(args.ids, args.occ, int(time_indices[0]), args.entry, g)
+                    return 2
+                ds_name = _h5_get_first_existing(g, cand)
+                if ds_name is None:
+                    print(f"ERROR: Could not find datasets for '{qk}'. Tried: {cand}")
+                    _print_quantity_help(args.ids, args.occ, int(time_indices[0]), args.entry, g)
+                    return 2
+
+                y = _h5_read_1d(g, ds_name, ti, ion_index=args.ion_index)
+                y = np.asarray(y, dtype=float).ravel()
+
+                # Legacy compatibility: older input2imas stored ptot as p_perp = ptot/3
+                if qk == "ptot" and ds_name.endswith("&pressure_perpendicular"):
+                    y = 3.0 * y
+
+                # Align lengths: keep the full x grid; pad shorter y arrays with NaN (do not truncate x).
+                ny = int(y.size)
+                if ny < nx:
+                    yy = np.full((nx,), np.nan, dtype=float)
+                    yy[:ny] = y
+                    y = yy
+                    print(f"WARNING: ti={ti} quantity '{qk}' has length {ny} < x length {nx}; padding with NaN.", file=sys.stderr)
+                elif ny > nx:
+                    y = y[:nx]
+                    print(f"WARNING: ti={ti} quantity '{qk}' has length {ny} > x length {nx}; truncating to {nx}.", file=sys.stderr)
+
+                resolved[(qk, ti)] = ds_name
+
+                tval = time_values.get(ti, None)
+                if tval is None or not np.isfinite(tval):
+                    lab = f"{_q_pretty(qk, with_unit=False)} (ti={ti})"
+                else:
+                    lab = f"{_q_pretty(qk, with_unit=False)} (ti={ti}, t={tval:.6g})"
+
+                curves.append((x, y, lab))
 
         if args.info:
             print(f"HDF5: {h5_path}")
             print(f"Group: /{grp_name}")
-            print(f"x: {x_ds} kind={x_kind} label={x_label} shape={x.shape}")
-            for q in qlist:
-                qk = q.strip().lower()
-                print(f"{qk}: {resolved[qk]} label={_q_pretty(qk, with_unit=True)} shape={ys[qk].shape}")
+            print(f"x: {x_ds} kind={last_x_kind} label={x_label_first}")
+            print(f"time_indices: {time_indices} (time source: {t_src})")
+            for ti in time_indices:
+                ti = int(ti)
+                tval = time_values.get(ti, None)
+                ttag = f"t={tval:.6g}" if (tval is not None and np.isfinite(tval)) else "t=n/a"
+                print(f"  ti={ti} ({ttag}):")
+                for q in qlist:
+                    qk = q.strip().lower()
+                    ds = resolved.get((qk, ti), None)
+                    if ds is not None:
+                        print(f"    {qk}: {ds} label={_q_pretty(qk, with_unit=True)}")
             return 0
 
+        y_label = _q_pretty(qlist[0].strip().lower(), with_unit=True) if len(qlist) == 1 else None
         q_title = ", ".join([_q_pretty(q.strip().lower(), with_unit=False) for q in qlist])
-        title = f"{args.ids}_{args.occ}: {q_title}   time_index={args.time_index}"
+        ti_str = ",".join(str(int(ti)) for ti in time_indices)
+        title = f"{args.ids}_{args.occ}: {q_title}   time_index={ti_str}"
+
         # Plot cosmetics: enforce [0, ...] x-limits for normalized flux coordinates
         xlim = None
         vline1 = False
-        ids_lc = str(args.ids).strip().lower()
-        if ids_lc == "edge_profiles":
-            # Always show magnetic axis at 0 and LCFS at 1, even if core bins are NaN.
-            xf = x[np.isfinite(x)]
-            xmax = float(np.nanmax(xf)) if xf.size else 1.1
-            xmax = max(1.05, xmax)
-            xlim = (0.0, xmax)
+        if is_edge:
+            xmax = max([1.05] + xlims) if xlims else 1.1
+            xlim = (0.0, float(xmax))
             vline1 = True
-        elif ids_lc == "core_profiles":
-            xf = x[np.isfinite(x)]
-            xmax = float(np.nanmax(xf)) if xf.size else 1.0
-            xmax = max(1.0, xmax)
-            xlim = (0.0, xmax)
+        elif is_core:
+            xmax = max([1.0] + xlims) if xlims else 1.0
+            xlim = (0.0, float(xmax))
             vline1 = True
 
-        _plot(
-            x,
-            ys,
+        _plot_curves(
+            curves,
             title=title,
-            x_label=x_label,
+            x_label=str(x_label_first) if x_label_first else "x",
             y_label=y_label,
-            legend_labels=legend_labels,
             out=args.out,
             show=bool(args.show),
             xlim=xlim,
             vline1=vline1,
         )
         return 0
+
 
     finally:
         f.close()

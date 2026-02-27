@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.2](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.3.1...nimrod2imas-v0.3.2) (2026-02-27)
+
+
+### Bug Fixes
+
+* fixing 1d profile reconstruction for full option ([0fdaace](https://github.com/PrincetonUniversity/nimrod2imas/commit/0fdaace246bf2498fecae56572b44e0e2f547519))
+* fixing 1d profile reconstruction for full option ([a715d2b](https://github.com/PrincetonUniversity/nimrod2imas/commit/a715d2bc54533d60180e46c4339ec5530f09f775))
+
 ## [0.3.1](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.3.0...nimrod2imas-v0.3.1) (2026-02-15)
 
 

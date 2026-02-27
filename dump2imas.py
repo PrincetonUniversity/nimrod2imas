@@ -3148,10 +3148,14 @@ def populate_core_profiles(cp: Any, data: Dict[str, Any], t_index: int, args) ->
                              _slice_modes_cp(fields.get(imkey), spec=spec, comp=comp))
 
         # Override scalar equilibrium fields (when corresponding perturbations are present)
-        pr2d = _recon_key(pr2d, "repr", "impr") or pr2d
-        pe2d = _recon_key(pe2d, "repe", "impe") or pe2d
-        te2d = _recon_key(te2d, "rete", "imte") or te2d
-        ti2d = _recon_key(ti2d, "reti", "imti") or ti2d
+        if (_tmp := _recon_key(pr2d, "repr", "impr")) is not None:
+            pr2d = _tmp
+        if (_tmp := _recon_key(pe2d, "repe", "impe")) is not None:
+            pe2d = _tmp
+        if (_tmp := _recon_key(te2d, "rete", "imte")) is not None:
+            te2d = _tmp
+        if (_tmp := _recon_key(ti2d, "reti", "imti")) is not None:
+            ti2d = _tmp
 
         # Density helper (spec=0 is electrons; spec>=1 are ion species)
         def dens2d(spec_index: int):
@@ -3174,12 +3178,14 @@ def populate_core_profiles(cp: Any, data: Dict[str, Any], t_index: int, args) ->
         # Toroidal velocity/current overrides (used later in binning)
         try:
             vphi_eq = np.asarray(vq[..., 2], dtype=float) if (vq is not None and getattr(vq, "ndim", 0) >= 3) else None
-            _cp_vphi2d = _recon_key(vphi_eq, "reve", "imve", comp=2) or vphi_eq
+            _tmp = _recon_key(vphi_eq, "reve", "imve", comp=2)
+            _cp_vphi2d = _tmp if _tmp is not None else vphi_eq
         except Exception:
             _cp_vphi2d = None
         try:
             jphi_eq = np.asarray(jq[..., 2], dtype=float) if (jq is not None and getattr(jq, "ndim", 0) >= 3) else None
-            _cp_jphi2d = _recon_key(jphi_eq, "reja", "imja", comp=2) or jphi_eq
+            _tmp = _recon_key(jphi_eq, "reja", "imja", comp=2)
+            _cp_jphi2d = _tmp if _tmp is not None else jphi_eq
         except Exception:
             _cp_jphi2d = None
 
@@ -3499,7 +3505,11 @@ def populate_edge_profiles(ep: Any, data: Dict[str, Any], t_index: int, args) ->
     # If requested, source edge_profiles 1D profiles from TRANSP-style peqdsk (equilibrium).
     # This is important for cases where NIMROD teq/nq are not on the same separatrix definition as peqdsk.
     edge_mode = str(getattr(args, 'edge_ggd_values', '') or '').strip().lower()
-    if edge_mode == 'equilibrium':
+    # NOTE: edge_profiles.profiles_1d are intended to remain equilibrium-like.
+    # The --edge-ggd-values switch controls edge_profiles.ggd export only.
+    # Therefore we always try equilibrium sources (preprocessed core_profiles and/or PEQDSK) first,
+    # regardless of --edge-ggd-values, and fall back to dump-derived binning only if those are unavailable.
+    if True:
 
         # Prefer preprocessed IMAS core_profiles (typically written by input2imas) as the equilibrium source.
         # This avoids depending on external peqdsk discovery and avoids mixing dump COCOS with input2imas COCOS.
@@ -3538,12 +3548,12 @@ def populate_edge_profiles(ep: Any, data: Dict[str, Any], t_index: int, args) ->
                 pass
 
             psi_core_max = float(np.nanmax(ps1d)) if ps1d.size else 1.0
-            psi_cap = getattr(args, 'edge_psi_max', None)
+            psi_cap = getattr(args, 'edge_psi_norm_max', None)
             try:
                 psi_cap = float(psi_cap) if psi_cap not in (None, '') else None
             except Exception:
                 psi_cap = None
-            # If user did not specify --edge-psi-max, do not impose an artificial cap.
+            # If user did not specify --edge-psi-norm-max, do not impose an artificial cap.
             # The SOL extent is determined from the available equilibrium sources:
             #   * PEQDSK tail (preferred), otherwise
             #   * maximum psi_pol_norm present on the stitched (R,Z) grid.
@@ -3946,9 +3956,7 @@ def populate_edge_profiles(ep: Any, data: Dict[str, Any], t_index: int, args) ->
             # Done: do not fall back to dump-derived binning.
             return
         else:
-            log.warning("edge_profiles: --edge-ggd-values equilibrium requested but peqdsk unavailable or missing Te/ne; falling back to dump-derived profiles")
-    p.add_argument('--edge-psi-max', dest='edge_psi_max', type=float, default=None,
-                   help='Maximum psi_pol_norm to include in edge_profiles.profiles_1d when extending beyond LCFS. If omitted, the extent is taken from PEQDSK tail (if available) or the maximum psi_pol_norm on the stitched (R,Z) grid.')
+            log.warning("edge_profiles: equilibrium sources (preprocessed core_profiles / PEQDSK) unavailable; falling back to dump-derived profiles")
 
 
     # Base finite mask
@@ -9258,7 +9266,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Fallback Te at separatrix [eV] used only if neither contours.h5 nor peqdsk can be used (default 60 eV).")
 
     # Optional edge extent controls (SOL/PF)
-    p.add_argument("--edge-psi-norm-max", dest="edge_psi_norm_max", type=float, default=None,
+    p.add_argument("--edge-psi-norm-max", dest="edge_psi_norm_max", type=float, default=1.2,
                    help="Override max normalized poloidal flux for edge_profiles 1D grid (include SOL/PF). Default: auto from data.")
     p.add_argument("--edge-psi-norm-quantile", dest="edge_psi_norm_quantile", type=float, default=0.9995,
                    help="Quantile used to estimate max psi_pol_norm from 2D data for edge_profiles (robust against outliers).")
@@ -9391,8 +9399,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Index in nq/rend/imnd corresponding to electrons (used to pair density with Te perturbation).",
     )
 
-    p.add_argument('--edge-psi-max', dest='edge_psi_max', type=float, default=None,
-        help='Maximum psi_pol_norm to include in edge_profiles.profiles_1d when extending beyond LCFS. If omitted, the extent is taken from PEQDSK tail (if available) or the maximum psi_pol_norm on the stitched (R,Z) grid.')
     
     p.add_argument("--p-scale", type=float, default=1.0,
                    help="Scale factor applied to pressure-like quantities from dump -> IMAS (e.g., kPa->Pa: 1e3).")
@@ -10360,7 +10366,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ):
                     try:
                         _mirror_edge_profiles_from_mhd_h5(entry_dir, occ_base, args=args)
-                        _log("Mirrored edge_profiles electrons.temperature from mhd GGD (full)", args.quiet)
+                        mhd_h5, _  = _ids_backend_h5_loc(entry_dir, "mhd", occ_base)
+                        edge_h5, _ = _ids_backend_h5_loc(entry_dir, "edge_profiles", occ_base)
+                        if os.path.exists(mhd_h5) and os.path.exists(edge_h5):
+                            _mirror_edge_profiles_from_mhd_h5(mhd_h5, edge_h5, int(occ_base), int(occ_base), args=args)
+                            _log("Mirrored edge_profiles electrons.temperature from mhd GGD (full)", args.quiet)
                     except Exception as _e:
                        _log(f"[warn] edge_profiles mirror failed: {_e}", args.quiet)
             except Exception as e:

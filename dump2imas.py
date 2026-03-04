@@ -1217,6 +1217,31 @@ def _unpack_density_modes(
     raise ValueError(f"Unexpected density shape {a.shape} for nmodes={nmodes}")
 
 
+def _unpack_multispecies_scalar_modes(
+    a: np.ndarray,
+    nmodes: int,
+    nspec: int,
+    order: str,
+) -> np.ndarray:
+    """Return (ny,nx,nspec,nmodes). Supports ambiguity in packing."""
+    a = np.asarray(a)
+    a = _squeeze1(a)
+
+    if a.ndim == 4:
+        # Guess which axis is nspec/nmodes
+        if a.shape[2] == nmodes and a.shape[3] == nspec:
+            # (ny,nx,nmodes,nspec) -> (ny,nx,nspec,nmodes)
+            return np.transpose(a, (0, 1, 3, 2))
+        if a.shape[3] == nmodes and a.shape[2] == nspec:
+            return a
+
+    if a.ndim == 3:
+        ny, nx, k = a.shape
+        if k == nspec * nmodes:
+            # This assumes species_major packing for simplicity
+            return a.reshape(ny, nx, nspec, nmodes)
+
+    raise ValueError(f"Unexpected multispecies scalar shape {a.shape} for nmodes={nmodes}, nspec={nspec}")
 
 
 
@@ -2532,6 +2557,15 @@ def read_and_stitch_dump(fn: Path, args) -> Dict[str, Any]:
         # Time and modes
         t0 = _read_time(f, args.time)
         keff = _read_keff(f)
+
+        # Get zimp for renz/imnz
+        nimrod_in_guess = None
+        try:
+            cand = fn.parent / "nimrod.in"
+            if cand.is_file():
+                nimrod_in_guess = str(cand)
+        except Exception:
+            nimrod_in_guess = None
         nmodes = int(np.size(keff))
 
         # Equilibrium fields
@@ -2662,7 +2696,7 @@ def read_and_stitch_dump(fn: Path, args) -> Dict[str, Any]:
                     pass
 
             # pressure/temp
-            for nm in ("repr", "impr", "repe", "impe", "rete", "imte", "reti", "imti"):
+            for nm in ("repr", "impr", "repe", "impe", "rete", "imte", "reti", "imti", "reqlosl", "imqlosl", "reqloso", "imqloso"):
                 try:
                     fields[nm] = read_scalar_modes(nm)
                 except Exception:
@@ -2689,6 +2723,32 @@ def read_and_stitch_dump(fn: Path, args) -> Dict[str, Any]:
                 fields["imnd"], _ = dens["imnd"]
                 fields["nspec_dens"] = np.array([nspec_dens], dtype=int)
 
+            # Custom impurity charge state densities
+            try:
+                nimrod_species_info = _nimrod_species_info(nimrod_in_guess)
+                zimp = int(nimrod_species_info.get('zimp', 0))
+                if zimp > 0:
+                    nspec_imp = zimp + 1
+                    def read_impurity_modes(base: str) -> np.ndarray:
+                        blocks = []
+                        for bid in bids:
+                            a = _read_block_ds(f, base, bid)
+                            a = _squeeze1(a)
+                            a = _unpack_multispecies_scalar_modes(a, nmodes, nspec_imp, 'species_major')
+                            blocks.append(a.astype(float, copy=False))
+                        return stitch_blocks(blocks, nxbl, nybl, ordering)
+
+                    try:
+                        fields["renz"] = read_impurity_modes("renz")
+                        fields["imnz"] = read_impurity_modes("imnz")
+                        fields["nspec_imp"] = np.array([nspec_imp], dtype=int)
+                        log.info(f"Read renz/imnz for {nspec_imp} impurity charge states.")
+                    except KeyError:
+                        log.info("renz/imnz not found in dump file, skipping impurity mapping.")
+                    except Exception as e:
+                        log.warning(f"Could not process renz/imnz: {e}")
+            except Exception as e:
+                log.warning(f"Could not read impurity info for renz/imnz: {e}")
                 # Store 2D fields in a stitched IMAS-friendly (dim1,dim2) layout.
         #
         # NIMROD rblock stitching produces arrays shaped (Ny, Nx) where the first axis is the
@@ -2698,15 +2758,6 @@ def read_and_stitch_dump(fn: Path, args) -> Dict[str, Any]:
 
         # --- Single-ion/no-impurity compatibility ---
         # Some NIMROD dumps provide only one density channel (nq[...,0]) even though IMAS
-        # expects electrons + at least one ion species. Expand nq (and rend/imnd if present)
-        # to [e, main ion] using zisp_input/zeff_input when available.
-        nimrod_in_guess = None
-        try:
-            cand = fn.parent / "nimrod.in"
-            if cand.is_file():
-                nimrod_in_guess = str(cand)
-        except Exception:
-            nimrod_in_guess = None
         try:
             nq, fields, nspec_eq = _expand_single_ion_to_e_plus_main(nq, fields, nspec_eq, nmodes, args, nimrod_in_guess)
         except Exception:
@@ -2750,6 +2801,8 @@ def read_and_stitch_dump(fn: Path, args) -> Dict[str, Any]:
                     vv = vv * float(getattr(args, "v_scale", 1.0))
                 elif k in ("reja","imja"):
                     vv = vv * float(getattr(args, "j_scale", 1.0))
+                elif k in ("reqlosl", "imqlosl", "reqloso", "imqloso"):
+                    vv = vv * float(getattr(args, "power_density_scale", 1.0))
                 fields_imas[k] = vv
             except Exception:
                 pass
@@ -9528,6 +9581,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Scale factor applied to velocity-like quantities from dump -> IMAS (e.g., cm/s->m/s: 1e-2).")
     p.add_argument("--j-scale", type=float, default=1.0,
                    help="Scale factor applied to current-density-like quantities from dump -> IMAS (e.g., A/cm^2->A/m^2: 1e4).")
+    p.add_argument("--power-density-scale", type=float, default=1.0,
+                   help="Scale factor applied to power-density-like quantities from dump -> IMAS (e.g., W/m^3).")
 
 
     p.add_argument(

@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.3](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.3.2...nimrod2imas-v0.3.3) (2026-03-04)
+
+
+### Bug Fixes
+
+* Moving from Cocos11 to Cocos17 as default for IMAS ([2239fd1](https://github.com/PrincetonUniversity/nimrod2imas/commit/2239fd1030c7c300c277fd3f9f3908e777efbbe4))
+* Moving from Cocos11 to Cocos17 as default for IMAS ([d50f773](https://github.com/PrincetonUniversity/nimrod2imas/commit/d50f773b6da1ee82f2414a7a5975132d07df097c))
+
 ## [0.3.2](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.3.1...nimrod2imas-v0.3.2) (2026-02-27)
 
 

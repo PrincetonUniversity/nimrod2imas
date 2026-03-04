@@ -42,7 +42,7 @@ import h5py
 import numpy as np
 import imas
 
-__version__ = "0.3.0"
+__version__ = "0.3.2"
 
 try:
     import f90nml  # type: ignore
@@ -112,25 +112,24 @@ def _as_f64(a: np.ndarray) -> np.ndarray:
 # -----------------------------
 #
 # NIMROD uses an R–Z–phi cylindrical ordering ("RZPhi"), which corresponds to COCOS=12
-# in the Sauter coordinate-conventions table: sigma_{R\phi Z} = -1 (toroidal angle
-# increases clockwise when viewed from +Z).
+# in the ITER/IMAS paired COCOS table (sigma_RphiZ = -1; toroidal angle increases CW
+# when viewed from +Z).
 #
-# IMAS expects COCOS=11 (sigma_{R\phi Z} = +1), which is the standard right-handed
-# (R,phi,Z) cylindrical system.
+# IMAS DD v4.1 workflows use COCOS=17.
 #
-# The 12->11 conversion requires:
-#   * flip sign of absolute poloidal flux psi (so that B_R/B_Z remain unchanged when
-#     sigma_{R\phi Z} changes sign)
-#   * flip sign of *toroidal* (phi) components of equilibrium vectors (B_phi, V_phi, J_phi)
-#   * for Fourier-mode perturbations stored as (re, im): complex conjugation for scalars
-#     (Im -> -Im) and -conjugation for toroidal vector components (Re_phi -> -Re_phi,
-#     Im_phi unchanged)
+# Operationally, the 12->17 conversion is implemented as:
+#   (1) 12 -> 11: reverse toroidal angle direction (phi -> -phi), which requires
+#       - flipping the sign of the absolute poloidal flux psi to keep B_R and B_Z unchanged,
+#       - flipping the sign of toroidal (phi) components of equilibrium vectors (B_phi, V_phi, J_phi),
+#       - mapping Fourier-mode perturbations for phi-reversal (scalar conjugation; toroidal basis reversal).
+#   (2) 11 -> 17: flip the sign of the absolute poloidal flux psi again. This changes the
+#       poloidal-flux reference convention while leaving vector components unchanged.
 #
 # This script assumes NIMROD dump inputs are COCOS=12 and converts all dump2imas outputs
-# to be COCOS=11-consistent.
+# to be COCOS=17-consistent.
 
 COCOS_IN_DEFAULT = 12
-COCOS_OUT_DEFAULT = 11
+COCOS_OUT_DEFAULT = 17
 
 
 def _set_ids_cocos(ids_obj: Any, cocos: int) -> None:
@@ -219,12 +218,38 @@ def _apply_cocos_12_to_11_inplace(data: Dict[str, Any], log: logging.Logger) -> 
     data["_cocos_12_to_11_applied"] = True
 
 
+def _apply_cocos_11_to_17_inplace(data: Dict[str, Any], log: logging.Logger) -> None:
+    """In-place COCOS=11 -> COCOS=17 adjustment.
+
+    In the paired COCOS table, COCOS 11 and 17 share the same cylindrical handedness
+    (sigma_RphiZ = +1), but differ in the poloidal-flux reference convention. To keep
+    the equilibrium vector fields unchanged while switching the convention family, we
+    flip the sign of the absolute poloidal flux psi (and only psi) in this step.
+    """
+    if bool(data.get("_cocos_11_to_17_applied", False)):
+        return
+
+    if data.get("psi_eq", None) is not None:
+        data["psi_eq"] = -np.asarray(data["psi_eq"], dtype=float)
+        log.info("COCOS 11->17: flipped sign of psi_eq (absolute poloidal flux)")
+
+    data["_cocos_11_to_17_applied"] = True
+
+
+def _apply_cocos_12_to_17_inplace(data: Dict[str, Any], log: logging.Logger) -> None:
+    """In-place COCOS=12 -> COCOS=17 conversion (default for IMAS DD v4.1 workflows)."""
+    _apply_cocos_12_to_11_inplace(data, log)
+    _apply_cocos_11_to_17_inplace(data, log)
+
+
+
+
 
 def _sanity_print_cocos(tag: str, src_name: str, t: float, payload: Dict[str, Any], args: Any) -> None:
     """Print lightweight sanity statistics before/after COCOS conversion.
 
-    Intended for quick verification that the 12->11 sign flips are being applied:
-      - psi flips sign
+    Intended for quick verification that the 12->17 conversion is being applied:
+      - psi_eq is normalized to the COCOS=17 convention (may change sign)
       - Bphi/Jphi/Vphi flip sign (equilibrium)
       - scalar-mode imaginary parts flip sign; vector-mode rules for phi reversal hold
     """
@@ -270,7 +295,7 @@ def _sanity_print_cocos(tag: str, src_name: str, t: float, payload: Dict[str, An
     fields = payload.get("fields", {}) if isinstance(payload.get("fields", None), dict) else {}
 
     lines = []
-    lines.append(f"SANITY[{tag}] {src_name}  t={t:.6g}  (COCOS12->11 check)")
+    lines.append(f"SANITY[{tag}] {src_name}  t={t:.6g}  (COCOS12->17 check)")
     lines.append("  " + _fmt_stats("psi_eq", psi))
     lines.append("  " + _fmt_stats("Bphi(eq)", _phi_comp(bq)))
     lines.append("  " + _fmt_stats("Jphi(eq)", _phi_comp(jq)))
@@ -2680,7 +2705,7 @@ def read_and_stitch_dump(fn: Path, args) -> Dict[str, Any]:
             except Exception:
                 pass
 
-        # Convert from NIMROD's native COCOS=12 convention to IMAS COCOS=11.
+        # Convert from NIMROD's native COCOS=12 convention to IMAS COCOS=17.
         # This is applied only within dump2imas outputs (input2imas preserves original PEQDSK signs).
         try:
             _cocos_log = logging.getLogger("dump2imas")
@@ -2693,7 +2718,7 @@ def read_and_stitch_dump(fn: Path, args) -> Dict[str, Any]:
             )
             
             _sanity_print_cocos("PRE", fn.name, float(t0), _cocos_payload, args)
-            _apply_cocos_12_to_11_inplace(_cocos_payload, _cocos_log)
+            _apply_cocos_12_to_17_inplace(_cocos_payload, _cocos_log)
 
             _sanity_print_cocos("POST", fn.name, float(t0), _cocos_payload, args)
             psi_eq_imas = _cocos_payload.get("psi_eq", psi_eq_imas)
@@ -2749,11 +2774,11 @@ def _reconstruct_psi_from_bq(R: np.ndarray, Z: np.ndarray, bq: np.ndarray) -> Op
 
     This corresponds to the COCOS=12 sign convention (sigma_{R phi Z}=-1). The
     surrounding dump2imas workflow will subsequently convert the reconstructed
-    psi to COCOS=11 by flipping its sign.
+    psi to COCOS=17 by applying the internal COCOS conversion logic.
 
     NOTE: this relation corresponds to sigma_{R phi Z} = -1 (COCOS=12-type) in the Sauter
-    coordinate-convention definitions. dump2imas enforces COCOS=11 output by flipping the
-    sign of psi after stitching/reconstruction.
+    coordinate-convention definitions. dump2imas enforces COCOS=17 output by applying the
+    internal COCOS conversion after stitching/reconstruction.
 
     We reconstruct psi on a logically-rectangular grid by:
       1) selecting a reference point near the magnetic axis (min |B_p|)
@@ -2986,7 +3011,7 @@ def _ensure_psi_eq_available(
 def populate_equilibrium(eq: Any, data: Dict[str, Any], t_index: int, quiet: bool) -> None:
     t = float(data["time"])
 
-    # IMAS output convention (dump2imas enforces COCOS=11)
+    # IMAS output convention (dump2imas enforces COCOS=17)
 
     _set_ids_cocos(eq, COCOS_OUT_DEFAULT)
     R = data["R"]
@@ -3060,7 +3085,7 @@ def populate_core_profiles(cp: Any, data: Dict[str, Any], t_index: int, args) ->
     log = logging.getLogger(__name__)
     t = float(data.get("time", 0.0))
 
-    # IMAS output convention (dump2imas enforces COCOS=11)
+    # IMAS output convention (dump2imas enforces COCOS=17)
 
     _set_ids_cocos(cp, COCOS_OUT_DEFAULT)
 
@@ -9421,7 +9446,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="sanity_print",
         action="store_true",
         help=(
-            "Print sanity statistics before and after the internal COCOS=12 -> COCOS=11 conversion "
+            "Print sanity statistics before and after the internal COCOS=12 -> COCOS=17 conversion "
             "(psi_eq, Bphi/Jphi/Vphi and representative perturbation components). Useful for quick sign checks."
         ),
     )
@@ -10247,7 +10272,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 mhd_ids.ids_properties.comment = (
                     f"dump2imas: stitched grid; ids={ids_name}; occurrence={occ}; species_index={s}; "
                     f"dens_pert_order={args.dens_pert_order}; common_fields={include_common}; nonlinear={nonlinear_flag}; "
-                    "COCOS: converted NIMROD COCOS=12 -> IMAS COCOS=11 (psi sign flipped; toroidal components flipped; "
+                    "COCOS: converted NIMROD COCOS=12 -> IMAS COCOS=17 (psi sign flipped; toroidal components flipped; "
                     "modal perturbations mapped for phi-reversal)"
                 )
             except Exception:
@@ -10295,11 +10320,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             mhd_s.code.parameters = _build_nimrod_xml(nimrod_in_path)
                     except Exception:
                         pass
-                    # annotate COCOS conversion provenance (dump2imas enforces COCOS=11 output)
+                    # annotate COCOS conversion provenance (dump2imas enforces COCOS=17 output)
                     try:
                         mhd_s.ids_properties.comment = (
                             f"dump2imas: ggd full-field snapshot; ids={ids_name}; occurrence={occ}; species_index={s}; "
-                            "COCOS: converted NIMROD COCOS=12 -> IMAS COCOS=11 (psi sign flipped; toroidal components flipped; "
+                            "COCOS: converted NIMROD COCOS=12 -> IMAS COCOS=17 (psi sign flipped; toroidal components flipped; "
                             "modal perturbations mapped for phi-reversal)"
                         )
                     except Exception:

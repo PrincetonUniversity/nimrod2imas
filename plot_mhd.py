@@ -59,7 +59,7 @@ except Exception:
     cmr = None  # type: ignore
 
 
-__version__ = "0.3.0"
+__version__ = "0.3.2"
 
 VERSION = __version__
 

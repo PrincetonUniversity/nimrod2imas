@@ -2338,6 +2338,80 @@ def _bin_scalar_on_rho_bins(
     return out
 
 
+def _calculate_q_profile(
+    R: np.ndarray,
+    Z: np.ndarray,
+    psi: np.ndarray,
+    B_R: np.ndarray,
+    B_Z: np.ndarray,
+    B_phi: np.ndarray,
+    psi_axis: float,
+    psi_lcfs: float,
+    n_levels: int = 32,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    Calculate the safety factor q(psi) from 2D equilibrium fields.
+
+    This function traces contours of the poloidal flux `psi` and performs the line integral
+    q(psi) = (1 / 2*pi) *oint (B_phi / (R * B_p)) dl_p for each contour.
+
+    Args:
+        R: 2D array of major radius.
+        Z: 2D array of vertical position.
+        psi: 2D array of poloidal flux.
+        B_R: 2D array of radial magnetic field.
+        B_Z: 2D array of vertical magnetic field.
+        B_phi: 2D array of toroidal magnetic field.
+        psi_axis: Poloidal flux at the magnetic axis.
+        psi_lcfs: Poloidal flux at the last closed flux surface.
+        n_levels: Number of psi contours to calculate q on.
+
+    Returns:
+        A tuple of (psi_1d, q_1d) arrays, or None if the calculation fails.
+    """
+    import matplotlib.pyplot as plt
+    from scipy.interpolate import griddata
+
+    if not all(
+        x is not None and np.any(np.isfinite(x))
+        for x in [R, Z, psi, B_R, B_Z, B_phi]
+    ):
+        return None
+
+    # Create a set of psi levels from axis to LCFS
+    psi_levels = np.linspace(psi_axis, psi_lcfs, n_levels + 2)[1:-1]
+    q_values = []
+    psi_values = []
+
+    B_p = np.sqrt(B_R**2 + B_Z**2)
+    integrand = B_phi / (R * B_p)
+
+    # Generate contours for each psi level
+    cs = plt.contour(R, Z, psi, levels=psi_levels)
+
+    for i, level in enumerate(cs.levels):
+        contour = cs.collections[i].get_paths()[0]
+        vertices = contour.vertices
+        r_path, z_path = vertices[:, 0], vertices[:, 1]
+
+        # Interpolate the integrand onto the contour path
+        points = np.column_stack((R.ravel(), Z.ravel()))
+        integrand_path = griddata(points, integrand.ravel(), (r_path, z_path), method='linear')
+
+        # Calculate the path length element dl_p
+        dl_p = np.sqrt(np.diff(r_path, prepend=r_path[0])**2 + np.diff(z_path, prepend=z_path[0])**2)
+
+        # Perform the line integral using the trapezoidal rule
+        integral = np.trapz(integrand_path, x=np.cumsum(dl_p))
+
+        q_values.append(integral / (2 * np.pi))
+        psi_values.append(level)
+
+    plt.close()  # Close the figure created by plt.contour
+
+    return np.array(psi_values), np.array(q_values)
+
+
 # -----------------------------
 # IMAS field setters (best effort)
 # -----------------------------
@@ -3033,6 +3107,32 @@ def populate_equilibrium(eq: Any, data: Dict[str, Any], t_index: int, quiet: boo
     except Exception as exc:
         _die(f"Failed to populate equilibrium.profiles_2d: {exc}")
 
+    # --- 1D profiles (q-profile) ---
+    try:
+        psi_axis, psi_lcfs, _ = _choose_psi_axis_lcfs(data, args, log)
+        if np.isfinite(psi_axis) and np.isfinite(psi_lcfs):
+            q_result = _calculate_q_profile(
+                R, Z, psi, bq[..., 0], bq[..., 1], bq[..., 2],
+                psi_axis, psi_lcfs, n_levels=64
+            )
+            if q_result:
+                psi_1d, q_1d = q_result
+                p1d = ts.profiles_1d
+                p1d.psi = psi_1d
+                p1d.q = q_1d
+                log.info("Calculated and populated equilibrium.profiles_1d.q")
+    except Exception as exc:
+        # Non-fatal: q-profile is a derived quantity.
+        log.warning(f"Failed to calculate q-profile: {exc}")
+    
+    # Pass q-profile result to other populators via the data dictionary
+    # so it can be interpolated onto other grids (e.g. core_profiles).
+    if 'q_result' in locals() and locals()['q_result']:
+        data['q_result'] = locals()['q_result']
+    else:
+        data['q_result'] = None
+
+
     # metadata
     try:
         eq.code.name = "NIMROD"
@@ -3421,6 +3521,20 @@ def populate_core_profiles(cp: Any, data: Dict[str, Any], t_index: int, args) ->
             p.j_phi = _as_f64(jtor1d)
     except Exception:
         pass
+
+    # ---- q-profile (interpolated from equilibrium calculation) ----
+    q_result = data.get("q_result", None)
+    if q_result:
+        try:
+            psi_q, q_vals = q_result
+            # Interpolate q(psi) onto the core_profiles psi grid
+            q_1d = np.interp(psi_abs_1d, psi_q, q_vals, left=np.nan, right=np.nan)
+            q_1d = _fill_nan_1d(q_1d)
+            if q_1d is not None and np.any(np.isfinite(q_1d)):
+                p.q = _as_f64(q_1d)
+                log.info("Populated core_profiles.profiles_1d.q by interpolating from equilibrium q-profile.")
+        except Exception as exc:
+            log.warning("Failed to interpolate q-profile for core_profiles: %s", exc)
 
     # metadata
     try:

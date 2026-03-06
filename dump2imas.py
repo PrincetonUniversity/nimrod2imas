@@ -42,7 +42,7 @@ import h5py
 import numpy as np
 import imas
 
-__version__ = "0.3.2"
+__version__ = "0.3.0"
 
 try:
     import f90nml  # type: ignore
@@ -2033,6 +2033,19 @@ def _psi_lcfs_from_contours(
     """Estimate psi_lcfs by sampling psi2d on LCFS polyline points from contours.h5."""
     try:
         import h5py as _h5py
+        import numpy as np
+
+        def _write_arr(dst_g, name: str, arr, *, dtype=None, overwrite=True, **kwargs):
+            """Small shim for mirroring helper: write/overwrite a dataset via _h5_write_dataset."""
+            dt = dtype
+            if isinstance(dtype, str):
+                try:
+                    dt = np.dtype(dtype)
+                except Exception:
+                    dt = None
+            _h5_write_dataset(dst_g, name, np.asarray(arr), dtype=dt, overwrite=overwrite, **kwargs)
+
+
         with _h5py.File(contours_path, "r") as h5:
             pts = None
             for gnm in ("LCFS", "lcfs", "gfile_lcfs"):
@@ -6580,6 +6593,15 @@ def _write_edge_profiles_ion_velocity_component_ggd_h5(entry_dir, occ, *, compon
 
 def _h5_write_dataset(g, name, data, *, dtype=None, overwrite=True, **kwargs):
     """Create or overwrite a dataset under HDF5 group g."""
+    # Robustify: callers sometimes pass numpy arrays/bools into overwrite
+    try:
+        if isinstance(overwrite, np.ndarray):
+            overwrite = bool(np.all(overwrite))
+        else:
+            overwrite = bool(overwrite)
+    except Exception:
+        overwrite = True if overwrite is None else bool(overwrite)
+
     if name in g:
         if overwrite:
             del g[name]
@@ -6588,6 +6610,7 @@ def _h5_write_dataset(g, name, data, *, dtype=None, overwrite=True, **kwargs):
     if dtype is not None:
         data = np.asarray(data, dtype=dtype)
     g.create_dataset(name, data=data, **kwargs)
+
 
 
 def _ids_backend_h5_loc(entry_dir: str, ids_name: str, occ: int):
@@ -8678,17 +8701,53 @@ def _write_unstructured_gridggd_packed_h5(
                 #  - (nggd, nsubsets, nelem) : per-element object count
                 #  - (nggd, nsubsets, 1)     : uniform count per subset
                 if doa.ndim == 3:
-                    # Resize element dimension if possible.
+                    # Prefer a compact representation: keep the last dimension = 1 when possible.
+                    # This avoids allocating per-element object-count arrays for very large meshes.
                     try:
-                        max_e = max(n_nodes, n_cells)
-                        if doa.shape[2] != max_e:
-                            doa.resize((doa.shape[0], doa.shape[1], max_e))
-                    except Exception:
-                        pass
-                    doa[...] = 0
-                    doa[0, nodes_subset_index, :n_nodes] = 3
-                    doa[0, vols_subset_index, :n_cells] = n_verts
+                        if doa.shape[2] == 1:
+                            doa[0, nodes_subset_index, 0] = 3
+                            doa[0, vols_subset_index, 0] = n_verts
+                        else:
+                            # Per-element counts: write only the required ranges (avoid doa[...] = 0).
+                            step = 4_000_000  # ints per write (~16 MiB)
+                            for i0 in range(0, n_nodes, step):
+                                i1 = min(i0 + step, n_nodes)
+                                doa[0, nodes_subset_index, i0:i1] = 3
+                            for i0 in range(0, n_cells, step):
+                                i1 = min(i0 + step, n_cells)
+                                doa[0, vols_subset_index, i0:i1] = n_verts
+
+                    except Exception as e:
+                        # If chunk allocation fails, fall back to recreating a compact AoS_SHAPE dataset (dim=1).
+                        if "memory allocation failed for chunk" in str(e).lower():
+                            try:
+                                del g[ds_obj_aos]
+                            except Exception:
+                                pass
+                            g.create_dataset(
+                                ds_obj_aos,
+                                shape=(1, n_subsets, 1),
+                                maxshape=(None, n_subsets, 1),
+                                dtype=np.int32,
+                                chunks=(1, 1, 1),
+                                compression=None,
+                                compression_opts=None,
+                                shuffle=False,
+                                fillvalue=0,
+                            )
+
+                            doa = g[ds_obj_aos]
+
+                            doa[0, nodes_subset_index, 0] = 3
+
+                            doa[0, vols_subset_index, 0] = n_verts
+
+                        else:
+
+                            raise
+
                 elif doa.ndim == 2:
+
                     # (nggd, nsubsets)
                     doa[...] = 0
                     doa[0, nodes_subset_index] = 3
@@ -8720,9 +8779,9 @@ def _write_unstructured_gridggd_packed_h5(
                     maxshape=maxshape,
                     dtype=dtype,
                     chunks=chunks,
-                    compression=compression,
-                    compression_opts=compression_opts,
-                    shuffle=shuffle,
+                    compression=None,
+                    compression_opts=None,
+                    shuffle=False,
                     fillvalue=fillvalue,
                 )
             except Exception as e:
@@ -8742,7 +8801,7 @@ def _write_unstructured_gridggd_packed_h5(
                     chunk_bytes *= int(c)
                 chunk_bytes *= int(bytes_per_item)
                 # Trigger if chunk is enormous in element dimension or absolute bytes > 128 MiB.
-                if ch[elem_axis] > 20000 or chunk_bytes > 128 * 1024 * 1024:
+                if ch[elem_axis] > 8192 or chunk_bytes > 32 * 1024 * 1024:
                     # Choose a conservative chunk along the element axis.
                     elem_chunk = min(8192, elem_count) if elem_count > 0 else 1
                     # Keep other axes minimal to avoid multiplying.
@@ -8815,11 +8874,18 @@ def _write_unstructured_gridggd_packed_h5(
                 pass
             # NOTE: do not clear the full packed datasets here (can trigger massive I/O and memory pressure).
 
-            # Nodes subset
-            dreal[0, nodes_subset_index, :n_nodes, :3] = nodes_xyz.astype(np.float64, copy=False)
-            # Volumes subset: connectivity indices
-            dind[0, vols_subset_index, :n_cells, :n_verts] = conn_1b
+            # Nodes subset (write in slabs to reduce peak memory and avoid huge HDF5 chunk buffers)
+            node_step = min(65536, n_nodes) if n_nodes > 0 else 1
+            nodes_f8 = nodes_xyz.astype(np.float64, copy=False)
+            for i0 in range(0, n_nodes, node_step):
+                i1 = min(i0 + node_step, n_nodes)
+                dreal[0, nodes_subset_index, i0:i1, :3] = nodes_f8[i0:i1, :3]
 
+            # Volumes subset: connectivity indices (write in slabs)
+            cell_step = min(8192, n_cells) if n_cells > 0 else 1
+            for i0 in range(0, n_cells, cell_step):
+                i1 = min(i0 + cell_step, n_cells)
+                dind[0, vols_subset_index, i0:i1, :n_verts] = conn_1b[i0:i1, :n_verts]
         else:
             # Fallback: try to write flattened payloads if the backend chose a packed 1D layout.
             # We do this best-effort and warn if it doesn't fit.
@@ -8832,7 +8898,10 @@ def _write_unstructured_gridggd_packed_h5(
                     # (nggd, nsubsets, nflat)
                     dreal.resize((1, n_subsets, flat_nodes.size))
                     # NOTE: avoid full-dataset clears; write only the required slice below.
-                    dreal[0, nodes_subset_index, : flat_nodes.size] = flat_nodes
+                    step = 2_000_000  # ~16 MiB per write for float64
+                    for i0 in range(0, flat_nodes.size, step):
+                        i1 = min(i0 + step, flat_nodes.size)
+                        dreal[0, nodes_subset_index, i0:i1] = flat_nodes[i0:i1]
                     wrote_any = True
             except Exception as e:
                 log.warning("Packed grid_ggd writer: could not write flattened real: %s", e)
@@ -8841,7 +8910,10 @@ def _write_unstructured_gridggd_packed_h5(
                 if dind.ndim == 3:
                     dind.resize((1, n_subsets, flat_conn.size))
                     # NOTE: avoid full-dataset clears; write only the required slice below.
-                    dind[0, vols_subset_index, : flat_conn.size] = flat_conn
+                    step = 4_000_000  # ~16 MiB per write for int32
+                    for i0 in range(0, flat_conn.size, step):
+                        i1 = min(i0 + step, flat_conn.size)
+                        dind[0, vols_subset_index, i0:i1] = flat_conn[i0:i1]
                     wrote_any = True
             except Exception as e:
                 log.warning("Packed grid_ggd writer: could not write flattened index: %s", e)
@@ -9925,19 +9997,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                                     nqA_ep[..., 0] = np.asarray(ne_native_full, dtype=float)
                                                 ne_native = ne_native_full
                                 
-                                    peq = _recon_ep(peq, 'repe', 'impe') or peq
-                                    teq = _recon_ep(teq, 'rete', 'imte') or teq
+                                    _tmp = _recon_ep(peq, 'repe', 'impe')
                                 
-                                    prq = _recon_ep(data.get('prq', None), 'repr', 'impr') or data.get('prq', None)
-                                    tiq = _recon_ep(data.get('tiq', None), 'reti', 'imti') or data.get('tiq', None)
+                                    if _tmp is not None:
                                 
+                                        peq = _tmp
+                                    _tmp = _recon_ep(teq, 'rete', 'imte')
+                                    if _tmp is not None:
+                                        teq = _tmp
+                                    _prq0 = data.get('prq', None)
+                                    _tmp = _recon_ep(_prq0, 'repr', 'impr')
+                                    prq = _prq0 if _tmp is None else _tmp
+                                    _tiq0 = data.get('tiq', None)
+                                    _tmp = _recon_ep(_tiq0, 'reti', 'imti')
+                                    tiq = _tiq0 if _tmp is None else _tmp
                                     vq_full = None
                                     if data.get('vq', None) is not None:
                                         try:
                                             vqA0 = np.asarray(data.get('vq'), dtype=float)
                                             vq_full = np.zeros_like(vqA0, dtype=float)
                                             for _c in (0, 1, 2):
-                                                vq_full[..., _c] = _recon_ep(vqA0[..., _c], 'reve', 'imve', comp=_c) or vqA0[..., _c]
+                                                _tmp = _recon_ep(vqA0[..., _c], 'reve', 'imve', comp=_c)
+                                                vq_full[..., _c] = vqA0[..., _c] if _tmp is None else _tmp
                                         except Exception:
                                             vq_full = None
                                     jq_full = None
@@ -9946,7 +10027,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                             jqA0 = np.asarray(data.get('jq'), dtype=float)
                                             jq_full = np.zeros_like(jqA0, dtype=float)
                                             for _c in (0, 1, 2):
-                                                jq_full[..., _c] = _recon_ep(jqA0[..., _c], 'reja', 'imja', comp=_c) or jqA0[..., _c]
+                                                _tmp = _recon_ep(jqA0[..., _c], 'reja', 'imja', comp=_c)
+                                                jq_full[..., _c] = jqA0[..., _c] if _tmp is None else _tmp
                                         except Exception:
                                             jq_full = None
                                 
@@ -10219,6 +10301,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
                             except Exception as e:
                                 log.warning('edge_profiles GGD required leaves (h5py direct) write failed: %s', e)
+                                log.exception('edge_profiles GGD required leaves (h5py direct) write failed')
                     # If unstructured GGD is requested, we'll mirror edge_profiles electrons.temperature from the mhd GGD
                     # after the mhd IDS is written (see below). This avoids fragile interpolation and keeps node ordering identical.
                     edge_profiles_need_mirror = bool(getattr(args, 'ggd_unstructured', False) and (str(getattr(args, 'edge_ggd_values', 'equilibrium') or 'equilibrium').strip().lower() == 'full'))
@@ -10390,7 +10473,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     and _edge_mode in ("full", "mhd", "mirror")
                 ):
                     try:
-                        _mirror_edge_profiles_from_mhd_h5(entry_dir, occ_base, args=args)
+                        #_mirror_edge_profiles_from_mhd_h5(entry_dir, occ_base, args=args)
                         mhd_h5, _  = _ids_backend_h5_loc(entry_dir, "mhd", occ_base)
                         edge_h5, _ = _ids_backend_h5_loc(entry_dir, "edge_profiles", occ_base)
                         if os.path.exists(mhd_h5) and os.path.exists(edge_h5):
@@ -10465,6 +10548,16 @@ def _mirror_edge_profiles_from_mhd_h5(
 
     import re as _re
     import h5py as _h5py
+
+def _write_arr(dst_g, name: str, arr, *, dtype=None, overwrite=True, **kwargs):
+    """Write/overwrite a dataset via _h5_write_dataset (local to mirror helper)."""
+    dt = dtype
+    if isinstance(dtype, str):
+        try:
+            dt = np.dtype(dtype)
+        except Exception:
+            dt = None
+    _h5_write_dataset(dst_g, name, np.asarray(arr), dtype=dt, overwrite=overwrite, **kwargs)
 
     def _parse_dd(v: str) -> tuple[int, int, int]:
         s = str(v or "").strip()

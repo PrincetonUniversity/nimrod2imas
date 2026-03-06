@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.4](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.3.3...nimrod2imas-v0.3.4) (2026-03-06)
+
+
+### Bug Fixes
+
+* This fix addresses memory allocation errors for h5py-write for l… ([9372d65](https://github.com/PrincetonUniversity/nimrod2imas/commit/9372d652155d1e0f326f9ba08b41c51f7288d3e5))
+* This fix addresses memory allocation errors for h5py-write for large nphi numbers ([185ff1f](https://github.com/PrincetonUniversity/nimrod2imas/commit/185ff1f0980df143e00004cb19300d316e4afa47))
+
 ## [0.3.3](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.3.2...nimrod2imas-v0.3.3) (2026-03-04)
 
 

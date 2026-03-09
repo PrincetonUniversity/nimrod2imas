@@ -4,6 +4,7 @@ This repository provides a small, script-oriented Python toolkit for:
 - Converting NIMROD inputs (GEQDSK + p-file and selected namelists) to IMAS (`input2imas.py`)
 - Converting NIMROD dump files to IMAS (`dump2imas.py`)
 - Computing NIMROD linear growth rates (and optional frequency) from `energy.bin`/`logen.bin` and storing them in IMAS `mhd_linear` (`gamma2imas.py`)
+- Converting NIMROD binary time-history files (`energy*.bin`, `discharge*.bin`) into IMAS `summary` + `mhd_linear` (`bin2imas.py`)
 - Restoring NIMROD-style input files from IMAS entries (`nimrodInputRestore.py`)
 - Plotting IMAS **profiles** (`plot_profiles_1d.py`)
 - Plotting IMAS `mhd` and `mhd_linear` content (`plot_mhd.py`, `plot_mhd_linear.py`)
@@ -260,7 +261,37 @@ python gamma2imas.py --dd mast --dd-version 4.1.1 --pulse 45272 --run 1 --occ 1 
 
 ---
 
-### 4) `nimrodInputRestore.py` — IMAS → NIMROD-style inputs
+### 4) `bin2imas.py` — time-history bins → IMAS (`summary` + `mhd_linear` + `disruption`)
+
+**What it does**
+- Reads standard NIMROD Fortran-record diagnostics from `energy*.bin` and `discharge*.bin`.
+- Optionally reads `kpraden*.bin` and maps:
+  - `qlosl` → disruption total radiated power
+  - `qloso` → disruption ohmic power
+- Merges restart segments by sorting and deduplicating records using `(step,time,mode)` keys.
+- Writes discharge traces into `summary` (e.g. `ip`, `v_loop`, `w_mhd` where fields exist in the active DD).
+- Writes per-mode time slices into `mhd_linear` and computes per-mode growth rate time history from \(E_{mag}+E_{kin}\).
+
+**CLI options**
+- `--input-dir`, `--energy-pattern`, `--discharge-pattern`: file discovery
+- `--energy-files`, `--discharge-files`: explicit files (override glob discovery)
+- `--summary-occ`, `--mhd-linear-occ`, `--disruption-occ`: IDS occurrences to update
+- `--no-summary`, `--no-mhd-linear`, `--no-disruption`: selective output
+- `--kprad-pattern` / `--kprad-files`: control `kpraden` discovery/input
+- `--dry-run`: parse and report only (no IMAS write)
+
+**Usage example**
+```bash
+python bin2imas.py \
+  --input-dir ~/onedrive/MiRACL/D3D_IAEA_BOTH/output_nimrod \
+  --dd d3d --dd-version 4.1.1 --pulse 0 --run 1 \
+  --dbpath . --backend hdf5 \
+  --summary-occ 0 --mhd-linear-occ 1
+```
+
+---
+
+### 5) `nimrodInputRestore.py` — IMAS → NIMROD-style inputs
 
 **What it does**
 - Opens an existing filesystem-backed IMAS entry and reconstructs:
@@ -313,7 +344,7 @@ Fix this in the shared `nimrod2imas.value_to_string(...)` and the corresponding 
 
 ---
 
-### 5) `plot_profiles_1d.py` — 1D profile plots from `core_profiles` / `edge_profiles`
+### 6) `plot_profiles_1d.py` — 1D profile plots from `core_profiles` / `edge_profiles`
 
 Plots `profiles_1d` from IMAS:
 - `core_profiles`: x-axis = **ρ_tor_norm** (normalized toroidal flux coordinate)
@@ -330,7 +361,7 @@ python plot_profiles_1d.py \
 
 ---
 
-### 6) `plot_mhd_linear.py` — contour plots from `mhd_linear`
+### 7) `plot_mhd_linear.py` — contour plots from `mhd_linear`
 
 Provides R–Z contour plots of:
 - scalar perturbations: `p`, `t`, `n`
@@ -348,7 +379,7 @@ Optional: `cmasher` colormaps can be used via `--cmap cmr.gothic` if installed.
 
 ---
 
-### 7) `plot_mhd.py` — contour plots from `mhd` (GGD) with HDF5 fallback
+### 8) `plot_mhd.py` — contour plots from `mhd` (GGD) with HDF5 fallback
 
 Attempts to read axes from IMAS `mhd.grid_ggd`; if not possible, falls back to auxiliary HDF5 datasets written by the conversion pipeline (when present).
 
@@ -360,7 +391,7 @@ python plot_mhd.py --entry mast/4/45272/8/ \
 
 ---
 
-### 8) `validate_nimrod2imas.py` — validate GEQDSK/p-file round trip
+### 9) `validate_nimrod2imas.py` — validate GEQDSK/p-file round trip
 
 Reads `equilibrium` and `core_profiles` from IMAS and regenerates:
 - a GEQDSK (using an original template)

@@ -36,10 +36,9 @@ import sys
 from collections import deque
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+from nimrod2imas import __version__, VERSION
 
 import numpy as np
-
-__version__ = "0.3.2"
 
 # ------------------------- Fortran sequential record reader -------------------------
 

@@ -9,7 +9,7 @@ nimrod_unstructured group). Geometry is obtained from IMAS-standard grid_ggd
 encodings:
 
   1) Packed grid_ggd nodes (preferred, robust across options):
-     /<ids>_<occ>/grid_ggd[]&grid_subset[]&element[]&object[]&real
+     /<ids>_<occ>/grid_ggd[]&grid_subset[]&element[]&object[]&space
      using grid_subset.dimension==0 (nodes)
 
   2) grid_ggd space-geometry vectors (if present):
@@ -47,7 +47,10 @@ from nimrod2imas import (
     resolve_entry_path as _resolve_entry_common,
     open_ids_h5 as _open_ids_h5_common,
     normalize_out_and_show as _normalize_out_and_show_common,
+    VERSION as __version__
 )
+
+VERSION = __version__
 
 # Optional: cmasher colormaps (https://cmasher.readthedocs.io/)
 # If installed, importing cmasher registers its colormaps with Matplotlib (names like 'cmr.gothic').
@@ -57,11 +60,6 @@ try:
     _HAS_CMASher = True
 except Exception:
     cmr = None  # type: ignore
-
-
-__version__ = "0.3.2"
-
-VERSION = __version__
 
 
 # ----------------- filesystem helpers -----------------
@@ -232,11 +230,279 @@ def _normalize_phi_units(phi: np.ndarray, debug: bool = False) -> np.ndarray:
         return np.asarray(phi, dtype=float) * (math.pi / 180.0)
     return np.asarray(phi, dtype=float)
 
+def _read_values_grid_binding(f: h5py.File, grp: str, leaf: str, values_path: str, debug: bool = False) -> Tuple[Optional[int], Optional[int]]:
+    """Return (grid_index, grid_subset_index) for a GGD values leaf when available."""
+    base = values_path[:-len('&values')] if values_path.endswith('&values') else values_path.rsplit('&values', 1)[0]
+    gidx = None
+    gsidx = None
+    for suffix, name in (("&grid_index", "grid_index"), ("&grid_subset_index", "grid_subset_index")):
+        p = f"{base}{suffix}"
+        if p not in f:
+            continue
+        try:
+            arr = np.asarray(f[p][()])
+            val = int(np.asarray(arr).reshape(-1)[0])
+            if name == 'grid_index':
+                gidx = val
+            else:
+                gsidx = val
+        except Exception:
+            continue
+    if debug:
+        print(f"DEBUG: values binding leaf={leaf} grid_index={gidx} grid_subset_index={gsidx}", file=sys.stderr)
+    return gidx, gsidx
+
+
+def _read_full_object_nodes_geometry(f: h5py.File, grp: str, *, grid_index: int = 1, debug: bool = False) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Read node coordinates from DD4+ full-object grid_ggd encoding.
+
+    Recent dump2imas versions store full-object geometry for cylindrical spaces as
+    ``(R, phi, Z)`` (``cyl_rpz`` / RPZ order), while some older or custom files may
+    use ``(R, Z, phi)``. This helper auto-detects the layout.
+    """
+    key = f"/{grp}/grid_ggd[]&space[]&objects_per_dimension[]&object[]&geometry"
+    sh_key = f"/{grp}/grid_ggd[]&space[]&objects_per_dimension[]&object[]&geometry_SHAPE"
+    if key not in f:
+        return None
+    arr = np.asarray(f[key][()])
+    if arr.ndim != 5 or arr.shape[-1] < 2:
+        return None
+    gi = max(0, min(int(grid_index) - 1, arr.shape[0] - 1))
+    geom = np.asarray(arr[gi, 0, 0], dtype=float)
+    nobj = int(geom.shape[0])
+    if sh_key in f:
+        try:
+            sh = np.asarray(f[sh_key][()])
+            if sh.ndim == 4:
+                nz = np.asarray(sh[gi, 0, 0]).reshape(-1)
+                nobj = min(nobj, int(np.count_nonzero(nz > 0)))
+        except Exception:
+            pass
+    geom = geom[:nobj]
+    if geom.ndim != 2 or geom.shape[1] < 2 or geom.shape[0] == 0:
+        return None
+
+    r = geom[:, 0].astype(float, copy=False)
+    if geom.shape[1] < 3:
+        z = geom[:, 1].astype(float, copy=False)
+        phi = np.zeros_like(r)
+        return r, z, phi
+
+    c1 = geom[:, 1].astype(float, copy=False)
+    c2 = geom[:, 2].astype(float, copy=False)
+
+    # Auto-detect RPZ vs RZP layout.
+    def _phi_like(x: np.ndarray) -> tuple[float, float, float]:
+        xf = np.asarray(x, dtype=float)
+        xf = xf[np.isfinite(xf)]
+        if xf.size == 0:
+            return (0.0, 0.0, 0.0)
+        xmin = float(np.min(xf)); xmax = float(np.max(xf))
+        span = xmax - xmin
+        score = 0.0
+        # radians-like
+        if xmin >= -1e-6 and xmax <= 2.0 * math.pi + 1e-3:
+            score += 3.0
+        # degrees-like
+        if xmin >= -1e-3 and xmax <= 360.0 + 1e-3:
+            score += 2.0
+        # typically smaller span than Z on tokamak grids
+        if span <= max(2.0 * math.pi + 1e-3, 360.0 + 1e-3):
+            score += 1.0
+        return (score, xmin, xmax)
+
+    s1, mn1, mx1 = _phi_like(c1)
+    s2, mn2, mx2 = _phi_like(c2)
+    if s1 > s2:
+        phi = c1
+        z = c2
+        layout = 'RPZ'
+    elif s2 > s1:
+        z = c1
+        phi = c2
+        layout = 'RZP'
+    else:
+        # Default to RPZ for full-object cylindrical geometry written by dump2imas.
+        phi = c1
+        z = c2
+        layout = 'RPZ(default)'
+
+    if debug:
+        print(
+            f"DEBUG: full-object node geometry nnodes={r.size} grid_index={grid_index} layout={layout} "
+            f"c1=[{mn1:.6g},{mx1:.6g}] c2=[{mn2:.6g},{mx2:.6g}]",
+            file=sys.stderr,
+        )
+    return r, z, _normalize_phi_units(phi, debug=debug)
+
+
+
+
+def _resolve_grid_subset_position(
+    f: h5py.File,
+    grp: str,
+    *,
+    grid_index: int = 1,
+    grid_subset_index: int | None = None,
+    debug: bool = False,
+) -> int:
+    """Map IMAS ``grid_subset_index`` identifier.index to the positional subset slot.
+
+    In the IMAS files written by ``dump2imas``, ``grid_subset_index`` attached to a
+    quantity is an IMAS identifier value (for example 1 for nodes, 5 for cells in
+    the unstructured writer), not necessarily the zero-based positional offset in
+    ``grid_ggd[]&grid_subset[]``.  Plotting code must therefore resolve the
+    identifier to the corresponding subset position before indexing packed subset
+    datasets.
+    """
+    if grid_subset_index is None:
+        return 0
+
+    gsi = int(grid_subset_index)
+    if gsi < 0:
+        return 0
+
+    key = f"/{grp}/grid_ggd[]&grid_subset[]&identifier&index"
+    aos_key = f"/{grp}/grid_ggd[]&grid_subset[]&AOS_SHAPE"
+    if key not in f:
+        return gsi
+
+    try:
+        arr = np.asarray(f[key][()])
+        if arr.ndim == 0:
+            return 0 if int(arr) == gsi else gsi
+        gi = max(0, min(int(grid_index) - 1, arr.shape[0] - 1)) if arr.ndim >= 2 else 0
+        row = np.asarray(arr[gi] if arr.ndim >= 2 else arr).reshape(-1).astype(np.int64)
+        if aos_key in f:
+            try:
+                aos = np.asarray(f[aos_key][()])
+                if aos.ndim >= 2:
+                    nsub = int(np.asarray(aos[gi]).reshape(-1)[0])
+                    if nsub > 0:
+                        row = row[:nsub]
+            except Exception:
+                pass
+        matches = np.where(row == gsi)[0]
+        if matches.size:
+            pos = int(matches[0])
+            if debug:
+                print(f"DEBUG: resolved grid_subset_index identifier {gsi} -> subset position {pos}", file=sys.stderr)
+            return pos
+        # Fallback: if the identifier was already passed as a positional index, keep it.
+        if 0 <= gsi < row.size:
+            if debug:
+                print(f"DEBUG: grid_subset_index={gsi} not found in identifier.index; treating as positional subset", file=sys.stderr)
+            return gsi
+    except Exception as e:
+        if debug:
+            print(f"DEBUG: grid subset identifier resolution failed for {key}: {e}", file=sys.stderr)
+    return max(0, gsi)
+
+def _extract_geometry_for_subset(
+    f: h5py.File,
+    grp: str,
+    *,
+    grid_index: int | None = None,
+    grid_subset_index: int | None = None,
+    debug: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return coordinates matching the values subset.
+
+    For node-centered data (subset 0), return node coordinates. For cell-centered
+    full-object DD4 grids, return cell centroids.
+    """
+    gidx = 1 if grid_index is None else int(grid_index)
+    gsidx0 = _resolve_grid_subset_position(
+        f, grp, grid_index=gidx, grid_subset_index=grid_subset_index, debug=debug
+    )
+
+    node_geom = _read_full_object_nodes_geometry(f, grp, grid_index=gidx, debug=debug)
+    if node_geom is None:
+        node_geom = _packed_nodes_from_gridggd(f, grp, debug=debug)
+        if node_geom is None:
+            node_geom = _space_geometry_vectors(f, grp, debug=debug)
+        if node_geom is None:
+            raise RuntimeError(
+                f"Could not find grid_ggd node geometry in /{grp}.\n"
+                "Tried DD4 full-object nodes, packed nodes, and space geometry leaves."
+            )
+        r, z, phi = node_geom
+        return np.asarray(r), np.asarray(z), _normalize_phi_units(phi, debug=debug)
+
+    r_nodes, z_nodes, phi_nodes = node_geom
+    if gsidx0 == 0:
+        return r_nodes, z_nodes, phi_nodes
+
+    k_space = f"/{grp}/grid_ggd[]&grid_subset[]&element[]&object[]&space"
+    k_dim = f"/{grp}/grid_ggd[]&grid_subset[]&element[]&object[]&dimension"
+    k_index = f"/{grp}/grid_ggd[]&grid_subset[]&element[]&object[]&index"
+    k_nodes = f"/{grp}/grid_ggd[]&space[]&objects_per_dimension[]&object[]&nodes"
+    k_nodes_sh = f"/{grp}/grid_ggd[]&space[]&objects_per_dimension[]&object[]&nodes_SHAPE"
+    if not all(k in f for k in (k_space, k_dim, k_index, k_nodes)):
+        return r_nodes, z_nodes, phi_nodes
+
+    try:
+        ref_space = np.asarray(f[k_space][()])
+        ref_dim = np.asarray(f[k_dim][()])
+        ref_index = np.asarray(f[k_index][()])
+        obj_nodes = np.asarray(f[k_nodes][()])
+        obj_nodes_sh = np.asarray(f[k_nodes_sh][()]) if k_nodes_sh in f else None
+    except Exception:
+        return r_nodes, z_nodes, phi_nodes
+
+    if ref_space.ndim < 4 or ref_dim.ndim < 4 or ref_index.ndim < 4 or obj_nodes.ndim < 5:
+        return r_nodes, z_nodes, phi_nodes
+
+    gi = max(0, min(gidx - 1, ref_space.shape[0] - 1))
+    sidx = max(0, min(gsidx0, ref_space.shape[1] - 1))
+    space_ref = np.asarray(ref_space[gi, sidx]).reshape(-1)
+    dim_ref = np.asarray(ref_dim[gi, sidx]).reshape(-1)
+    index_ref = np.asarray(ref_index[gi, sidx]).reshape(-1)
+    valid = (space_ref > 0) & (dim_ref > 0) & (index_ref > 0)
+    if not np.any(valid):
+        return r_nodes, z_nodes, phi_nodes
+
+    space_ref = space_ref[valid].astype(np.int64) - 1
+    dim_ref = dim_ref[valid].astype(np.int64) - 1
+    index_ref = index_ref[valid].astype(np.int64) - 1
+    if np.unique(space_ref).size != 1 or np.unique(dim_ref).size != 1:
+        return r_nodes, z_nodes, phi_nodes
+
+    sp = int(space_ref[0])
+    dm = int(dim_ref[0])
+    node_ids = np.asarray(obj_nodes[gi, sp, dm, index_ref], dtype=np.int64)
+    if obj_nodes_sh is not None and obj_nodes_sh.ndim >= 4:
+        counts = np.asarray(obj_nodes_sh[gi, sp, dm, index_ref]).reshape(-1).astype(np.int64)
+    else:
+        counts = np.sum(node_ids > 0, axis=1, dtype=np.int64)
+    width = int(node_ids.shape[1])
+    mask = (np.arange(width, dtype=np.int64)[None, :] < counts[:, None]) & (node_ids > 0)
+    node_ids0 = np.where(mask, node_ids - 1, -1)
+    rr = np.zeros(node_ids0.shape[0], dtype=float)
+    zz = np.zeros(node_ids0.shape[0], dtype=float)
+    pp = np.zeros(node_ids0.shape[0], dtype=float)
+    for j in range(width):
+        mj = node_ids0[:, j] >= 0
+        if not np.any(mj):
+            continue
+        idx = node_ids0[mj, j]
+        rr[mj] += r_nodes[idx]
+        zz[mj] += z_nodes[idx]
+        pp[mj] += phi_nodes[idx]
+    denom = np.maximum(counts.astype(float), 1.0)
+    rr /= denom
+    zz /= denom
+    pp /= denom
+    if debug:
+        print(f"DEBUG: subset geometry from centroids subset={gsidx0} dim={dm} n={rr.size}", file=sys.stderr)
+    return rr, zz, pp
+
+
 
 def _packed_nodes_from_gridggd(f: h5py.File, grp: str, debug: bool = False) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    """Read nodes from packed grid_ggd object[]&real selecting grid_subset.dimension==0."""
+    """Read nodes from packed grid_ggd object[]&space selecting grid_subset.dimension==0."""
     dim_path = f"/{grp}/grid_ggd[]&grid_subset[]&dimension"
-    real_path = f"/{grp}/grid_ggd[]&grid_subset[]&element[]&object[]&real"
+    real_path = f"/{grp}/grid_ggd[]&grid_subset[]&element[]&object[]&space"
     if dim_path not in f or real_path not in f:
         return None
 
@@ -338,23 +604,7 @@ def _space_geometry_vectors(f: h5py.File, grp: str, debug: bool = False) -> Opti
 
 
 def _extract_geometry(f: h5py.File, grp: str, debug: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    geom = _packed_nodes_from_gridggd(f, grp, debug=debug)
-    if geom is not None:
-        r, z, phi = geom
-        phi = _normalize_phi_units(phi, debug=debug)
-        return r, z, phi
-
-    geom = _space_geometry_vectors(f, grp, debug=debug)
-    if geom is not None:
-        r, z, phi = geom
-        phi = _normalize_phi_units(phi, debug=debug)
-        return r, z, phi
-
-    raise RuntimeError(
-        f"Could not find grid_ggd node geometry in /{grp}.\n"
-        "Tried packed nodes: grid_ggd[]&grid_subset[]&element[]&object[]&real\n"
-        "and space geometry: grid_ggd[]&space[]&...&geometry"
-    )
+    return _extract_geometry_for_subset(f, grp, grid_index=1, grid_subset_index=0, debug=debug)
 
 
 # ----------------- values extraction -----------------
@@ -441,7 +691,16 @@ def _read_values(
             ii = max(0, min(ii, a.shape[0] - 1))
         a = a[ii]
 
-    v = np.asarray(a, dtype=float).reshape(-1)
+    a = np.asarray(a, dtype=float)
+    # Important: dump2imas commonly writes shaped IMAS values arrays with Fortran-order
+    # node packing consistent with geometry built via ravel(order="F"). Flattening here
+    # in default C order scrambles values relative to (R,Z,phi) geometry and produces
+    # nonphysical striping/oscillatory contours. Preserve Fortran packing for multidim
+    # arrays; for 1-D arrays this is identical.
+    if a.ndim >= 2:
+        v = np.ravel(a, order="F")
+    else:
+        v = a.reshape(-1)
 
     # Mask common IMAS fill values (e.g. -9e40) and absurd magnitudes
     bad = (~np.isfinite(v)) | (np.abs(v) > 1.0e30) | (v < -8.0e39)
@@ -450,7 +709,7 @@ def _read_values(
         v[bad] = np.nan
 
     if debug:
-        print(f"DEBUG: values_path={values_path} leaf={leaf} n={v.size} ntime={ntime}", file=sys.stderr)
+        print(f"DEBUG: values_path={values_path} leaf={leaf} raw_shape={a.shape} n={v.size} ntime={ntime} flatten={'F' if a.ndim >= 2 else '1d'}", file=sys.stderr)
 
     return v
 
@@ -530,6 +789,37 @@ def _select_phi_plane(r, z, phi, v, phi_index=0, phi_tol=1e-6, min_points=200, d
     nsel = int(sel.sum())
     if debug:
         print(f"DEBUG: phi planes={uniq_bins.size} selected index={k} nsel={nsel} phi_used~{phi_used:g}", file=sys.stderr)
+
+    # Periodic wrap case: the same phi bin can appear in multiple contiguous blocks
+    # (e.g. first and wrap-around toroidal planes both at phi=0).  If we mix those
+    # blocks, duplicate (R,Z) locations with different values produce striping.
+    # Prefer a single contiguous block, typically the first physical plane.
+    if nsel >= min_points:
+        idx_sel_all = np.nonzero(sel)[0]
+        if idx_sel_all.size > 0:
+            gaps = np.where(np.diff(idx_sel_all) > 1)[0]
+            if gaps.size > 0:
+                starts = np.r_[0, gaps + 1]
+                stops = np.r_[gaps + 1, idx_sel_all.size]
+                seg_lengths = stops - starts
+                # Choose the longest contiguous block; tie-break to the first block.
+                ib = int(np.argmax(seg_lengths))
+                if int(seg_lengths[ib]) < nsel:
+                    idx_block = idx_sel_all[starts[ib]:stops[ib]]
+                    if debug:
+                        print(
+                            f"DEBUG: selected phi bin contains {len(seg_lengths)} contiguous blocks; "
+                            f"using block {ib} with n={idx_block.size} (discarding periodic duplicate blocks)",
+                            file=sys.stderr,
+                        )
+                    return (
+                        np.asarray(r).reshape(-1)[idx_block],
+                        np.asarray(z).reshape(-1)[idx_block],
+                        np.asarray(v).reshape(-1)[idx_block],
+                        phi_used,
+                        int(idx_block.size),
+                        idx_block,
+                    )
 
     if nsel < min_points:
         best_i = int(np.argmax(counts))
@@ -740,88 +1030,100 @@ def _plot_tricontour(
 # ----------------- connectivity (optional) -----------------
 
 def _load_tri_connectivity(
-    f: h5py.File, grp: str, n_nodes: int, debug: bool = False
+    f: h5py.File, grp: str, n_nodes: int, debug: bool = False, *, grid_index: int = 1
 ) -> Optional[np.ndarray]:
-    """
-    Load triangle connectivity (nv==3) from IMAS packed grid_ggd.
+    """Load triangle connectivity for node-centered plotting.
 
-    Important: in some outputs the subset axis contains an entry with degenerate
-    connectivity (e.g. all zeros). We select the subset with the lowest fraction
-    of degenerate triangles and with indices compatible with n_nodes.
-
-    Returns triangles as (ntri,3) 0-based, with degenerates removed.
+    Supports both the older packed grid_subset index tree and the DD4+ full-object
+    ``space[].objects_per_dimension[].object[].nodes`` encoding used by recent
+    dump2imas versions.
     """
     idx_path = f"/{grp}/grid_ggd[]&grid_subset[]&element[]&object[]&index"
-    if idx_path not in f:
+    if idx_path in f:
+        conn = np.asarray(f[idx_path][()])
+        conn = np.asarray(conn).squeeze()
+        while conn.ndim > 2 and conn.shape[0] == 1:
+            conn = conn[0]
+
+        candidates: list[tuple[float, int, np.ndarray, int, int]] = []
+        def _prep_candidate(craw: np.ndarray) -> None:
+            if craw.ndim != 2 or craw.shape[1] != 3:
+                return
+            c = np.asarray(craw)
+            cmin = int(np.min(c))
+            cmax = int(np.max(c))
+            is_1based = 0
+            if cmin >= 1 and cmax <= n_nodes:
+                is_1based = 1
+                c0 = c.astype(np.int64) - 1
+            else:
+                c0 = c.astype(np.int64)
+            if c0.size == 0:
+                return
+            if np.min(c0) < 0 or np.max(c0) >= n_nodes:
+                return
+            deg = np.count_nonzero((c0[:, 0] == c0[:, 1]) | (c0[:, 0] == c0[:, 2]) | (c0[:, 1] == c0[:, 2]))
+            deg_ratio = float(deg) / float(c0.shape[0])
+            candidates.append((deg_ratio, int(np.max(c0)), c0, int(np.min(c0)), is_1based))
+
+        if conn.ndim == 3:
+            for s in range(conn.shape[0]):
+                _prep_candidate(conn[s])
+        elif conn.ndim == 2:
+            _prep_candidate(conn)
+
+        if candidates:
+            candidates.sort(key=lambda t: (t[0], -t[1], -t[2].shape[0]))
+            deg_ratio, max_idx, tri, min_idx, is_1based = candidates[0]
+            mask = ~((tri[:, 0] == tri[:, 1]) | (tri[:, 0] == tri[:, 2]) | (tri[:, 1] == tri[:, 2]))
+            tri2 = tri[mask]
+            if debug:
+                print(
+                    f"DEBUG: loaded packed tri connectivity from {idx_path} shape={tri.shape} kept={tri2.shape[0]} "
+                    f"deg_ratio={deg_ratio:.3f} idx_range=[{min_idx},{max_idx}] one_based={bool(is_1based)}",
+                    file=sys.stderr,
+                )
+            if tri2.shape[0] > 0:
+                return tri2
+
+    nodes_path = f"/{grp}/grid_ggd[]&space[]&objects_per_dimension[]&object[]&nodes"
+    sh_path = f"/{grp}/grid_ggd[]&space[]&objects_per_dimension[]&object[]&nodes_SHAPE"
+    if nodes_path not in f:
         return None
-
-    conn = np.asarray(f[idx_path][()])
-    conn = np.asarray(conn).squeeze()
-
-    # Peel leading singleton dims (e.g. grid_index axis)
-    while conn.ndim > 2 and conn.shape[0] == 1:
-        conn = conn[0]
-
-    candidates: list[tuple[float, int, np.ndarray, int, int]] = []  # (deg_ratio, max_idx, tri, min_idx, is_1based)
-    def _prep_candidate(craw: np.ndarray) -> None:
-        if craw.ndim != 2 or craw.shape[1] != 3:
-            return
-        c = np.asarray(craw)
-
-        # Determine 1-based vs 0-based heuristically against n_nodes
-        cmin = int(np.min(c))
-        cmax = int(np.max(c))
-        is_1based = 0
-        if cmin >= 1 and cmax <= n_nodes:
-            is_1based = 1
-            c0 = c.astype(np.int64) - 1
-        else:
-            c0 = c.astype(np.int64)
-
-        # Reject if wildly out of range
-        if c0.size == 0:
-            return
-        if np.min(c0) < 0 or np.max(c0) >= n_nodes:
-            return
-
-        # Degenerate triangles (repeated vertices)
-        deg = np.count_nonzero((c0[:, 0] == c0[:, 1]) | (c0[:, 0] == c0[:, 2]) | (c0[:, 1] == c0[:, 2]))
-        deg_ratio = float(deg) / float(c0.shape[0])
-
-        candidates.append((deg_ratio, int(np.max(c0)), c0, int(np.min(c0)), is_1based))
-
-    if conn.ndim == 3:
-        for s in range(conn.shape[0]):
-            _prep_candidate(conn[s])
-    elif conn.ndim == 2:
-        _prep_candidate(conn)
+    try:
+        obj_nodes = np.asarray(f[nodes_path][()])
+        obj_nodes_sh = np.asarray(f[sh_path][()]) if sh_path in f else None
+    except Exception:
+        return None
+    if obj_nodes.ndim != 5 or obj_nodes.shape[2] < 3:
+        return None
+    gi = max(0, min(int(grid_index) - 1, obj_nodes.shape[0] - 1))
+    faces = np.asarray(obj_nodes[gi, 0, 2], dtype=np.int64)
+    if faces.ndim != 2 or faces.size == 0:
+        return None
+    if obj_nodes_sh is not None and obj_nodes_sh.ndim >= 4:
+        counts = np.asarray(obj_nodes_sh[gi, 0, 2]).reshape(-1).astype(np.int64)
     else:
-        return None
-
-    if not candidates:
+        counts = np.sum(faces > 0, axis=1, dtype=np.int64)
+    tris: list[np.ndarray] = []
+    sel3 = np.where(counts == 3)[0]
+    if sel3.size:
+        tris.append(faces[sel3, :3].astype(np.int64) - 1)
+    sel4 = np.where(counts == 4)[0]
+    if sel4.size:
+        pts = faces[sel4, :4].astype(np.int64) - 1
+        tris.append(np.stack([pts[:, [0, 1, 2]], pts[:, [0, 2, 3]]], axis=1).reshape(-1, 3))
+    if not tris:
         if debug:
-            print(f"DEBUG: no usable tri connectivity candidates under {idx_path}", file=sys.stderr)
+            print(f"DEBUG: no 2D face triangles/quads available under {nodes_path}", file=sys.stderr)
         return None
-
-    # Pick lowest degenerate ratio, then highest max index, then most triangles
-    candidates.sort(key=lambda t: (t[0], -t[1], -t[2].shape[0]))
-    deg_ratio, max_idx, tri, min_idx, is_1based = candidates[0]
-
-    # Remove degenerate triangles explicitly
-    mask = ~((tri[:, 0] == tri[:, 1]) | (tri[:, 0] == tri[:, 2]) | (tri[:, 1] == tri[:, 2]))
-    tri2 = tri[mask]
-
+    tri = np.vstack(tris)
+    good = np.all((tri >= 0) & (tri < n_nodes), axis=1)
+    tri = tri[good]
+    tri = tri[~((tri[:, 0] == tri[:, 1]) | (tri[:, 0] == tri[:, 2]) | (tri[:, 1] == tri[:, 2]))]
     if debug:
-        print(
-            f"DEBUG: loaded tri connectivity from {idx_path} "
-            f"shape={tri.shape} kept={tri2.shape[0]} deg_ratio={deg_ratio:.3f} "
-            f"idx_range=[{min_idx},{max_idx}] one_based={bool(is_1based)}",
-            file=sys.stderr,
-        )
-
-    if tri2.shape[0] == 0:
-        return None
-    return tri2
+        print(f"DEBUG: loaded full-object face connectivity from {nodes_path} triangles={tri.shape[0]}", file=sys.stderr)
+    return tri if tri.size else None
 
 
 def _restrict_and_remap_connectivity(conn: np.ndarray, keep_nodes: np.ndarray) -> np.ndarray:
@@ -966,8 +1268,14 @@ def main() -> int:
             raise
 
         v = _read_values(f, grp, leaf_used, vpath, args.time_index, args.ion_index, clamp_time_index=args.clamp_time_index, debug=args.debug)
+        gidx_leaf, gsidx_leaf = _read_values_grid_binding(f, grp, leaf_used, vpath, debug=args.debug)
 
-        r, z, phi = _extract_geometry(f, grp, debug=args.debug)
+        r, z, phi = _extract_geometry_for_subset(
+            f, grp,
+            grid_index=(gidx_leaf if gidx_leaf is not None else 1),
+            grid_subset_index=(gsidx_leaf if gsidx_leaf is not None else 0),
+            debug=args.debug,
+        )
         r, z, phi, v = _match_geometry_to_values(r, z, phi, v, args.phi_index, args.phi_tol, debug=args.debug)
 
         r2, z2, v2, phi_used, nsel, idx_sel = _select_phi_plane(
@@ -985,14 +1293,22 @@ def main() -> int:
 
         # Connectivity-based triangles if available and applicable
         triangles = None
-        if args.use_connectivity:
-            conn = _load_tri_connectivity(f, grp, nsel, debug=args.debug)
+        if args.use_connectivity and (gsidx_leaf in (None, 0)):
+            conn = _load_tri_connectivity(
+                f, grp, r.size, debug=args.debug,
+                grid_index=(gidx_leaf if gidx_leaf is not None else 1),
+            )
             if conn is not None:
                 keep = np.zeros(r.size, dtype=bool)
                 keep[idx_sel] = True
                 conn2 = _restrict_and_remap_connectivity(conn, keep)
                 if conn2.size:
                     triangles = conn2
+        elif args.use_connectivity and args.debug:
+            print(
+                f"DEBUG: skipping connectivity because values are grid_subset_index={gsidx_leaf} (not node-centered)",
+                file=sys.stderr,
+            )
 
         # Drop NaN/Inf nodes and (if using connectivity) also drop/rewire triangles.
         r3, z3, v3, tri3 = _filter_finite_nodes_and_remap_triangles(

@@ -40,7 +40,10 @@ from nimrod2imas import (
     open_dbentry as _open_db_common,
     ids_factory as _ids_factory_common,
     get_ids as _get_ids_common,
+    VERSION as __version__
 )
+
+VERSION = __version__
 
 from omfit_classes.omfit_eqdsk import OMFITgeqdsk
 from omfit_classes.omfit_osborne import OMFITpFile

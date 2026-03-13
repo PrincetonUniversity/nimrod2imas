@@ -40,7 +40,10 @@ from nimrod2imas import (
     h5_get_first_existing as _h5_get_first_existing_common,
     h5_list_keys as _h5_list_keys_common,
     normalize_out_and_show as _normalize_out_and_show_common,
+    VERSION as __version__
 )
+
+VERSION = __version__
 
 try:
     import imas

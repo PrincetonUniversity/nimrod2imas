@@ -27,6 +27,7 @@ import shlex
 from pathlib import Path
 import xml.etree.ElementTree as ET
 from typing import Any, List, Tuple, Optional
+from nimrod2imas import __version__, VERSION
 
 import numpy as np
 

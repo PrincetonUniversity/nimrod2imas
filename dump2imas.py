@@ -42,8 +42,6 @@ import h5py
 import numpy as np
 import imas
 
-__version__ = "0.3.0"
-
 try:
     import f90nml  # type: ignore
 except Exception:
@@ -58,7 +56,10 @@ from nimrod2imas import (
     namelist_file_to_xml as _namelist_file_to_xml_common,
     update_workflow_and_dataset_fair as _update_workflow_and_dataset_fair_common,
     sanitize_cli_command as _sanitize_cli_command_common,
+    VERSION as __version__
 )
+
+VERSION = __version__
 
 def _import_imas():
     import imas
@@ -647,6 +648,17 @@ def _db_put(db: Any, ids: Any, occ: int) -> None:
         db.put(ids)
 
 
+def _db_put_full_once(db: Any, ids: Any, occ: int) -> None:
+    """Write an initial IDS instance with db.put() (not slice) to force AoS creation."""
+    try:
+        ids.ids_properties.homogeneous_time = 1
+    except Exception:
+        pass
+    try:
+        db.put(ids, occ)
+    except TypeError:
+        db.put(ids)
+
 def _db_put_slice(db: Any, ids: Any, occ: int) -> None:
     """Put a *single* time slice for a homogeneous_time IDS.
 
@@ -701,6 +713,113 @@ def _db_put_slice(db: Any, ids: Any, occ: int) -> None:
     except TypeError:
         db.put(ids)
         return
+
+def _ensure_gridggd_space_identifier(ids: Any, *, name: str = "cyl_rpz", description: str = "Cylindrical coordinates (r,phi,z)", index: int = -1) -> None:
+    """Ensure grid_ggd.space[0].identifier fields are non-empty for AL/HDF5 backends.
+
+    Some AL backends will fail to create the string dataset grid_ggd[]&space[]&identifier&name
+    if all strings are empty in the slice being written.
+    """
+    try:
+        ggd_list = getattr(ids, "grid_ggd", None)
+    except Exception:
+        return
+    if ggd_list is None:
+        return
+
+    # Ensure at least one grid_ggd entry exists in this slice
+    try:
+        if len(ggd_list) == 0:
+            ggd_list.resize(1)
+    except Exception:
+        # cannot resize -> nothing we can do
+        return
+
+    # Assign the grid time (helps tooling pick the correct index)
+    try:
+        t = None
+        try:
+            if hasattr(ids, "time") and len(ids.time) > 0:
+                t = float(ids.time[0])
+        except Exception:
+            t = None
+        if t is not None:
+            try:
+                ggd_list[0].time = t
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        ggd = ggd_list[0]
+    except Exception:
+        return
+
+    # Ensure at least one space entry exists
+    try:
+        if len(ggd.space) == 0:
+            ggd.space.resize(1)
+    except Exception:
+        pass
+
+    try:
+        sp = ggd.space[0]
+    except Exception:
+        return
+
+    # Ensure identifier is non-empty
+    try:
+        sp.identifier.name = str(name)
+    except Exception:
+        pass
+    try:
+        sp.identifier.description = str(description)
+    except Exception:
+        pass
+    try:
+        sp.identifier.index = int(index)
+    except Exception:
+        pass
+
+
+def _ensure_gridggd_exists(ids: Any) -> None:
+    """Ensure at least one grid_ggd entry exists for time-dependent GGD export.
+
+    IMAS-ParaView's get_grid_ggd() returns None if the AoS along the grid path has len()==0.
+    In our pipeline we may patch the heavy geometry/connectivity leaves via h5py, but we must
+    still make the Access Layer create the AoS skeleton (AOS_SHAPE, coordinate arrays, etc.)
+    by ensuring len(grid_ggd) >= 1 at write time.
+    """
+    try:
+        ggd = getattr(ids, "grid_ggd", None)
+    except Exception:
+        ggd = None
+    if ggd is None:
+        return
+    try:
+        if len(ggd) == 0:
+            ggd.resize(1)
+    except Exception:
+        # If this isn't an AoS, nothing to do.
+        return
+    # Ensure a space entry exists so convert.py's _is_grid_valid passes.
+    try:
+        if len(ggd[0].space) == 0:
+            ggd[0].space.resize(1)
+    except Exception:
+        pass
+    # Minimal identifier (avoid empty-string dataset creation in some AL backends).
+    try:
+        sp = ggd[0].space[0]
+        if not getattr(sp.identifier, "name", ""):
+            sp.identifier.name = "cyl_rpz"
+        if not getattr(sp.identifier, "description", ""):
+            sp.identifier.description = "Cylindrical coordinates (r,phi,z)"
+        # index is int, safe
+        sp.identifier.index = int(getattr(sp.identifier, "index", -1) or -1)
+    except Exception:
+        pass
 
 
 def _append_time_equilibrium(eq: Any, t: float) -> int:
@@ -1615,6 +1734,105 @@ def estimate_psi_axis_and_lcfs_robust(
 
     return (float(psi_axis), float(psi_lcfs), f"{tag}|{axis_tag}|{dir_tag}")
 
+def _score_psi_candidate(
+    psi2d: np.ndarray,
+    psi_axis: float,
+    psi_lcfs: float,
+    *,
+    te2d: Optional[np.ndarray] = None,
+    pe2d: Optional[np.ndarray] = None,
+    pr2d: Optional[np.ndarray] = None,
+    nq: Optional[np.ndarray] = None,
+    qe: float = 1.602176634e-19,
+    te_min: float = 20.0,
+) -> dict[str, float]:
+    """Score a candidate psi normalization.
+
+    Higher score is better. The preferred candidate should:
+      - place most plasma-like points inside 0<=psiN<=1,
+      - place the hot core near psiN≈0,
+      - avoid putting the core near or above the LCFS.
+
+    Returns diagnostic metrics used for logging/debugging.
+    """
+    ps = np.asarray(psi2d, dtype=float)
+    out = {
+        'score': -np.inf,
+        'inside_frac': 0.0,
+        'inside_count': 0.0,
+        'base_count': 0.0,
+        'core_med': np.nan,
+        'core_penalty': np.inf,
+    }
+    den = float(psi_lcfs - psi_axis)
+    if (not np.isfinite(den)) or abs(den) < 1e-12:
+        return out
+
+    psn = (ps - float(psi_axis)) / den
+    mpsi = np.isfinite(ps) & np.isfinite(psn)
+
+    ne2d = None
+    if nq is not None:
+        try:
+            A = np.asarray(nq, dtype=float)
+            if A.ndim == 2:
+                ne2d = A
+            elif A.ndim >= 3 and A.shape[-1] >= 1:
+                ne2d = A[..., 0]
+        except Exception:
+            ne2d = None
+
+    base = mpsi.copy()
+    indicator = None
+    if te2d is not None:
+        te = np.asarray(te2d, dtype=float)
+        indicator = te
+        base &= np.isfinite(te) & (te > te_min)
+    elif pe2d is not None and ne2d is not None:
+        pe = np.asarray(pe2d, dtype=float)
+        indicator = np.full_like(pe, np.nan, dtype=float)
+        mm = mpsi & np.isfinite(pe) & np.isfinite(ne2d) & (ne2d > 0.0)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            indicator[mm] = pe[mm] / (ne2d[mm] * float(qe))
+        base &= np.isfinite(indicator) & (indicator > te_min)
+    elif pr2d is not None:
+        pr = np.asarray(pr2d, dtype=float)
+        indicator = pr
+        base &= np.isfinite(pr) & (pr > 0.0)
+    elif ne2d is not None:
+        indicator = ne2d
+        base &= np.isfinite(ne2d) & (ne2d > 0.0)
+
+    if int(np.count_nonzero(base)) < 50:
+        base = mpsi.copy()
+
+    out['base_count'] = float(np.count_nonzero(base))
+    if out['base_count'] <= 0:
+        return out
+
+    inside = base & (psn >= -1e-6) & (psn <= 1.0 + 1e-6)
+    out['inside_count'] = float(np.count_nonzero(inside))
+    out['inside_frac'] = float(out['inside_count'] / max(out['base_count'], 1.0))
+
+    if indicator is not None:
+        ind = np.asarray(indicator, dtype=float)
+        mm = base & np.isfinite(ind)
+        if np.any(mm):
+            qcore = 0.995 if int(np.count_nonzero(mm)) > 5000 else 0.99
+            thr = float(np.nanquantile(ind[mm], qcore))
+            core = mm & (ind >= thr)
+            if int(np.count_nonzero(core)) >= 10:
+                core_med = float(np.nanmedian(psn[core]))
+                out['core_med'] = core_med
+                # Prefer core near 0, strongly penalize core near/outside LCFS.
+                out['core_penalty'] = float(abs(core_med - 0.0))
+
+    # Composite score: primarily maximize how much plasma-like data lies inside [0,1],
+    # then keep the core near psiN=0.
+    core_pen = out['core_penalty'] if np.isfinite(out['core_penalty']) else 10.0
+    out['score'] = float(10.0 * out['inside_frac'] - core_pen)
+    return out
+
 def _resolve_optional_file(args, attr: str, default_name: str) -> Optional[str]:
     """Resolve an optional input file path.
 
@@ -2288,6 +2506,62 @@ def _choose_psi_axis_lcfs(data: Dict[str, Any], args, log: Optional[logging.Logg
             return _finalize(float(psi_axis), float(psi_lcfs_u), f"{tag}|user_te")
 
     # 5) robust fallback
+    # The initial robust guess can still pick the wrong LCFS *direction* relative to the axis
+    # (e.g. choose the PF/SOL branch instead of the LCFS branch). Score both directions and
+    # choose the normalization that keeps the largest plasma-like fraction inside 0<=psiN<=1
+    # while placing the hot core near psiN≈0.
+    pa = float(psi_axis)
+    pb0 = float(psi_lcfs_guess)
+    try:
+        ps = np.asarray(psi2d, dtype=float)
+        mpsi = np.isfinite(ps)
+        vals = ps[mpsi]
+        dv = vals - pa
+        dv_hi = float(np.nanquantile(dv, qedge))
+        dv_lo = float(np.nanquantile(dv, 1.0 - qedge))
+        cand_hi = pa + dv_hi
+        cand_lo = pa + dv_lo
+    except Exception:
+        cand_hi = pb0
+        cand_lo = pb0
+
+    cands = []
+    for name, pb in (("guess", pb0), ("hi", cand_hi), ("lo", cand_lo)):
+        if (not np.isfinite(pb)) or abs(float(pb) - pa) < 1e-12:
+            continue
+        met = _score_psi_candidate(
+            np.asarray(psi2d, dtype=float),
+            pa,
+            float(pb),
+            te2d=np.asarray(te2d, dtype=float) if te2d is not None else None,
+            pe2d=np.asarray(pe2d, dtype=float) if pe2d is not None else None,
+            pr2d=np.asarray(pr2d, dtype=float) if pr2d is not None else None,
+            nq=np.asarray(nq, dtype=float) if nq is not None else None,
+            qe=qe,
+            te_min=te_min,
+        )
+        cands.append((name, float(pb), met))
+
+    if cands:
+        best_name, best_pb, best_met = max(cands, key=lambda x: x[2].get('score', -np.inf))
+        if log is not None:
+            pieces = []
+            for name, pb, met in cands:
+                pieces.append(
+                    f"{name}: lcfs≈{pb:.6g} inside={int(met['inside_count'])}/{int(met['base_count'])}"
+                    f" ({met['inside_frac']:.3f}) core≈{met['core_med']:.3f} score={met['score']:.3f}"
+                )
+            log.info(
+                "LCFS fallback candidates: " + "; ".join(pieces) +
+                f"; chose {best_name} (psi_axis≈{pa:.6g}, psi_lcfs≈{best_pb:.6g})"
+            )
+            if best_met['inside_frac'] < 0.5:
+                log.warning(
+                    f"Suspicious psi normalization after fallback selection: only {best_met['inside_frac']:.1%} "
+                    f"of plasma-like points lie inside 0<=psiN<=1 (axis≈{pa:.6g}, lcfs≈{best_pb:.6g}, tag={tag})"
+                )
+        return _finalize(pa, float(best_pb), tag + f"|fallback:{best_name}")
+
     if log is not None:
         log.info(f"LCFS fallback: psi_axis≈{psi_axis:.6g}, psi_lcfs≈{psi_lcfs_guess:.6g} (tag={tag})")
     return _finalize(float(psi_axis), float(psi_lcfs_guess), tag)
@@ -3273,7 +3547,39 @@ def populate_core_profiles(cp: Any, data: Dict[str, Any], t_index: int, args) ->
 
     kept = int(np.count_nonzero(m))
     if kept < 50:
-        log.warning("core_profiles: too few valid points for 1D averaging (%d); skipping", kept)
+        _diag = []
+        _diag.append(f"psi_window={int(np.count_nonzero(np.isfinite(psi_pol_norm2d) & (psi_pol_norm2d >= 0.0) & (psi_pol_norm2d <= 1.0 + 1e-6)))}/{psi_pol_norm2d.size}")
+        if te2d is not None:
+            _te = np.asarray(te2d, dtype=float)
+            _te_fin = np.isfinite(_te)
+            _te_ok = _te_fin & (_te > te_min)
+            _diag.append(f"Te_present=yes Te_finite={int(np.count_nonzero(_te_fin))}/{_te.size} Te_gt_{te_min:g}eV={int(np.count_nonzero(_te_ok))}/{_te.size}")
+            if not np.count_nonzero(_te_ok):
+                _diag.append("Te failed: no finite points above threshold")
+        else:
+            _diag.append("Te_present=no")
+            if pe2d is not None:
+                _pe = np.asarray(pe2d, dtype=float)
+                _diag.append(f"pe_present=yes pe_finite={int(np.count_nonzero(np.isfinite(_pe)))}/{_pe.size}")
+            else:
+                _diag.append("pe_present=no")
+        if ne2d is not None:
+            _ne = np.asarray(ne2d, dtype=float)
+            _ne_fin = np.isfinite(_ne)
+            _ne_pos = _ne_fin & (_ne > 0.0)
+            _diag.append(f"ne_present=yes ne_finite={int(np.count_nonzero(_ne_fin))}/{_ne.size} ne_positive={int(np.count_nonzero(_ne_pos))}/{_ne.size}")
+            if not np.count_nonzero(_ne_pos):
+                _diag.append("ne failed: no positive finite points")
+        else:
+            _diag.append("ne_present=no")
+        if pr2d is not None:
+            _pr = np.asarray(pr2d, dtype=float)
+            _pr_fin = np.isfinite(_pr)
+            _pr_pos = _pr_fin & (_pr > 0.0)
+            _diag.append(f"pr_present=yes pr_finite={int(np.count_nonzero(_pr_fin))}/{_pr.size} pr_positive={int(np.count_nonzero(_pr_pos))}/{_pr.size}")
+        else:
+            _diag.append("pr_present=no")
+        log.warning("core_profiles: too few valid points for 1D averaging (%d); skipping. %s", kept, "; ".join(_diag))
         return
 
     nbins = int(getattr(args, "nbins", 256) or 256)
@@ -4050,7 +4356,33 @@ def populate_edge_profiles(ep: Any, data: Dict[str, Any], t_index: int, args) ->
 
     kept = int(np.count_nonzero(m))
     if kept < 50:
-        log.warning("edge_profiles: too few valid points for 1D averaging (%d); skipping", kept)
+        _diag = []
+        _diag.append(f"psi_finite={int(np.count_nonzero(np.isfinite(psi_pol_norm2d)))}/{psi_pol_norm2d.size}")
+        _diag.append(f"psi_window_0_to_{xmax:.6g}={int(np.count_nonzero(np.isfinite(psi_pol_norm2d) & (psi_pol_norm2d >= 0.0) & (psi_pol_norm2d <= xmax + 1e-6)))}/{psi_pol_norm2d.size}")
+        if ne2d is not None:
+            _ne = np.asarray(ne2d, dtype=float)
+            _ne_fin = np.isfinite(_ne)
+            _ne_pos = _ne_fin & (_ne > 0.0)
+            _diag.append(f"ne_present=yes ne_finite={int(np.count_nonzero(_ne_fin))}/{_ne.size} ne_positive={int(np.count_nonzero(_ne_pos))}/{_ne.size}")
+            if not np.count_nonzero(_ne_pos):
+                _diag.append("ne failed: no positive finite points")
+        else:
+            _diag.append("ne_present=no")
+        if pr2d is not None:
+            _pr = np.asarray(pr2d, dtype=float)
+            _pr_fin = np.isfinite(_pr)
+            _pr_pos = _pr_fin & (_pr > 0.0)
+            _diag.append(f"pr_present=yes pr_finite={int(np.count_nonzero(_pr_fin))}/{_pr.size} pr_positive={int(np.count_nonzero(_pr_pos))}/{_pr.size}")
+        else:
+            _diag.append("pr_present=no")
+        if te2d is not None:
+            _te = np.asarray(te2d, dtype=float)
+            _te_fin = np.isfinite(_te)
+            _te_pos = _te_fin & (_te > 0.0)
+            _diag.append(f"Te_present=yes Te_finite={int(np.count_nonzero(_te_fin))}/{_te.size} Te_positive={int(np.count_nonzero(_te_pos))}/{_te.size}")
+        else:
+            _diag.append("Te_present=no")
+        log.warning("edge_profiles: too few valid points for 1D averaging (%d); skipping. %s", kept, "; ".join(_diag))
         return
 
     nbins = int(getattr(args, "nbins", 256) or 256)
@@ -4224,6 +4556,31 @@ def _ggd_should_write_grid(args: Any) -> bool:
     if not bool(getattr(args, "ggd_reuse_grid", False)):
         return True
     return bool(getattr(args, "_ggd_write_grid", False))
+
+
+def _ggd_should_write_step(args: Any) -> bool:
+    """Return True if GGD-bearing IDS content should be written for this processed dump.
+
+    When --ggd-write-once is enabled, we keep only the first processed GGD time slice
+    (for example mhd.ggd, core_profiles.ggd, edge_profiles.ggd) and skip GGD writes for
+    all later dumps. The per-file decision is communicated via args._ggd_write_step
+    (set in main()).
+    """
+    if not bool(getattr(args, "ggd_write_once", False)):
+        return True
+    return bool(getattr(args, "_ggd_write_step", False))
+
+
+def _ggd_write_full_objects_enabled(args: Any) -> bool:
+    """Return True when object-based grid_ggd.space.objects_per_dimension should be written.
+
+    Preferred control is --ggd-write-full-objects. Legacy --ggd-representation=full|both
+    is still honored for backward compatibility.
+    """
+    if bool(getattr(args, "ggd_write_full_objects", False)):
+        return True
+    rep = str(getattr(args, "ggd_representation", "packed") or "packed").strip().lower()
+    return rep in ("full", "both")
 
 
 def _append_time_ggd(mhd: Any, t: float, *, write_grid: bool = True, reuse_grid: bool = False) -> tuple[int, int]:
@@ -4536,66 +4893,342 @@ def _gridggd_write_unstructured_grid_subset_imas(
         log.info("IMAS grid_ggd: wrote connectivity subset (Nc=%d, Nv=%d)", n_cells, n_verts)
 
 
+def _gridggd_write_full_objects_imas(
+    g: Any,
+    nodes_xyz: np.ndarray,
+    connectivity: Optional[np.ndarray],
+    *,
+    conn_kind: str | None = None,
+    log: Optional[logging.Logger] = None,
+) -> None:
+    """Populate IMAS object-based ``grid_ggd`` using the IDS API.
+
+    This mirrors the structure expected by IMAS-ParaView:
+      * ``space[0].objects_per_dimension[0].object[*].geometry`` for points
+      * ``space[0].objects_per_dimension[2 or 3].object[*]`` for cells
+      * ``grid_subset[element].object[0]`` as scalar references with
+        ``space``, ``dimension``, and ``index``
+
+    The HDF5-direct full-object writer proved fragile because the backend AoS layout is
+    easy to get subtly wrong. Writing the same structure through the IDS API is slower,
+    but it lets IMAS create the nested AoS metadata consistently.
+    """
+    import numpy as _np
+
+    if log is None:
+        log = logging.getLogger(__name__)
+
+    nodes_xyz = _np.asarray(nodes_xyz, dtype=float)
+    if nodes_xyz.ndim != 2 or nodes_xyz.shape[1] != 3:
+        raise ValueError(f"nodes_xyz must have shape (N,3); got {nodes_xyz.shape}")
+    n_nodes = int(nodes_xyz.shape[0])
+
+    if connectivity is None:
+        connectivity = _np.zeros((0, 0), dtype=_np.int32)
+    else:
+        connectivity = _np.asarray(connectivity, dtype=_np.int32)
+        if connectivity.ndim != 2:
+            raise ValueError(f"connectivity must be 2D; got {connectivity.shape}")
+    n_cells = int(connectivity.shape[0])
+    cell_obj_dim = _ggd_connectivity_object_dimension(conn_kind, connectivity)
+
+    conn_i32 = connectivity.astype(_np.int32, copy=False)
+    if conn_i32.size:
+        try:
+            if int(conn_i32.min()) == 0:
+                conn_i32 = conn_i32 + 1
+        except Exception:
+            pass
+
+    # IMAS-ParaView expects cylindrical coordinates in (r, phi, z) order.
+    geom_rpz = _np.empty((n_nodes, 3), dtype=float)
+    geom_rpz[:, 0] = nodes_xyz[:, 0]
+    geom_rpz[:, 1] = nodes_xyz[:, 2]
+    geom_rpz[:, 2] = nodes_xyz[:, 1]
+
+    try:
+        g.space.resize(1)
+    except Exception:
+        pass
+    sp = g.space[0]
+    try:
+        sp.identifier.name = "cyl_rpz"
+        sp.identifier.index = -1
+        sp.identifier.description = "Cylindrical coordinates (r,phi,z)"
+    except Exception:
+        pass
+    try:
+        sp.coordinates_type.resize(3)
+        for ii, (nm, idxv) in enumerate((("r", 4), ("phi", 5), ("z", 3))):
+            try:
+                sp.coordinates_type[ii].name = nm
+                sp.coordinates_type[ii].index = int(idxv)
+                sp.coordinates_type[ii].description = nm
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        sp.geometry_type.name = "Toroidal"
+        sp.geometry_type.index = -1
+        sp.geometry_type.description = "Toroidal/cylindrical coordinates (r,phi,z)"
+    except Exception:
+        pass
+
+    max_dim = 3 if cell_obj_dim == 3 else 2
+    try:
+        sp.objects_per_dimension.resize(max_dim + 1)
+    except Exception:
+        pass
+
+    # Best-effort labels for each objects_per_dimension entry. These are particularly
+    # important for 3D cells where downstream VTK conversion otherwise has to guess the
+    # cell type from face/boundary payloads alone.
+    try:
+        _opd_labels = _ggd_opd_geometry_labels(conn_kind)
+        for _dim, (_nm, _idx, _desc) in _opd_labels.items():
+            if _dim > max_dim:
+                continue
+            try:
+                _opd = sp.objects_per_dimension[_dim]
+                try:
+                    _opd.geometry_type.name = str(_nm)
+                except Exception:
+                    pass
+                try:
+                    _opd.geometry_type.index = int(_idx)
+                except Exception:
+                    pass
+                try:
+                    _opd.geometry_type.description = str(_desc)
+                except Exception:
+                    pass
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 0D node objects.
+    try:
+        op0 = sp.objects_per_dimension[0]
+        op0.object.resize(n_nodes)
+        for i in range(n_nodes):
+            try:
+                op0.object[i].geometry = geom_rpz[i, :].tolist()
+            except Exception:
+                op0.object[i].geometry = [float(geom_rpz[i, 0]), float(geom_rpz[i, 1]), float(geom_rpz[i, 2])]
+    except Exception as e:
+        raise RuntimeError(f"Failed to populate 0D point objects: {e}") from e
+
+    if cell_obj_dim == 2:
+        try:
+            op2 = sp.objects_per_dimension[2]
+            op2.object.resize(n_cells)
+            for i in range(n_cells):
+                op2.object[i].nodes = conn_i32[i, :].tolist()
+        except Exception as e:
+            raise RuntimeError(f"Failed to populate 2D cell objects: {e}") from e
+    elif cell_obj_dim == 3:
+        face_topology = _ggd_build_face_topology(conn_kind, conn_i32)
+        if face_topology is None:
+            raise RuntimeError("3D full-object export requires face topology, but none could be built")
+        face_nodes = face_topology['face_nodes']
+        face_nodes_shape = face_topology['face_nodes_shape']
+        cell_boundary = face_topology['cell_boundary']
+        cell_boundary_shape = face_topology['cell_boundary_shape']
+        n_faces = int(face_nodes.shape[0])
+        try:
+            op2 = sp.objects_per_dimension[2]
+            op2.object.resize(n_faces)
+            for i in range(n_faces):
+                nf = int(face_nodes_shape[i])
+                op2.object[i].nodes = face_nodes[i, :nf].tolist()
+        except Exception as e:
+            raise RuntimeError(f"Failed to populate 2D face objects: {e}") from e
+        try:
+            op3 = sp.objects_per_dimension[3]
+            op3.object.resize(n_cells)
+            for i in range(n_cells):
+                op3.object[i].nodes = conn_i32[i, :].tolist()
+                nb = int(cell_boundary_shape[i])
+                try:
+                    op3.object[i].boundary.resize(nb)
+                except Exception:
+                    pass
+                for j in range(nb):
+                    try:
+                        op3.object[i].boundary[j].index = int(cell_boundary[i, j])
+                    except Exception:
+                        pass
+                    try:
+                        op3.object[i].boundary[j].dimension = 3
+                    except Exception:
+                        pass
+                    try:
+                        op3.object[i].boundary[j].space = 1
+                    except Exception:
+                        pass
+        except Exception as e:
+            raise RuntimeError(f"Failed to populate 3D cell objects: {e}") from e
+
+    # Subsets should reference the objects_per_dimension entries, not carry packed payloads.
+    try:
+        g.grid_subset.resize(2 if n_cells > 0 else 1)
+    except Exception:
+        pass
+
+    s0 = g.grid_subset[0]
+    try:
+        s0.identifier.name = "nodes"
+        s0.identifier.index = 1
+        s0.identifier.description = "Unstructured nodes"
+        s0.dimension = 1
+    except Exception:
+        pass
+    try:
+        s0.element.resize(n_nodes)
+        for i in range(n_nodes):
+            el = s0.element[i]
+            el.object.resize(1)
+            o = el.object[0]
+            o.space = 1
+            o.dimension = 1
+            o.index = i + 1
+    except Exception as e:
+        raise RuntimeError(f"Failed to populate nodes subset references: {e}") from e
+
+    if n_cells > 0:
+        s1 = g.grid_subset[1]
+        try:
+            s1.identifier.name = "cells"
+            s1.identifier.index = 5
+            s1.identifier.description = "Unstructured cells"
+            s1.dimension = int(cell_obj_dim + 1)
+        except Exception:
+            pass
+        try:
+            s1.element.resize(n_cells)
+            for i in range(n_cells):
+                el = s1.element[i]
+                el.object.resize(1)
+                o = el.object[0]
+                o.space = 1
+                o.dimension = int(cell_obj_dim + 1)
+                o.index = i + 1
+        except Exception as e:
+            raise RuntimeError(f"Failed to populate cells subset references: {e}") from e
+
+    log.info(
+        "IMAS full-object grid_ggd writer: wrote %d nodes and %d cells via IDS API (conn_kind=%s)",
+        n_nodes, n_cells, str(conn_kind or "")
+    )
+
+
 
 def _build_fe_tri_nodes_conn(R2d: "np.ndarray", Z2d: "np.ndarray", nphi: int, phi_list: "np.ndarray") -> tuple["np.ndarray","np.ndarray"]:
-    """
-    Build node coordinates and triangle connectivity for the stitched (R,Z) lattice.
-    - Nodes: full rectangular lattice (nr*nz*nphi), including NaN nodes (kept to preserve indexing).
-    - Connectivity: two triangles per valid quad cell, replicated per phi plane; indices are 0-based here.
+    """Build a toroidally connected triangle surface complex.
+
+    Semantics used here:
+      * ``fe_tri`` is a 2D finite-element connectivity embedded in 3D.
+      * The full triangulated poloidal surface is retained on every toroidal plane.
+      * Every unique 2D mesh edge is extruded between neighbouring toroidal planes and each
+        resulting quad strip is split into two triangles.
+
+    The last item is the key GGD-consistent connectivity requirement for the user's workflow:
+    triangles must be allowed to reference node indices that belong to neighbouring toroidal
+    surfaces, not only to a single poloidal cut. This yields a connected non-manifold surface
+    complex spanning the whole toroidal segment. For a true volumetric toroidal extrusion,
+    use ``fe_wedge`` or ``hex``.
     """
     import numpy as np
+
     R2d = np.asarray(R2d, dtype=float)
     Z2d = np.asarray(Z2d, dtype=float)
     if R2d.shape != Z2d.shape or R2d.ndim != 2:
         raise ValueError(f"R2d and Z2d must be same 2D shape; got {R2d.shape} vs {Z2d.shape}")
-    ny, nx = R2d.shape  # NIMROD internal often (Ny,Nx)
-    nr, nz = nx, ny     # we treat i=R index (fast) and j=Z index (slow) via transpose below
 
-    # Node ordering: i fastest, then j, then k (phi), consistent with node(i,j,k)=k*(nr*nz)+j*nr+i.
-    R = R2d.T.reshape(-1)  # (nr*nz)
-    Z = Z2d.T.reshape(-1)  # (nr*nz)
-    base = np.stack([R, Z], axis=1)  # (nr*nz,2)
+    ny, nx = R2d.shape
+    nr, nz = nx, ny
 
-    # Replicate in phi
+    # Node ordering: i fastest, then j, then k.
+    r_plane = R2d.T.reshape(-1)
+    z_plane = Z2d.T.reshape(-1)
+    base = np.stack([r_plane, z_plane], axis=1)
+
     nphi = int(max(1, nphi))
     phi_list = np.asarray(phi_list, dtype=float)
     if phi_list.size != nphi:
         raise ValueError("phi_list size mismatch")
-    nodes = np.empty((nr*nz*nphi, 3), dtype=np.float64)
-    for k,phi in enumerate(phi_list):
-        sl = slice(k*nr*nz, (k+1)*nr*nz)
-        nodes[sl,0] = base[:,0]
-        nodes[sl,1] = base[:,1]
-        nodes[sl,2] = phi
 
-    # Valid cell mask: all four corners finite.
-    Rm = R2d.T  # (nr,nz)
+    nn2d = int(nr * nz)
+    nodes = np.empty((nn2d * nphi, 3), dtype=np.float64)
+    for k, phi in enumerate(phi_list):
+        sl = slice(k * nn2d, (k + 1) * nn2d)
+        nodes[sl, 0] = base[:, 0]
+        nodes[sl, 1] = base[:, 1]
+        nodes[sl, 2] = phi
+
+    # Build one-plane 2D triangulation.
+    Rm = R2d.T
     Zm = Z2d.T
     finite = np.isfinite(Rm) & np.isfinite(Zm)
-    cell_ok = finite[:-1,:-1] & finite[1:,:-1] & finite[1:,1:] & finite[:-1,1:]
+    cell_ok = finite[:-1, :-1] & finite[1:, :-1] & finite[1:, 1:] & finite[:-1, 1:]
 
-    ii, jj = np.nonzero(cell_ok)  # arrays of length ncell
-    # Corner node ids (0-based) within one phi plane
-    a = jj*nr + ii
-    b = jj*nr + (ii+1)
-    c = (jj+1)*nr + (ii+1)
-    d = (jj+1)*nr + ii
+    ii, jj = np.nonzero(cell_ok)
+    a = jj * nr + ii
+    b = jj * nr + (ii + 1)
+    c = (jj + 1) * nr + (ii + 1)
+    d = (jj + 1) * nr + ii
 
-    # Two tris per cell: (a,b,c) and (a,c,d)
-    tri0 = np.stack([a,b,c], axis=1)
-    tri1 = np.stack([a,c,d], axis=1)
-    tri_plane = np.vstack([tri0, tri1]).astype(np.int32, copy=False)  # (2*ncell,3)
+    # Standard in-plane CCW triangulation on the (R,Z) mesh.
+    # Volumetric face orientation is handled separately in _ggd_build_face_topology.
+    tri0 = np.stack([a, b, c], axis=1)
+    tri1 = np.stack([a, c, d], axis=1)
+    tri_plane = np.vstack([tri0, tri1]).astype(np.int32, copy=False)
 
-    # Replicate per phi plane with offset
+    if tri_plane.size == 0:
+        return nodes, np.zeros((0, 3), dtype=np.int32)
+
+    # Replicate the full poloidal triangulation on every toroidal plane.
+    tri_planes = np.empty((tri_plane.shape[0] * nphi, 3), dtype=np.int32)
+    out = 0
+    for k in range(nphi):
+        off = k * nn2d
+        ntri = tri_plane.shape[0]
+        tri_planes[out:out + ntri, :] = tri_plane + off
+        out += ntri
+
     if nphi == 1:
-        tri = tri_plane
-    else:
-        tri = np.empty((tri_plane.shape[0]*nphi, 3), dtype=np.int32)
-        for k in range(nphi):
-            off = k*(nr*nz)
-            tri[k*tri_plane.shape[0]:(k+1)*tri_plane.shape[0], :] = tri_plane + off
+        return nodes, tri_planes
 
-    return nodes, tri
+    # Collect all unique undirected 2D mesh edges; each gets extruded toroidally.
+    edge_oriented: dict[tuple[int, int], tuple[int, int]] = {}
+    for tri in tri_plane:
+        p0, p1, p2 = int(tri[0]), int(tri[1]), int(tri[2])
+        for u, v in ((p0, p1), (p1, p2), (p2, p0)):
+            key = (u, v) if u < v else (v, u)
+            edge_oriented.setdefault(key, (u, v))
+
+    all_edges = list(edge_oriented.values())
+    if not all_edges:
+        return nodes, tri_planes
+
+    tri_side = np.empty((2 * len(all_edges) * nphi, 3), dtype=np.int32)
+    out = 0
+    for k in range(nphi):
+        kp = (k + 1) % nphi
+        off0 = k * nn2d
+        off1 = kp * nn2d
+        for u, v in all_edges:
+            u0 = u + off0
+            v0 = v + off0
+            u1 = u + off1
+            v1 = v + off1
+            tri_side[out, :] = (u0, v0, v1)
+            tri_side[out + 1, :] = (u0, v1, u1)
+            out += 2
+
+    return nodes, np.vstack([tri_planes, tri_side])
 
 
 def _build_fe_wedge_nodes_conn(
@@ -4873,7 +5506,16 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
             if write_grid and _use_imas_connectivity_writer(args):
                 try:
                     nodes_xyz, connectivity, _meta = _build_unstructured_nodes_connectivity(data, args)
-                    _gridggd_write_unstructured_grid_subset_imas(g, nodes_xyz, connectivity, log=None)
+                    if _ggd_write_full_objects_enabled(args):
+                        _gridggd_write_full_objects_imas(
+                            g,
+                            nodes_xyz,
+                            connectivity,
+                            conn_kind=_meta.get("connectivity_kind"),
+                            log=None,
+                        )
+                    else:
+                        _gridggd_write_unstructured_grid_subset_imas(g, nodes_xyz, connectivity, log=None)
                 except Exception:
                     # Non-fatal; downstream tools may still use the space geometry vectors.
                     pass
@@ -5688,103 +6330,185 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
     # tiny “skeleton” grid_ggd here (fast), and (when --ggd-h5py-direct is
     # used) a packed writer fills the large node/connectivity arrays directly
     # into the produced IDS HDF5.
+    _ggd_unstructured_objspace = False
     if getattr(args, "ggd_unstructured", False):
-        try:
-            g.space.resize(3)
-            # Keep identifiers minimal; geometry will be provided via packed write.
-            for ii, nm in enumerate(["R", "Z", "Phi"]):
+        rep = str(getattr(args, "ggd_representation", "packed") or "packed").lower()
+
+        # For IMAS-ParaView compatibility, write the IMAS-standard object-based GGD representation
+        # (points as 0D objects with geometry, cells as 2D objects with nodes) under space[0].
+        if _ggd_write_full_objects_enabled(args):
+            _ggd_unstructured_objspace = True
+            try:
+                g.space.resize(1)
+                sp = g.space[0]
+                # Space identifier: must be non-empty, otherwise some AL backends attempt to create
+                # a zero-length string dataset and fail (e.g. grid_ggd[]&space[]&identifier&name).
                 try:
-                    g.space[ii].identifier.name = nm
-                    g.space[ii].identifier.index = -1
-                    g.space[ii].identifier.description = nm
+                    sp.identifier.name = "cyl_rpz"
+                    sp.identifier.index = -1
+                    sp.identifier.description = "Cylindrical coordinates (r,phi,z)"
                 except Exception:
                     pass
-        except Exception:
-            pass
 
-        # Minimal grid_subset skeleton (nodes + volumes) to force the backend to create
-        # the relevant datasets. The packed writer will overwrite/resize them.
-        try:
-            g.grid_subset.resize(2)
-
-            # Subset 0: nodes (dimension=0)
-            s0 = g.grid_subset[0]
-            try:
-                s0.dimension = 1
-                s0.identifier.name = "nodes"
-                s0.identifier.index = 1
-                s0.identifier.description = "Unstructured nodes"
-            except Exception:
-                pass
-            try:
-                # Create minimal element AoS; packed writer will create/resize object leaves.
-                # IMPORTANT: keep this non-empty so the HDF5 backend emits AOS_SHAPE datasets.
-                s0.element.resize(1)
+                # Coordinate identifiers: use cylindrical (r,phi,z) so ParaView can convert to x,y,z.
                 try:
-                    s0.element[0].object.resize(3)
-                    for kk in range(3):
+                    sp.coordinates_type.resize(3)
+                    for ii, (nm, idxv) in enumerate([("r", 4), ("phi", 5), ("z", 3)]):
                         try:
-                            s0.element[0].object[kk].real = 0.0
+                            sp.coordinates_type[ii].name = nm
+                            sp.coordinates_type[ii].index = int(idxv)
+                            sp.coordinates_type[ii].description = nm
                         except Exception:
                             pass
                 except Exception:
                     pass
-            except Exception:
-                pass
+                # Avoid triggering the special 'Poloidal' + (r,phi) workaround in IMAS-ParaView.
+                try:
+                    sp.geometry_type.name = "Toroidal"
+                    sp.geometry_type.index = -1
+                    sp.geometry_type.description = "Toroidal/cylindrical coordinates (r,phi,z)"
+                except Exception:
+                    pass
+
+                # Ensure objects_per_dimension exists.
+                try:
+                    sp.objects_per_dimension.resize(4)
+                except Exception:
+                    try:
+                        sp.objects_per_dimension.resize(3)
+                    except Exception:
+                        pass
+
+                # 0D: at least one point object with a non-empty geometry vector so the backend creates geometry datasets.
+                try:
+                    op0 = sp.objects_per_dimension[0]
+                    op0.object.resize(1)
+                    op0.object[0].geometry = [0.0, 0.0, 0.0]
+                except Exception:
+                    pass
+
+                # Highest-dimensional connectivity object: faces for fe_tri, volumes for hex/fe_wedge.
+                try:
+                    _conn_kind_full = str(getattr(args, "ggd_connectivity", "none") or "none").strip().lower()
+                    _cell_dim_full = _ggd_connectivity_object_dimension(_conn_kind_full, None)
+                    _nverts_full = 8 if _conn_kind_full == 'hex' else (6 if _conn_kind_full == 'fe_wedge' else (3 if _conn_kind_full == 'fe_tri' else 3))
+                    op_cell = sp.objects_per_dimension[_cell_dim_full]
+                    op_cell.object.resize(1)
+                    op_cell.object[0].nodes = [1] * int(max(2, _nverts_full))
+                except Exception:
+                    pass
+
+                # Keep only a minimal placeholder here. The real object arrays and subset
+                # references are written after put()/put_slice() by the HDF5 full-object writer.
+                if not _ggd_should_write_grid(args):
+                    try:
+                        g.grid_subset.resize(0)
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
-            # Subset 1: volumes (dimension=3)
-            s1 = g.grid_subset[1]
-            try:
-                s1.dimension = 4
-                s1.identifier.name = "volumes"
-                s1.identifier.index = 43
-                s1.identifier.description = "Unstructured connectivity"
-            except Exception:
-                pass
-            try:
-                # Base points to nodes subset
-                s1.base.resize(1)
-                s1.base[0].index = 0
-                s1.base[0].grid_subset_index = 1
-            except Exception:
-                pass
-            try:
-                # Create minimal element AoS; packed writer will create/resize object leaves.
-                # IMPORTANT: keep this non-empty so the HDF5 backend emits AOS_SHAPE datasets.
-                s1.element.resize(1)
+            # Skip the packed grid_subset skeleton below.
+        else:
                 try:
-                    # vertex count placeholder depends on requested connectivity
-                    _nobj = 8 if conn_kind == 'hex' else (6 if conn_kind == 'fe_wedge' else (3 if conn_kind == 'fe_tri' else 8))
-                    s1.element[0].object.resize(int(_nobj))
-                    for kk in range(int(_nobj)):
+                    g.space.resize(3)
+                    # Keep identifiers minimal; geometry will be provided via packed write.
+                    for ii, nm in enumerate(["R", "Z", "Phi"]):
                         try:
-                            s1.element[0].object[kk].index = 0
+                            g.space[ii].identifier.name = nm
+                            g.space[ii].identifier.index = -1
+                            g.space[ii].identifier.description = nm
                         except Exception:
                             pass
                 except Exception:
                     pass
-            except Exception:
-                pass
-            except Exception:
-                pass
-        except Exception:
-            pass
 
-        if conn_kind == "fe_pointcloud":
-            try:
-                g.grid_subset.resize(1)
-            except Exception:
-                pass
+                # Minimal grid_subset skeleton (nodes + volumes) to force the backend to create
+                # the relevant datasets. The packed writer will overwrite/resize them.
+                try:
+                    g.grid_subset.resize(2)
 
+                    # Subset 0: nodes (dimension=0)
+                    s0 = g.grid_subset[0]
+                    try:
+                        s0.dimension = 1
+                        s0.identifier.name = "nodes"
+                        s0.identifier.index = 1
+                        s0.identifier.description = "Unstructured nodes"
+                    except Exception:
+                        pass
+                    try:
+                        # Create minimal element AoS; packed writer will create/resize object leaves.
+                        # IMPORTANT: keep this non-empty so the HDF5 backend emits AOS_SHAPE datasets.
+                        s0.element.resize(1)
+                        try:
+                            s0.element[0].object.resize(3)
+                            for kk in range(3):
+                                try:
+                                    s0.element[0].object[kk].real = 0.0
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    except Exception:
+                        pass
+
+                    # Subset 1: volumes (dimension=3)
+                    s1 = g.grid_subset[1]
+                    try:
+                        s1.dimension = 4
+                        s1.identifier.name = "volumes"
+                        s1.identifier.index = 43
+                        s1.identifier.description = "Unstructured connectivity"
+                    except Exception:
+                        pass
+                    try:
+                        # Base points to nodes subset
+                        s1.base.resize(1)
+                        s1.base[0].index = 0
+                        s1.base[0].grid_subset_index = 1
+                    except Exception:
+                        pass
+                    try:
+                        # Create minimal element AoS; packed writer will create/resize object leaves.
+                        # IMPORTANT: keep this non-empty so the HDF5 backend emits AOS_SHAPE datasets.
+                        s1.element.resize(1)
+                        try:
+                            # vertex count placeholder depends on requested connectivity
+                            _nobj = 8 if conn_kind == 'hex' else (6 if conn_kind == 'fe_wedge' else (3 if conn_kind == 'fe_tri' else 8))
+                            s1.element[0].object.resize(int(_nobj))
+                            for kk in range(int(_nobj)):
+                                try:
+                                    s1.element[0].object[kk].index = 0
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+                if conn_kind == "fe_pointcloud":
+                    try:
+                        g.grid_subset.resize(1)
+                    except Exception:
+                        pass
         # In unstructured mode we do not attempt to populate the structured axis geometry
         # via space.objects_per_dimension here.
-        nspaces = 3
+        nspaces = (1 if _ggd_unstructured_objspace else 3)
     else:
         nspaces = 3 if nphi > 1 else 2
     try:
-        g.space.resize(nspaces)
+        # IMPORTANT: in object-based unstructured mode, keep exactly one space entry.
+        # Resizing back to 3 here corrupts the HDF5 layout by mixing a 1-space object-based
+        # grid with 3-space structured metadata, which can later crash IMAS on readback.
+        if not _ggd_unstructured_objspace:
+            g.space.resize(nspaces)
     except Exception:
         pass
 
@@ -6640,6 +7364,1229 @@ def _ids_backend_h5_loc(entry_dir: str, ids_name: str, occ: int):
     return cands[0]
 
 
+def _repair_gridggd_root_h5(entry_dir: str, ids_name: str, occ: int, *, times=None, nspace: int = 1, space_names=None, log=None) -> None:
+    """Best-effort post-close repair of the top-level ``grid_ggd`` AoS skeleton.
+
+    The IMAS HDF5 backend occasionally persists nested ``grid_ggd`` leaves while leaving the
+    top-level ``grid_ggd`` AoS empty from the Access-Layer point of view. In that case,
+    ``len(ids.grid_ggd)`` reads back as zero and IMAS-ParaView refuses the grid before it ever
+    inspects any geometry/connectivity leaves.
+
+    This helper creates the minimal canonical datasets needed for the AL to materialize the root
+    AoS on readback:
+      - ``grid_ggd[]&AOS_SHAPE`` with rank 1 and length ``nggd``
+      - ``grid_ggd[]&time``
+      - ``grid_ggd[]&space[]&AOS_SHAPE`` with shape ``(nggd, nspace)``
+
+    It also writes minimal identifier leaves when they are missing, but never overwrites existing
+    identifier datasets.
+    """
+    import os
+    import h5py
+    import numpy as np
+
+    if log is None:
+        log = logging.getLogger(__name__)
+
+    try:
+        h5_path, grp_name = _ids_backend_h5_loc(entry_dir, ids_name, occ)
+    except Exception:
+        return
+    grp_key = grp_name[1:] if str(grp_name).startswith('/') else str(grp_name)
+    if not os.path.exists(h5_path):
+        log.warning("grid_ggd root repair: HDF5 file not found: %s", h5_path)
+        return
+
+    # Determine grid times. Prefer the main IDS homogeneous-time axis when present,
+    # then fall back to the caller-provided list, then to any existing grid_ggd[]&time leaf.
+    tarr = np.asarray([], dtype=np.float64)
+    try:
+        with h5py.File(h5_path, 'r') as h5:
+            if grp_key in h5 and 'time' in h5[grp_key]:
+                _main_t = np.asarray(h5[grp_key]['time'], dtype=np.float64).reshape(-1)
+                if _main_t.size:
+                    tarr = _main_t
+    except Exception:
+        tarr = np.asarray([], dtype=np.float64)
+    if tarr.size == 0 and times is not None:
+        try:
+            _tmp = np.asarray(times, dtype=np.float64).reshape(-1)
+            if _tmp.size:
+                try:
+                    _tmp = np.unique(_tmp)
+                except Exception:
+                    pass
+                tarr = _tmp
+        except Exception:
+            tarr = np.asarray([], dtype=np.float64)
+    if tarr.size == 0:
+        try:
+            with h5py.File(h5_path, 'r') as h5:
+                if grp_key in h5 and 'grid_ggd[]&time' in h5[grp_key]:
+                    tarr = np.asarray(h5[grp_key]['grid_ggd[]&time'], dtype=np.float64).reshape(-1)
+        except Exception:
+            tarr = np.asarray([], dtype=np.float64)
+    if tarr.size == 0:
+        tarr = np.asarray([0.0], dtype=np.float64)
+
+    nggd = max(1, int(tarr.size))
+    nspace = max(1, int(nspace or 1))
+    if space_names is None:
+        if nspace == 1:
+            space_names = ['cyl_rpz']
+        elif nspace == 2:
+            space_names = ['R', 'Z']
+        else:
+            base = ['R', 'Z', 'Phi']
+            if nspace <= len(base):
+                space_names = base[:nspace]
+            else:
+                space_names = base + [f'space_{i+1}' for i in range(len(base), nspace)]
+    else:
+        space_names = [str(x) for x in list(space_names)[:nspace]]
+        if len(space_names) < nspace:
+            space_names.extend([f'space_{i+1}' for i in range(len(space_names), nspace)])
+
+    with h5py.File(h5_path, 'r+') as h5:
+        if grp_key not in h5:
+            log.warning("grid_ggd root repair: group '/%s' not found in %s", grp_key, h5_path)
+            return
+        g = h5[grp_key]
+
+        def _ensure_dataset(name: str, data, *, dtype=None):
+            arr = np.asarray(data, dtype=dtype) if dtype is not None else np.asarray(data)
+            if name in g:
+                ds = g[name]
+                if tuple(ds.shape) != tuple(arr.shape) or (dtype is not None and ds.dtype != np.dtype(dtype)):
+                    try:
+                        del g[name]
+                    except Exception:
+                        pass
+                    g.create_dataset(name, data=arr)
+                else:
+                    ds[...] = arr
+            else:
+                g.create_dataset(name, data=arr)
+
+        # Root AoS must be rank-1 and store the number of grid_ggd entries, not a vector of ones.
+        # For a scalar parent AoS, the canonical HDF5 representation is shape (1,) with value nggd.
+        _ensure_dataset('grid_ggd[]&AOS_SHAPE', np.asarray([nggd], dtype=np.int32), dtype=np.int32)
+        _ensure_dataset('grid_ggd[]&time', tarr.astype(np.float64, copy=False), dtype=np.float64)
+
+        # Minimal space AoS: one row per grid_ggd entry, one column per space entry.
+        _ensure_dataset('grid_ggd[]&space[]&AOS_SHAPE', np.ones((nggd, nspace), dtype=np.int32), dtype=np.int32)
+
+        # Best-effort identifiers. These are not strictly required for len(grid_ggd), but they help
+        # the AL materialize the nested structure consistently and keep downstream tooling happy.
+        str_dt = h5py.string_dtype(encoding='utf-8')
+        def _ensure_text_dataset(name: str, data):
+            arr = np.asarray(data, dtype=object)
+            if name in g:
+                ds = g[name]
+                try:
+                    if tuple(ds.shape) != tuple(arr.shape):
+                        del g[name]
+                        g.create_dataset(name, data=arr, dtype=str_dt)
+                    else:
+                        ds[...] = arr
+                except Exception:
+                    try:
+                        del g[name]
+                    except Exception:
+                        pass
+                    g.create_dataset(name, data=arr, dtype=str_dt)
+            else:
+                g.create_dataset(name, data=arr, dtype=str_dt)
+
+        _ensure_text_dataset('grid_ggd[]&identifier&name', np.asarray([str(ids_name)] * nggd, dtype=object))
+        _ensure_text_dataset('grid_ggd[]&identifier&description', np.asarray(['GGD grid'] * nggd, dtype=object))
+        _ensure_dataset('grid_ggd[]&identifier&index', np.arange(1, nggd + 1, dtype=np.int32), dtype=np.int32)
+
+        names = np.empty((nggd, nspace), dtype=object)
+        desc = np.empty((nggd, nspace), dtype=object)
+        for i in range(nggd):
+            for j in range(nspace):
+                names[i, j] = space_names[j]
+                desc[i, j] = space_names[j]
+        _ensure_text_dataset('grid_ggd[]&space[]&identifier&name', names)
+        _ensure_text_dataset('grid_ggd[]&space[]&identifier&description', desc)
+        idx = np.tile(np.arange(1, nspace + 1, dtype=np.int32).reshape(1, nspace), (nggd, 1))
+        _ensure_dataset('grid_ggd[]&space[]&identifier&index', idx, dtype=np.int32)
+
+
+
+def _repair_gridggd_full_space_meta_h5(entry_dir: str, ids_name: str, occ: int, *, log=None) -> None:
+    """Normalize object-based ``grid_ggd.space[0]`` metadata for IMAS-ParaView.
+
+    In full unstructured mode the canonical layout is a *single* space entry that carries
+    cylindrical coordinate metadata via ``coordinates_type = [r, phi, z]`` and a geometry
+    type such as ``Toroidal``. If the writer later resizes ``space`` back to three entries,
+    the HDF5 backend can persist an inconsistent mix of:
+      * ``space[]&AOS_SHAPE == 1``
+      * ``space[]&identifier&*`` datasets with length 3
+      * missing ``coordinates_type`` / ``geometry_type`` leaves
+
+    That inconsistency can trigger crashes in IMAS-Python before IMAS-ParaView even gets
+    to the geometry arrays. This repair rewrites the space-level metadata into a canonical
+    one-space cylindrical form.
+    """
+    import os
+    import h5py
+    import numpy as np
+
+    if log is None:
+        log = logging.getLogger(__name__)
+
+    try:
+        h5_path, grp_name = _ids_backend_h5_loc(entry_dir, ids_name, occ)
+    except Exception:
+        return
+    grp_key = grp_name[1:] if str(grp_name).startswith('/') else str(grp_name)
+    if not os.path.exists(h5_path):
+        return
+
+    K_GGD_AOS   = 'grid_ggd[]&AOS_SHAPE'
+    K_GGD_TIME  = 'grid_ggd[]&time'
+    K_GEOM      = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&geometry'
+    K_NODES     = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&nodes'
+    K_SPACE_AOS = 'grid_ggd[]&space[]&AOS_SHAPE'
+
+    def _nggd(g) -> int:
+        ng = 1
+        try:
+            if 'time' in g:
+                ds = g['time']
+                ng = max(ng, int(ds.shape[-1] if ds.ndim >= 2 else ds.shape[0]))
+        except Exception:
+            pass
+        try:
+            if K_GGD_TIME in g:
+                ds = g[K_GGD_TIME]
+                ng = max(ng, int(ds.shape[-1] if ds.ndim >= 2 else ds.shape[0]))
+        except Exception:
+            pass
+        try:
+            if K_GGD_AOS in g:
+                arr = np.asarray(g[K_GGD_AOS]).reshape(-1)
+                if arr.size:
+                    ng = max(ng, int(arr.sum() if arr.size > 1 else arr[0]))
+        except Exception:
+            pass
+        try:
+            if K_GEOM in g:
+                ng = max(ng, int(g[K_GEOM].shape[0]))
+        except Exception:
+            pass
+        return max(1, int(ng))
+
+    def _ensure_numeric(g, name: str, arr: np.ndarray, *, dtype):
+        arr = np.asarray(arr, dtype=dtype)
+        if name in g:
+            ds = g[name]
+            try:
+                if tuple(ds.shape) != tuple(arr.shape) or ds.dtype != np.dtype(dtype):
+                    del g[name]
+                    return g.create_dataset(name, data=arr, dtype=np.dtype(dtype))
+                ds[...] = arr
+                return ds
+            except Exception:
+                try:
+                    del g[name]
+                except Exception:
+                    pass
+                return g.create_dataset(name, data=arr, dtype=np.dtype(dtype))
+        return g.create_dataset(name, data=arr, dtype=np.dtype(dtype))
+
+    def _ensure_text(g, name: str, arr):
+        arr = np.asarray(arr, dtype=object)
+        dt = h5py.string_dtype(encoding='utf-8')
+        if name in g:
+            ds = g[name]
+            try:
+                if tuple(ds.shape) != tuple(arr.shape):
+                    del g[name]
+                    return g.create_dataset(name, data=arr, dtype=dt)
+                ds[...] = arr
+                return ds
+            except Exception:
+                try:
+                    del g[name]
+                except Exception:
+                    pass
+                return g.create_dataset(name, data=arr, dtype=dt)
+        return g.create_dataset(name, data=arr, dtype=dt)
+
+    with h5py.File(h5_path, 'r+') as h5:
+        if grp_key not in h5:
+            return
+        g = h5[grp_key]
+        if (K_GEOM not in g) and (K_NODES not in g):
+            return
+
+        nggd = _nggd(g)
+
+        # One canonical space entry.
+        _ensure_numeric(g, K_SPACE_AOS, np.ones((nggd, 1), dtype=np.int32), dtype=np.int32)
+
+        _ensure_text(g, 'grid_ggd[]&space[]&identifier&name', np.full((nggd, 1), 'cyl_rpz', dtype=object))
+        _ensure_text(g, 'grid_ggd[]&space[]&identifier&description', np.full((nggd, 1), 'Cylindrical coordinates (r,phi,z)', dtype=object))
+        _ensure_numeric(g, 'grid_ggd[]&space[]&identifier&index', -np.ones((nggd, 1), dtype=np.int32), dtype=np.int32)
+
+        # coordinates_type = [r, phi, z]
+        _ensure_numeric(g, 'grid_ggd[]&space[]&coordinates_type[]&AOS_SHAPE', np.full((nggd, 1), 3, dtype=np.int32), dtype=np.int32)
+
+        c_names = np.empty((nggd, 1, 3), dtype=object)
+        c_desc  = np.empty((nggd, 1, 3), dtype=object)
+        c_idx   = np.empty((nggd, 1, 3), dtype=np.int32)
+        for gi in range(nggd):
+            c_names[gi, 0, :] = ['r', 'phi', 'z']
+            c_desc[gi, 0, :]  = ['r', 'phi', 'z']
+            c_idx[gi, 0, :]   = [4, 5, 3]
+        _ensure_text(g, 'grid_ggd[]&space[]&coordinates_type[]&name', c_names)
+        _ensure_text(g, 'grid_ggd[]&space[]&coordinates_type[]&description', c_desc)
+        _ensure_numeric(g, 'grid_ggd[]&space[]&coordinates_type[]&index', c_idx, dtype=np.int32)
+
+        # geometry_type per space
+        _ensure_text(g, 'grid_ggd[]&space[]&geometry_type&name', np.full((nggd, 1), 'Toroidal', dtype=object))
+        _ensure_text(g, 'grid_ggd[]&space[]&geometry_type&description', np.full((nggd, 1), 'Toroidal/cylindrical coordinates (r,phi,z)', dtype=object))
+        _ensure_numeric(g, 'grid_ggd[]&space[]&geometry_type&index', -np.ones((nggd, 1), dtype=np.int32), dtype=np.int32)
+
+
+def _repair_gridggd_full_object_aos_h5(entry_dir: str, ids_name: str, occ: int, *, log=None) -> None:
+    """Best-effort post-close repair of object-based ``grid_ggd.space[].objects_per_dimension`` AoS metadata.
+
+    Some IMAS/AL + HDF5 combinations persist the value leaves
+    ``grid_ggd[]&space[]&objects_per_dimension[]&object[]&(geometry|nodes)``
+    and their ``*_SHAPE`` datasets, but omit the corresponding AoS count datasets:
+
+      - ``grid_ggd[]&space[]&objects_per_dimension[]&AOS_SHAPE``
+      - ``grid_ggd[]&space[]&objects_per_dimension[]&object[]&AOS_SHAPE``
+
+    In that case IMAS-Python reconstructs ``len(space.objects_per_dimension)==0`` even though
+    the actual geometry/connectivity arrays exist on disk. This helper recreates those AoS
+    counters from the persisted geometry/nodes leaves.
+    """
+    import os
+    import h5py
+    import numpy as np
+
+    if log is None:
+        log = logging.getLogger(__name__)
+
+    try:
+        h5_path, grp_name = _ids_backend_h5_loc(entry_dir, ids_name, occ)
+    except Exception:
+        return
+    grp_key = grp_name[1:] if str(grp_name).startswith('/') else str(grp_name)
+    if not os.path.exists(h5_path):
+        return
+
+    K_GGD_AOS   = 'grid_ggd[]&AOS_SHAPE'
+    K_GGD_TIME  = 'grid_ggd[]&time'
+    K_SPACE_AOS = 'grid_ggd[]&space[]&AOS_SHAPE'
+    K_OPD_AOS   = 'grid_ggd[]&space[]&objects_per_dimension[]&AOS_SHAPE'
+    K_OBJ_AOS   = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&AOS_SHAPE'
+    K_GEOM      = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&geometry'
+    K_GEOM_SH   = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&geometry_SHAPE'
+    K_NODES     = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&nodes'
+    K_NODES_SH  = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&nodes_SHAPE'
+
+    def _ensure_dataset(g, name: str, arr: np.ndarray, *, dtype=None):
+        arr = np.asarray(arr, dtype=dtype) if dtype is not None else np.asarray(arr)
+        if name in g:
+            ds = g[name]
+            try:
+                if tuple(ds.shape) != tuple(arr.shape) or (dtype is not None and ds.dtype != np.dtype(dtype)):
+                    del g[name]
+                    return g.create_dataset(name, data=arr, dtype=(np.dtype(dtype) if dtype is not None else None))
+                ds[...] = arr
+                return ds
+            except Exception:
+                try:
+                    del g[name]
+                except Exception:
+                    pass
+                return g.create_dataset(name, data=arr, dtype=(np.dtype(dtype) if dtype is not None else None))
+        return g.create_dataset(name, data=arr, dtype=(np.dtype(dtype) if dtype is not None else None))
+
+    def _count_from_shape_leaf(ds, gi: int, space_idx: int, opd_idx: int) -> int:
+        try:
+            arr = np.asarray(ds)
+            if arr.ndim >= 4:
+                sl = arr[gi, space_idx, opd_idx, ...]
+                return int(np.count_nonzero(np.asarray(sl).reshape(-1)))
+        except Exception:
+            pass
+        return 0
+
+    with h5py.File(h5_path, 'r+') as h5:
+        if grp_key not in h5:
+            return
+        g = h5[grp_key]
+
+        if (K_GEOM not in g) and (K_NODES not in g):
+            return
+
+        nggd = 1
+        try:
+            if 'time' in g:
+                tds = g['time']
+                nggd = max(nggd, int(tds.shape[-1] if tds.ndim >= 2 else tds.shape[0]))
+        except Exception:
+            pass
+        try:
+            if K_GGD_TIME in g:
+                tds = g[K_GGD_TIME]
+                nggd = max(nggd, int(tds.shape[-1] if tds.ndim >= 2 else tds.shape[0]))
+        except Exception:
+            pass
+        try:
+            if K_GGD_AOS in g:
+                aos = np.asarray(g[K_GGD_AOS]).reshape(-1)
+                if aos.size:
+                    nggd = max(nggd, int(aos.sum() if aos.size > 1 else aos[0]))
+        except Exception:
+            pass
+        try:
+            if K_GEOM in g:
+                nggd = max(nggd, int(g[K_GEOM].shape[0]))
+        except Exception:
+            pass
+
+        nspace = 1
+        if K_SPACE_AOS in g:
+            try:
+                sds = g[K_SPACE_AOS]
+                if sds.ndim >= 2:
+                    nspace = max(1, int(sds.shape[1]))
+            except Exception:
+                pass
+        elif K_GEOM in g:
+            try:
+                nspace = max(1, int(g[K_GEOM].shape[1]))
+            except Exception:
+                pass
+
+        opd_counts = np.zeros((nggd, nspace, 1), dtype=np.int32)
+        # Both nested AoS count datasets need a trailing singleton axis:
+        #   objects_per_dimension[]&AOS_SHAPE      -> (nggd, nspace, 1)
+        #   objects_per_dimension[]&object[]&AOS_SHAPE -> (nggd, nspace, 4, 1)
+        # Without it, the backend can mis-size every opd.object[] from the first count.
+        obj_counts = np.zeros((nggd, nspace, 4, 1), dtype=np.int32)
+
+        for gi in range(nggd):
+            for si in range(nspace):
+                nonzero_any = False
+                n0 = 0
+                if K_GEOM_SH in g:
+                    n0 = _count_from_shape_leaf(g[K_GEOM_SH], gi, si, 0)
+                if n0 <= 0 and K_GEOM in g:
+                    try:
+                        if K_GEOM_SH in g:
+                            n0 = int(np.count_nonzero(np.asarray(g[K_GEOM_SH][gi, si, 0, ...]).reshape(-1)))
+                        else:
+                            n0 = int(g[K_GEOM].shape[3])
+                    except Exception:
+                        try:
+                            n0 = int(g[K_GEOM].shape[3])
+                        except Exception:
+                            n0 = 0
+                if n0 > 0:
+                    obj_counts[gi, si, 0, 0] = int(n0)
+                    nonzero_any = True
+
+                if K_NODES_SH in g:
+                    try:
+                        arr = np.asarray(g[K_NODES_SH])
+                        if arr.ndim >= 4:
+                            for _opd in range(1, min(arr.shape[2], 4)):
+                                _cnt = int(np.count_nonzero(np.asarray(arr[gi, si, _opd, ...]).reshape(-1)))
+                                if _cnt > 0:
+                                    obj_counts[gi, si, _opd, 0] = int(_cnt)
+                                    nonzero_any = True
+                    except Exception:
+                        pass
+                elif K_NODES in g:
+                    try:
+                        # Fallback: at least preserve one nonzero cell dimension if value leaves exist.
+                        obj_counts[gi, si, 2, 0] = int(g[K_NODES].shape[3])
+                        nonzero_any = bool(g[K_NODES].shape[3] > 0)
+                    except Exception:
+                        pass
+
+                if nonzero_any:
+                    opd_counts[gi, si, 0] = 4
+
+        if np.any(opd_counts > 0):
+            _ensure_dataset(g, K_OPD_AOS, opd_counts, dtype=np.int32)
+            _ensure_dataset(g, K_OBJ_AOS, obj_counts, dtype=np.int32)
+
+
+
+
+def _repair_gridggd_full_boundary_aos_h5(entry_dir: str, ids_name: str, occ: int, *, log=None) -> None:
+    """Best-effort repair of nested ``boundary[]`` AoS counts for full-object GGD grids.
+
+    Some HDF5 backends persist the boundary value leaves
+      ``grid_ggd[]&space[]&objects_per_dimension[]&object[]&boundary[]&(index|space|dimension)``
+    but omit or mis-size the corresponding nested ``boundary[]&AOS_SHAPE`` dataset. In that
+    case IMAS-Python reconstructs ``len(obj.boundary)==0`` even though the face references are
+    present on disk. This helper recreates the per-object boundary counts from nonzero
+    ``boundary[]&index`` entries.
+    """
+    import os
+    import h5py
+    import numpy as np
+
+    if log is None:
+        log = logging.getLogger(__name__)
+
+    try:
+        h5_path, grp_name = _ids_backend_h5_loc(entry_dir, ids_name, occ)
+    except Exception:
+        return
+    grp_key = grp_name[1:] if str(grp_name).startswith('/') else str(grp_name)
+    if not os.path.exists(h5_path):
+        return
+
+    K_BND_AOS = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&boundary[]&AOS_SHAPE'
+    K_BND_INDEX = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&boundary[]&index'
+
+    with h5py.File(h5_path, 'r+') as h5:
+        if grp_key not in h5:
+            return
+        g = h5[grp_key]
+        if K_BND_INDEX not in g:
+            return
+        try:
+            idx = np.asarray(g[K_BND_INDEX], dtype=np.int32)
+        except Exception:
+            return
+        if idx.ndim != 5:
+            return
+        counts = np.count_nonzero(idx, axis=-1, keepdims=True).astype(np.int32)
+        try:
+            if K_BND_AOS in g:
+                ds = g[K_BND_AOS]
+                if tuple(ds.shape) != tuple(counts.shape):
+                    del g[K_BND_AOS]
+                    g.create_dataset(K_BND_AOS, data=counts, dtype=np.int32)
+                else:
+                    ds[...] = counts
+            else:
+                g.create_dataset(K_BND_AOS, data=counts, dtype=np.int32)
+        except Exception as e:
+            log.warning('full grid_ggd boundary AoS repair failed for %s: %s', h5_path, e)
+def _repair_gridggd_two_grid_consistent_h5(entry_dir: str, ids_name: str, occ: int, *, times, log=None) -> None:
+    """Rebuild the entire ``grid_ggd`` tree with a single coherent ``nggd=len(times)``.
+
+    This is a focused post-close repair for homogeneous-time ``mhd`` IDSs where the
+    geometry/connectivity are identical for each time slice, but the HDF5 backend ends up
+    with contradictory leading dimensions across ``grid_ggd`` branches.  The repair makes
+    the root AoS, object-based ``space.objects_per_dimension`` branch, and packed
+    ``grid_subset.element.object`` branch all agree on the same number of ``grid_ggd`` entries.
+
+    Strategy:
+      * infer ``nggd`` from the caller-provided ``times`` only;
+      * read one canonical geometry/connectivity slice from the existing file;
+      * rewrite all GGD metadata/value leaves so their leading dimension is exactly ``nggd``;
+      * mirror the same grid into each ``grid_ggd[itime]`` entry.
+    """
+    import os
+    import h5py
+    import numpy as np
+
+    if log is None:
+        log = logging.getLogger(__name__)
+
+    try:
+        tarr = np.asarray(times, dtype=np.float64).reshape(-1)
+    except Exception:
+        return
+    if tarr.size == 0:
+        return
+    try:
+        tarr = np.unique(tarr)
+    except Exception:
+        pass
+    nggd = int(max(1, tarr.size))
+
+    try:
+        h5_path, grp_name = _ids_backend_h5_loc(entry_dir, ids_name, occ)
+    except Exception:
+        return
+    grp_key = grp_name[1:] if str(grp_name).startswith('/') else str(grp_name)
+    if not os.path.exists(h5_path):
+        return
+
+    K_GGD_AOS   = 'grid_ggd[]&AOS_SHAPE'
+    K_GGD_TIME  = 'grid_ggd[]&time'
+    K_GGD_ID_N  = 'grid_ggd[]&identifier&name'
+    K_GGD_ID_D  = 'grid_ggd[]&identifier&description'
+    K_GGD_ID_I  = 'grid_ggd[]&identifier&index'
+
+    K_SPACE_AOS = 'grid_ggd[]&space[]&AOS_SHAPE'
+    K_SPACE_ID_N = 'grid_ggd[]&space[]&identifier&name'
+    K_SPACE_ID_D = 'grid_ggd[]&space[]&identifier&description'
+    K_SPACE_ID_I = 'grid_ggd[]&space[]&identifier&index'
+    K_COORD_AOS = 'grid_ggd[]&space[]&coordinates_type[]&AOS_SHAPE'
+    K_COORD_N   = 'grid_ggd[]&space[]&coordinates_type[]&name'
+    K_COORD_D   = 'grid_ggd[]&space[]&coordinates_type[]&description'
+    K_COORD_I   = 'grid_ggd[]&space[]&coordinates_type[]&index'
+    K_GEOT_N    = 'grid_ggd[]&space[]&geometry_type&name'
+    K_GEOT_D    = 'grid_ggd[]&space[]&geometry_type&description'
+    K_GEOT_I    = 'grid_ggd[]&space[]&geometry_type&index'
+
+    K_OPD_AOS   = 'grid_ggd[]&space[]&objects_per_dimension[]&AOS_SHAPE'
+    K_OBJ_AOS   = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&AOS_SHAPE'
+    K_GEOM      = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&geometry'
+    K_GEOM_SH   = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&geometry_SHAPE'
+    K_NODES     = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&nodes'
+    K_NODES_SH  = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&nodes_SHAPE'
+
+    K_SUB_AOS   = 'grid_ggd[]&grid_subset[]&AOS_SHAPE'
+    K_SUB_ID_N  = 'grid_ggd[]&grid_subset[]&identifier&name'
+    K_SUB_ID_D  = 'grid_ggd[]&grid_subset[]&identifier&description'
+    K_SUB_ID_I  = 'grid_ggd[]&grid_subset[]&identifier&index'
+    K_SUB_DIM   = 'grid_ggd[]&grid_subset[]&dimension'
+    K_SUB_BASE  = 'grid_ggd[]&grid_subset[]&base[]&AOS_SHAPE'
+    K_ELEM_AOS  = 'grid_ggd[]&grid_subset[]&element[]&AOS_SHAPE'
+    K_EOBJ_AOS  = 'grid_ggd[]&grid_subset[]&element[]&object[]&AOS_SHAPE'
+    K_REAL      = 'grid_ggd[]&grid_subset[]&element[]&object[]&real'
+    K_INDEX     = 'grid_ggd[]&grid_subset[]&element[]&object[]&index'
+
+    def _delete_if_exists(g, name: str):
+        try:
+            if name in g:
+                del g[name]
+        except Exception:
+            pass
+
+    def _write_num(g, name: str, data, *, dtype, chunks=None, maxshape=None):
+        arr = np.asarray(data, dtype=dtype)
+        _delete_if_exists(g, name)
+        kwargs = {'dtype': np.dtype(dtype)}
+        if chunks is not None:
+            kwargs['chunks'] = chunks
+        if maxshape is not None:
+            kwargs['maxshape'] = maxshape
+        g.create_dataset(name, data=arr, **kwargs)
+
+    def _write_text(g, name: str, data, *, chunks=None, maxshape=None):
+        arr = np.asarray(data, dtype=object)
+        _delete_if_exists(g, name)
+        kwargs = {'dtype': h5py.string_dtype(encoding='utf-8')}
+        if chunks is not None:
+            kwargs['chunks'] = chunks
+        if maxshape is not None:
+            kwargs['maxshape'] = maxshape
+        g.create_dataset(name, data=arr, **kwargs)
+
+    def _tile_first_axis(arr: np.ndarray, n0: int) -> np.ndarray:
+        arr = np.asarray(arr)
+        if arr.ndim == 0:
+            return np.repeat(arr.reshape(1), n0, axis=0)
+        if arr.shape[0] == n0:
+            return arr
+        base = arr[:1, ...] if arr.shape[0] >= 1 else np.zeros((1,) + arr.shape[1:], dtype=arr.dtype)
+        return np.repeat(base, n0, axis=0)
+
+    with h5py.File(h5_path, 'r+') as h5:
+        if grp_key not in h5:
+            return
+        g = h5[grp_key]
+
+        # Extract one canonical grid from the existing object-based or packed branches.
+        pts = None
+        conn = None
+        n_verts = 0
+
+        if K_GEOM in g:
+            try:
+                ds = g[K_GEOM]
+                if ds.ndim == 5 and ds.shape[2] >= 1 and ds.shape[3] >= 1 and ds.shape[4] >= 3:
+                    pts = np.asarray(ds[0, 0, 0, :, :3], dtype=np.float64)
+            except Exception:
+                pts = None
+        if pts is None and K_REAL in g:
+            try:
+                ds = g[K_REAL]
+                if ds.ndim == 4 and ds.shape[2] >= 1 and ds.shape[3] >= 3:
+                    pts = np.asarray(ds[0, 0, :, :3], dtype=np.float64)
+            except Exception:
+                pts = None
+
+        if K_NODES in g:
+            try:
+                ds = g[K_NODES]
+                if ds.ndim == 5 and ds.shape[2] >= 3 and ds.shape[3] >= 1:
+                    base = np.asarray(ds[0, 0, 2, :, :], dtype=np.int32)
+                    # Trim trailing all-zero columns if present.
+                    if base.ndim == 2 and base.size:
+                        nzcols = np.where(np.any(base != 0, axis=0))[0]
+                        if nzcols.size:
+                            base = base[:, :int(nzcols[-1]) + 1]
+                    conn = base
+            except Exception:
+                conn = None
+        if conn is None and K_INDEX in g:
+            try:
+                ds = g[K_INDEX]
+                if ds.ndim == 4 and ds.shape[1] >= 2 and ds.shape[2] >= 1:
+                    base = np.asarray(ds[0, 1, :, :], dtype=np.int32)
+                    if base.ndim == 2 and base.size:
+                        nzcols = np.where(np.any(base != 0, axis=0))[0]
+                        if nzcols.size:
+                            base = base[:, :int(nzcols[-1]) + 1]
+                    conn = base
+            except Exception:
+                conn = None
+
+        if pts is None or conn is None or pts.ndim != 2 or pts.shape[1] < 3 or conn.ndim != 2 or conn.shape[0] == 0:
+            log.warning('two-grid grid_ggd repair: could not infer canonical geometry/connectivity from %s', h5_path)
+            return
+
+        pts = np.asarray(pts[:, :3], dtype=np.float64)
+        conn = np.asarray(conn, dtype=np.int32)
+        n_nodes = int(pts.shape[0])
+        n_cells = int(conn.shape[0])
+        n_verts = int(conn.shape[1])
+
+        # --- root and space metadata ---
+        _write_num(g, K_GGD_AOS, np.asarray([nggd], dtype=np.int32), dtype=np.int32, maxshape=(None,))
+        _write_num(g, K_GGD_TIME, tarr.astype(np.float64, copy=False), dtype=np.float64, maxshape=(None,))
+        _write_text(g, K_GGD_ID_N, np.asarray([str(ids_name)] * nggd, dtype=object), maxshape=(None,))
+        _write_text(g, K_GGD_ID_D, np.asarray(['GGD grid'] * nggd, dtype=object), maxshape=(None,))
+        _write_num(g, K_GGD_ID_I, np.arange(1, nggd + 1, dtype=np.int32), dtype=np.int32, maxshape=(None,))
+
+        _write_num(g, K_SPACE_AOS, np.ones((nggd, 1), dtype=np.int32), dtype=np.int32, maxshape=(None, 1))
+        _write_text(g, K_SPACE_ID_N, np.full((nggd, 1), 'cyl_rpz', dtype=object), maxshape=(None, 1))
+        _write_text(g, K_SPACE_ID_D, np.full((nggd, 1), 'Cylindrical coordinates (r,phi,z)', dtype=object), maxshape=(None, 1))
+        _write_num(g, K_SPACE_ID_I, -np.ones((nggd, 1), dtype=np.int32), dtype=np.int32, maxshape=(None, 1))
+
+        _write_num(g, K_COORD_AOS, np.full((nggd, 1), 3, dtype=np.int32), dtype=np.int32, maxshape=(None, 1))
+        c_names = np.empty((nggd, 1, 3), dtype=object)
+        c_desc  = np.empty((nggd, 1, 3), dtype=object)
+        c_idx   = np.empty((nggd, 1, 3), dtype=np.int32)
+        c_names[:, 0, :] = ['r', 'phi', 'z']
+        c_desc[:, 0, :]  = ['r', 'phi', 'z']
+        c_idx[:, 0, :]   = [4, 5, 3]
+        _write_text(g, K_COORD_N, c_names, maxshape=(None, 1, 3))
+        _write_text(g, K_COORD_D, c_desc, maxshape=(None, 1, 3))
+        _write_num(g, K_COORD_I, c_idx, dtype=np.int32, maxshape=(None, 1, 3))
+        _write_text(g, K_GEOT_N, np.full((nggd, 1), 'Toroidal', dtype=object), maxshape=(None, 1))
+        _write_text(g, K_GEOT_D, np.full((nggd, 1), 'Toroidal/cylindrical coordinates (r,phi,z)', dtype=object), maxshape=(None, 1))
+        _write_num(g, K_GEOT_I, -np.ones((nggd, 1), dtype=np.int32), dtype=np.int32, maxshape=(None, 1))
+
+        # --- object-based full branch ---
+        opd_aos = np.full((nggd, 1), 4, dtype=np.int32)
+        obj_aos = np.zeros((nggd, 1, 4), dtype=np.int32)
+        obj_aos[:, 0, 0] = n_nodes
+        obj_aos[:, 0, 2] = n_cells
+        _write_num(g, K_OPD_AOS, opd_aos, dtype=np.int32, maxshape=(None, 1))
+        _write_num(g, K_OBJ_AOS, obj_aos, dtype=np.int32, maxshape=(None, 1, 4))
+
+        geom = np.zeros((nggd, 1, 4, n_nodes, 3), dtype=np.float64)
+        geom[:, 0, 0, :, :] = pts[None, :, :]
+        geom_sh = np.zeros((nggd, 1, 4, n_nodes), dtype=np.int32)
+        geom_sh[:, 0, 0, :] = 3
+        nodes = np.zeros((nggd, 1, 4, n_cells, n_verts), dtype=np.int32)
+        nodes[:, 0, 2, :, :] = conn[None, :, :]
+        nodes_sh = np.zeros((nggd, 1, 4, n_cells), dtype=np.int32)
+        nodes_sh[:, 0, 2, :] = n_verts
+
+        _write_num(g, K_GEOM, geom, dtype=np.float64, chunks=(1, 1, 1, min(65536, max(1, n_nodes)), 3), maxshape=(None, 1, 4, None, 3))
+        _write_num(g, K_GEOM_SH, geom_sh, dtype=np.int32, chunks=(1, 1, 1, min(65536, max(1, n_nodes))), maxshape=(None, 1, 4, None))
+        _write_num(g, K_NODES, nodes, dtype=np.int32, chunks=(1, 1, 1, min(8192, max(1, n_cells)), n_verts), maxshape=(None, 1, 4, None, n_verts))
+        _write_num(g, K_NODES_SH, nodes_sh, dtype=np.int32, chunks=(1, 1, 1, min(8192, max(1, n_cells))), maxshape=(None, 1, 4, None))
+
+        # --- packed grid_subset branch ---
+        # Preserve row-0 metadata when present; otherwise use canonical nodes/volumes values.
+        if K_SUB_ID_N in g:
+            try:
+                sub_names0 = np.asarray(g[K_SUB_ID_N], dtype=object)
+                sub_names = _tile_first_axis(sub_names0, nggd)
+                if sub_names.ndim != 2 or sub_names.shape[1] < 2:
+                    raise ValueError
+                sub_names = sub_names[:, :2]
+            except Exception:
+                sub_names = np.asarray([['nodes', 'volumes']] * nggd, dtype=object)
+        else:
+            sub_names = np.asarray([['nodes', 'volumes']] * nggd, dtype=object)
+
+        if K_SUB_ID_D in g:
+            try:
+                sub_desc0 = np.asarray(g[K_SUB_ID_D], dtype=object)
+                sub_desc = _tile_first_axis(sub_desc0, nggd)
+                if sub_desc.ndim != 2 or sub_desc.shape[1] < 2:
+                    raise ValueError
+                sub_desc = sub_desc[:, :2]
+            except Exception:
+                sub_desc = sub_names.copy()
+        else:
+            sub_desc = sub_names.copy()
+
+        if K_SUB_ID_I in g:
+            try:
+                sub_idx0 = np.asarray(g[K_SUB_ID_I], dtype=np.int32)
+                sub_idx = _tile_first_axis(sub_idx0, nggd)
+                if sub_idx.ndim != 2 or sub_idx.shape[1] < 2:
+                    raise ValueError
+                sub_idx = sub_idx[:, :2]
+            except Exception:
+                sub_idx = np.tile(np.asarray([[1, 43]], dtype=np.int32), (nggd, 1))
+        else:
+            sub_idx = np.tile(np.asarray([[1, 43]], dtype=np.int32), (nggd, 1))
+
+        if K_SUB_DIM in g:
+            try:
+                sub_dim0 = np.asarray(g[K_SUB_DIM], dtype=np.int32)
+                sub_dim = _tile_first_axis(sub_dim0, nggd)
+                if sub_dim.ndim != 2 or sub_dim.shape[1] < 2:
+                    raise ValueError
+                sub_dim = sub_dim[:, :2]
+            except Exception:
+                sub_dim = np.tile(np.asarray([[1, 4]], dtype=np.int32), (nggd, 1))
+        else:
+            sub_dim = np.tile(np.asarray([[1, 4]], dtype=np.int32), (nggd, 1))
+
+        if K_SUB_BASE in g:
+            try:
+                base0 = np.asarray(g[K_SUB_BASE], dtype=np.int32)
+                basev = _tile_first_axis(base0, nggd)
+                if basev.ndim != 3 or basev.shape[1] < 2:
+                    raise ValueError
+                basev = basev[:, :2, :1]
+            except Exception:
+                basev = np.zeros((nggd, 2, 1), dtype=np.int32)
+                basev[:, 1, 0] = 1
+        else:
+            basev = np.zeros((nggd, 2, 1), dtype=np.int32)
+            basev[:, 1, 0] = 1
+
+        _write_num(g, K_SUB_AOS, np.full((nggd, 1), 2, dtype=np.int32), dtype=np.int32, maxshape=(None, 1))
+        _write_text(g, K_SUB_ID_N, sub_names, maxshape=(None, 2))
+        _write_text(g, K_SUB_ID_D, sub_desc, maxshape=(None, 2))
+        _write_num(g, K_SUB_ID_I, sub_idx, dtype=np.int32, maxshape=(None, 2))
+        _write_num(g, K_SUB_DIM, sub_dim, dtype=np.int32, maxshape=(None, 2))
+        _write_num(g, K_SUB_BASE, basev, dtype=np.int32, maxshape=(None, 2, 1))
+
+        elem_aos = np.ones((nggd, 2, 1), dtype=np.int32)
+        eobj_aos = np.zeros((nggd, 2, 1), dtype=np.int32)
+        eobj_aos[:, 0, 0] = 3
+        eobj_aos[:, 1, 0] = n_verts
+        _write_num(g, K_ELEM_AOS, elem_aos, dtype=np.int32, maxshape=(None, 2, 1))
+        _write_num(g, K_EOBJ_AOS, eobj_aos, dtype=np.int32, maxshape=(None, 2, 1))
+
+        real = np.zeros((nggd, 2, n_nodes, 3), dtype=np.float64)
+        real[:, 0, :, :] = pts[None, :, :]
+        index = np.zeros((nggd, 2, n_cells, n_verts), dtype=np.int32)
+        index[:, 1, :, :] = conn[None, :, :]
+        _write_num(g, K_REAL, real, dtype=np.float64, chunks=(1, 1, min(65536, max(1, n_nodes)), 3), maxshape=(None, 2, None, 3))
+        _write_num(g, K_INDEX, index, dtype=np.int32, chunks=(1, 1, min(8192, max(1, n_cells)), n_verts), maxshape=(None, 2, None, n_verts))
+
+
+        log.info('Rebuilt two-grid-consistent grid_ggd tree with nggd=%d in %s (occ=%d)', nggd, h5_path, occ)
+
+
+def _repair_gridggd_three_nested_aos_h5(entry_dir: str, ids_name: str, occ: int, *, times, log=None) -> None:
+    """Force the three nested grid_ggd AoS counters to expose all grids consistently.
+
+    This is a narrow post-close repair on top of the broader two-grid rebuild. It recreates
+    exactly these datasets from the final value-leaf shapes using a coherent leading dimension
+    ``nggd=len(unique(times))``:
+
+      * ``grid_ggd[]&space[]&objects_per_dimension[]&AOS_SHAPE``
+      * ``grid_ggd[]&space[]&objects_per_dimension[]&object[]&AOS_SHAPE``
+      * ``grid_ggd[]&grid_subset[]&element[]&object[]&AOS_SHAPE``
+
+    We intentionally avoid touching unrelated branches here.
+    """
+    import os
+    import h5py
+    import numpy as np
+
+    if log is None:
+        log = logging.getLogger(__name__)
+
+    try:
+        tarr = np.asarray(times, dtype=np.float64).reshape(-1)
+    except Exception:
+        return
+    if tarr.size == 0:
+        return
+    try:
+        tarr = np.unique(tarr)
+    except Exception:
+        pass
+    nggd = int(max(1, tarr.size))
+
+    try:
+        h5_path, grp_name = _ids_backend_h5_loc(entry_dir, ids_name, occ)
+    except Exception:
+        return
+    grp_key = grp_name[1:] if str(grp_name).startswith('/') else str(grp_name)
+    if not os.path.exists(h5_path):
+        return
+
+    K_SPACE_AOS = 'grid_ggd[]&space[]&AOS_SHAPE'
+    K_OPD_AOS   = 'grid_ggd[]&space[]&objects_per_dimension[]&AOS_SHAPE'
+    K_OBJ_AOS   = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&AOS_SHAPE'
+    K_GEOM      = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&geometry'
+    K_GEOM_SH   = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&geometry_SHAPE'
+    K_NODES     = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&nodes'
+    K_NODES_SH  = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&nodes_SHAPE'
+
+    K_SUB_AOS   = 'grid_ggd[]&grid_subset[]&AOS_SHAPE'
+    K_EOBJ_AOS  = 'grid_ggd[]&grid_subset[]&element[]&object[]&AOS_SHAPE'
+    K_REAL      = 'grid_ggd[]&grid_subset[]&element[]&object[]&real'
+    K_INDEX     = 'grid_ggd[]&grid_subset[]&element[]&object[]&index'
+
+    def _delete_if_exists(g, name: str):
+        try:
+            if name in g:
+                del g[name]
+        except Exception:
+            pass
+
+    def _write_num(g, name: str, data, *, dtype, chunks=None, maxshape=None):
+        arr = np.asarray(data, dtype=dtype)
+        _delete_if_exists(g, name)
+        kwargs = {'dtype': np.dtype(dtype)}
+        if chunks is not None:
+            kwargs['chunks'] = chunks
+        if maxshape is not None:
+            kwargs['maxshape'] = maxshape
+        g.create_dataset(name, data=arr, **kwargs)
+
+    with h5py.File(h5_path, 'r+') as h5:
+        if grp_key not in h5:
+            return
+        g = h5[grp_key]
+
+        # Infer nspace from the canonical space AoS values, not the dataset shape.
+        # In IMAS HDF5, AoS datasets often have shape (nggd, 1) while the *values* carry the logical count.
+        nspace = 1
+        try:
+            if K_SPACE_AOS in g:
+                arr = np.asarray(g[K_SPACE_AOS], dtype=np.int32)
+                if arr.size:
+                    nspace = int(np.nanmax(arr))
+        except Exception:
+            nspace = 1
+        nspace = max(1, int(nspace))
+
+        # Infer point/cell counts from the packed value leaves first. These encode the actual object counts.
+        # Do NOT use geometry_SHAPE.shape[3] as a fallback of first resort: for this converter it can reflect
+        # flattened payload size rather than number of objects, which inflates object[]&AOS_SHAPE disastrously.
+        n_nodes = 0
+        n_cells = 0
+        n_verts = 0
+        cell_obj_dim = 2
+        if K_REAL in g:
+            try:
+                ds = g[K_REAL]
+                if ds.ndim >= 4:
+                    n_nodes = int(ds.shape[2])
+            except Exception:
+                n_nodes = 0
+        if n_nodes <= 0 and K_GEOM in g:
+            try:
+                ds = g[K_GEOM]
+                if ds.ndim >= 5:
+                    n_nodes = int(ds.shape[3])
+            except Exception:
+                n_nodes = 0
+        if n_nodes <= 0 and K_GEOM_SH in g:
+            try:
+                ds = g[K_GEOM_SH]
+                if ds.ndim >= 4:
+                    arr = np.asarray(ds, dtype=np.int32)
+                    if arr.size:
+                        # Number of point objects is the count of shape entries for opd=0, not the stored value 3.
+                        n_nodes = int(arr.shape[3])
+            except Exception:
+                n_nodes = 0
+
+        if K_INDEX in g:
+            try:
+                ds = g[K_INDEX]
+                if ds.ndim >= 4:
+                    n_cells = int(ds.shape[2])
+                    n_verts = int(ds.shape[3])
+            except Exception:
+                n_cells = 0
+                n_verts = 0
+        if (n_cells <= 0 or n_verts <= 0) and K_NODES in g:
+            try:
+                ds = g[K_NODES]
+                if ds.ndim >= 5:
+                    n_cells = max(n_cells, int(ds.shape[3]))
+                    n_verts = max(n_verts, int(ds.shape[4]))
+            except Exception:
+                pass
+        if (n_cells <= 0 or n_verts <= 0) and K_NODES_SH in g:
+            try:
+                ds = g[K_NODES_SH]
+                if ds.ndim >= 4:
+                    for _opd in range(min(ds.shape[2], 4) - 1, 0, -1):
+                        arr = np.asarray(ds[0, 0, _opd, :], dtype=np.int32)
+                        nz = arr[arr > 0]
+                        if nz.size:
+                            cell_obj_dim = int(_opd)
+                            n_cells = max(n_cells, int(arr.shape[0]))
+                            n_verts = max(n_verts, int(nz[0]))
+                            break
+            except Exception:
+                pass
+
+        # Canonical values for this converter.
+        n_nodes = max(0, int(n_nodes))
+        n_cells = max(0, int(n_cells))
+        n_verts = max(3, int(n_verts) if int(n_verts) > 0 else 3)
+
+        # 1) objects_per_dimension[] AoS counts: exactly one set of four opds per visible space.
+        opd_aos = np.full((nggd, nspace), 4, dtype=np.int32)
+        _write_num(g, K_OPD_AOS, opd_aos, dtype=np.int32, maxshape=(None, nspace))
+
+        # 2) object[] AoS counts: points in opd=0 and cells in opd=2, for every visible grid.
+        obj_aos = np.zeros((nggd, nspace, 4), dtype=np.int32)
+        obj_aos[:, :, 0] = n_nodes
+        obj_aos[:, :, cell_obj_dim] = n_cells
+        _write_num(g, K_OBJ_AOS, obj_aos, dtype=np.int32, maxshape=(None, nspace, 4))
+
+        # 3) packed grid_subset.element.object[] AoS counts: one object entry per subset, for every grid.
+        nsub = 2
+        try:
+            if K_SUB_AOS in g:
+                arr = np.asarray(g[K_SUB_AOS], dtype=np.int32)
+                if arr.size:
+                    # Like other AoS datasets, the logical subset count is stored in the values, not in shape[1].
+                    nsub = int(np.nanmax(arr))
+        except Exception:
+            nsub = 2
+        nsub = max(1, int(nsub))
+        eobj_aos = np.ones((nggd, nsub, 1), dtype=np.int32)
+        if nsub >= 1:
+            eobj_aos[:, 0, 0] = 3
+        if nsub >= 2:
+            eobj_aos[:, 1, 0] = n_verts
+        _write_num(g, K_EOBJ_AOS, eobj_aos, dtype=np.int32, maxshape=(None, nsub, 1))
+
+
+        log.info('Repaired three nested grid_ggd AoS counters with nggd=%d in %s (occ=%d)', nggd, h5_path, occ)
+
+
+def _finalize_gridggd_object_counts_h5(entry_dir: str, ids_name: str, occ: int, *, times, log=None) -> None:
+    """Last-write-wins override for the two remaining grid_ggd object-count AoS datasets.
+
+    This runs *after* all other grid_ggd repairs and force-writes exact object counts from the
+    final persisted value leaves so earlier in-run writers cannot leave inflated AoS counts behind.
+
+    Rewrites only:
+      * ``grid_ggd[]&space[]&objects_per_dimension[]&object[]&AOS_SHAPE``
+      * ``grid_ggd[]&grid_subset[]&element[]&object[]&AOS_SHAPE``
+    """
+    import os
+    import h5py
+    import numpy as np
+
+    if log is None:
+        log = logging.getLogger(__name__)
+
+    try:
+        tarr = np.asarray(times, dtype=np.float64).reshape(-1)
+    except Exception:
+        return
+    if tarr.size == 0:
+        return
+    try:
+        tarr = np.unique(tarr)
+    except Exception:
+        pass
+    nggd = int(max(1, tarr.size))
+
+    try:
+        h5_path, grp_name = _ids_backend_h5_loc(entry_dir, ids_name, occ)
+    except Exception:
+        return
+    grp_key = grp_name[1:] if str(grp_name).startswith('/') else str(grp_name)
+    if not os.path.exists(h5_path):
+        return
+
+    K_SPACE_AOS = 'grid_ggd[]&space[]&AOS_SHAPE'
+    K_SUB_AOS   = 'grid_ggd[]&grid_subset[]&AOS_SHAPE'
+    K_OBJ_AOS   = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&AOS_SHAPE'
+    K_EOBJ_AOS  = 'grid_ggd[]&grid_subset[]&element[]&object[]&AOS_SHAPE'
+    K_REAL      = 'grid_ggd[]&grid_subset[]&element[]&object[]&real'
+    K_INDEX     = 'grid_ggd[]&grid_subset[]&element[]&object[]&index'
+    K_GEOM      = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&geometry'
+    K_GEOM_SH   = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&geometry_SHAPE'
+    K_NODES     = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&nodes'
+    K_NODES_SH  = 'grid_ggd[]&space[]&objects_per_dimension[]&object[]&nodes_SHAPE'
+
+    def _delete_if_exists(g, name: str):
+        try:
+            if name in g:
+                del g[name]
+        except Exception:
+            pass
+
+    def _write_num(g, name: str, data, *, dtype, maxshape=None):
+        arr = np.asarray(data, dtype=dtype)
+        _delete_if_exists(g, name)
+        kwargs = {'dtype': np.dtype(dtype)}
+        if maxshape is not None:
+            kwargs['maxshape'] = maxshape
+        g.create_dataset(name, data=arr, **kwargs)
+
+    with h5py.File(h5_path, 'r+') as h5:
+        if grp_key not in h5:
+            return
+        g = h5[grp_key]
+
+        nspace = 1
+        try:
+            if K_SPACE_AOS in g:
+                arr = np.asarray(g[K_SPACE_AOS], dtype=np.int32)
+                if arr.size:
+                    nspace = int(np.nanmax(arr))
+        except Exception:
+            nspace = 1
+        nspace = max(1, int(nspace))
+
+        nsub = 2
+        try:
+            if K_SUB_AOS in g:
+                arr = np.asarray(g[K_SUB_AOS], dtype=np.int32)
+                if arr.size:
+                    nsub = int(np.nanmax(arr))
+        except Exception:
+            nsub = 2
+        nsub = max(1, int(nsub))
+
+        # Derive exact object counts from the packed value leaves first.
+        # In this converter, the packed branch remains shape-stable even when the object-based
+        # geometry/nodes leaves become malformed (for example collapsing the opd axis and inflating
+        # counts to nobj*4*3).  The counts we need for object[]&AOS_SHAPE are the number of
+        # points/cells, which are stored directly on the packed leaves:
+        #   real : (nggd, nsub, n_nodes, 3)
+        #   index: (nggd, nsub, n_cells, n_verts)
+        n_nodes = 0
+        n_cells = 0
+        n_verts = 0
+
+        # 1) Prefer packed leaves.
+        try:
+            if K_REAL in g:
+                ds = g[K_REAL]
+                if ds.ndim >= 4 and int(ds.shape[-1]) == 3:
+                    n_nodes = int(ds.shape[-2])
+                elif ds.ndim >= 3 and int(ds.shape[-1]) % 3 == 0:
+                    n_nodes = int(ds.shape[-1] // 3)
+        except Exception:
+            n_nodes = 0
+        try:
+            if K_INDEX in g:
+                ds = g[K_INDEX]
+                if ds.ndim >= 4:
+                    n_cells = int(ds.shape[-2])
+                    n_verts = int(ds.shape[-1])
+                elif ds.ndim >= 3:
+                    n_cells = int(ds.shape[-2])
+                    n_verts = int(ds.shape[-1])
+        except Exception:
+            n_cells = n_cells if n_cells > 0 else 0
+            n_verts = n_verts if n_verts > 0 else 0
+
+        # 2) Fallback to object-based leaves only if packed leaves are absent.
+        if n_nodes <= 0:
+            try:
+                if K_GEOM in g:
+                    ds = g[K_GEOM]
+                    if ds.ndim >= 5 and int(ds.shape[-1]) == 3:
+                        n_nodes = int(ds.shape[-2])
+                    elif ds.ndim >= 4 and int(ds.shape[-1]) == 3:
+                        n_nodes = int(ds.shape[-2])
+            except Exception:
+                n_nodes = 0
+        if n_cells <= 0 or n_verts <= 0:
+            try:
+                if K_NODES in g:
+                    ds = g[K_NODES]
+                    if ds.ndim >= 5:
+                        n_cells = max(n_cells, int(ds.shape[-2]))
+                        n_verts = max(n_verts, int(ds.shape[-1]))
+                    elif ds.ndim >= 4:
+                        n_cells = max(n_cells, int(ds.shape[-2]))
+                        n_verts = max(n_verts, int(ds.shape[-1]))
+            except Exception:
+                pass
+
+        if K_NODES_SH in g:
+            try:
+                ds = g[K_NODES_SH]
+                arr = np.asarray(ds)
+                if arr.ndim >= 4:
+                    for _opd in range(min(arr.shape[2], 4) - 1, 0, -1):
+                        sl = np.asarray(arr[0, 0, _opd, ...]).reshape(-1)
+                        nz = sl[sl > 0]
+                        if nz.size:
+                            cell_obj_dim = int(_opd)
+                            n_cells = max(n_cells, int(arr.shape[-1]))
+                            n_verts = max(n_verts, int(nz[0]))
+                            break
+            except Exception:
+                pass
+
+        # 3) Final fallback to *_SHAPE leaves, but never via nonzero counting over the whole array.
+        if n_nodes <= 0:
+            try:
+                if K_GEOM_SH in g:
+                    ds = g[K_GEOM_SH]
+                    if ds.ndim >= 4:
+                        n_nodes = int(ds.shape[-1])
+            except Exception:
+                n_nodes = 0
+        if n_cells <= 0 or n_verts <= 0:
+            try:
+                if K_NODES_SH in g:
+                    ds = g[K_NODES_SH]
+                    arr = np.asarray(ds)
+                    if arr.ndim >= 4:
+                        n_cells = max(n_cells, int(arr.shape[-1]))
+                        sl = np.asarray(arr[0, 0, cell_obj_dim, ...]).reshape(-1)
+                        nz = sl[sl > 0]
+                        if nz.size:
+                            n_verts = max(n_verts, int(nz[0]))
+            except Exception:
+                pass
+        n_nodes = max(0, int(n_nodes))
+        n_cells = max(0, int(n_cells))
+        n_verts = max(3, int(n_verts) if int(n_verts) > 0 else 3)
+
+        obj_aos = np.zeros((nggd, nspace, 4), dtype=np.int32)
+        obj_aos[:, :, 0] = n_nodes
+        obj_aos[:, :, cell_obj_dim] = n_cells
+        _write_num(g, K_OBJ_AOS, obj_aos, dtype=np.int32, maxshape=(None, nspace, 4))
+
+        eobj_aos = np.ones((nggd, nsub, 1), dtype=np.int32)
+        if nsub >= 1:
+            eobj_aos[:, 0, 0] = 3
+        if nsub >= 2:
+            eobj_aos[:, 1, 0] = n_verts
+        _write_num(g, K_EOBJ_AOS, eobj_aos, dtype=np.int32, maxshape=(None, nsub, 1))
+
+        try:
+            _obj0 = np.asarray(g[K_OBJ_AOS][0, 0, :], dtype=np.int32).tolist()
+        except Exception:
+            _obj0 = None
+        try:
+            _eobj0 = np.asarray(g[K_EOBJ_AOS][0, :, 0], dtype=np.int32).tolist()
+        except Exception:
+            _eobj0 = None
+        log.info('Finalized grid_ggd object-count AoS with nggd=%d, n_nodes=%d, n_cells=%d, n_verts=%d, obj_aos[0]=%s, eobj_aos[0]=%s in %s (occ=%d)', nggd, n_nodes, n_cells, n_verts, _obj0, _eobj0, h5_path, occ)
+
 
 def _write_edge_profiles_electrons_pressure_ggd_h5(entry_dir, occ, *, values_1d, shape_rzp, grid_index=1, grid_subset_index=0, overwrite=True):
     base = 'ggd[]&electrons&pressure[]'
@@ -7346,10 +9293,19 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
             tri = _fe_tri_connectivity_from_mask(mask2d)
 
         if (conn_kind != "fe_pointcloud") and write_grid and _use_imas_connectivity_writer(args):
-            # Slow, DD-aware path: populate grid_ggd.grid_subset connectivity using IMAS objects.
+            # Slow, DD-aware path: populate grid_ggd connectivity using IMAS objects.
             try:
                 nodes_xyz = np.stack((r_nodes, z_nodes, phi_nodes), axis=1).astype(np.float64, copy=False)
-                _gridggd_write_unstructured_grid_subset_imas(g, nodes_xyz, tri, log=None)
+                if _ggd_write_full_objects_enabled(args):
+                    _gridggd_write_full_objects_imas(
+                        g,
+                        nodes_xyz,
+                        tri,
+                        conn_kind="fe_tri",
+                        log=None,
+                    )
+                else:
+                    _gridggd_write_unstructured_grid_subset_imas(g, nodes_xyz, tri, log=None)
             except Exception:
                 # Non-fatal; downstream tools may still use the space geometry vectors.
                 pass
@@ -8396,6 +10352,8 @@ def _build_unstructured_nodes_connectivity(
             kp = (k + 1) % int(nphi)
             for j in range(nz - 1):
                 for i in range(nr - 1):
+                    # Standard base/top quad ordering on the regular (R,Z) product grid.
+                    # Face orientation for volumetric cells is handled in _ggd_build_face_topology.
                     conn[c, 0] = node_index(i, j, k)
                     conn[c, 1] = node_index(i + 1, j, k)
                     conn[c, 2] = node_index(i + 1, j + 1, k)
@@ -8417,6 +10375,8 @@ def _build_unstructured_nodes_connectivity(
         b = jj * nr + (ii + 1)
         c = (jj + 1) * nr + (ii + 1)
         d = (jj + 1) * nr + ii
+        # Standard in-plane CCW triangulation on the (R,Z) product grid.
+        # Volumetric face orientation is handled separately in _ggd_build_face_topology.
         tri0 = np.stack([a, b, c], axis=1)
         tri1 = np.stack([a, c, d], axis=1)
         tri_plane = np.vstack([tri0, tri1]).astype(np.int32, copy=False)  # (ntri,3)
@@ -8461,6 +10421,159 @@ def _build_unstructured_nodes_connectivity(
     }
 
 
+def _ggd_connectivity_object_dimension(conn_kind: str | None, connectivity: "np.ndarray | None" = None) -> int:
+    """Return the objects_per_dimension slot for the cell/element connectivity.
+
+    IMAS uses objects_per_dimension[0]=0D points, [1]=1D lines, [2]=2D faces, [3]=3D volumes.
+    For the NIMROD unstructured exports used here:
+      * fe_tri           -> 2D faces
+      * hex, fe_wedge    -> 3D volumes
+      * line/edge        -> 1D lines
+    When conn_kind is unavailable we fall back to the connectivity vertex count.
+    """
+    kind = str(conn_kind or "").strip().lower()
+    if kind in ("line", "edge", "segment"):
+        return 1
+    if kind in ("tri", "quad", "polygon", "fe_tri"):
+        return 2
+    if kind in ("tet", "tetra", "pyr", "pyramid", "prism", "wedge", "hex", "hexa", "hexahedron", "fe_wedge"):
+        return 3
+
+    try:
+        conn = np.asarray(connectivity) if connectivity is not None else None
+    except Exception:
+        conn = None
+    try:
+        nverts = int(conn.shape[1]) if (conn is not None and conn.ndim == 2) else 0
+    except Exception:
+        nverts = 0
+
+    if nverts <= 0:
+        return 2
+    if nverts <= 2:
+        return 1
+    if nverts in (6, 8):
+        return 3
+    return 2
+
+
+
+
+def _ggd_opd_geometry_labels(conn_kind: str | None) -> dict[int, tuple[str, int, str]]:
+    """Return best-effort geometry labels for objects_per_dimension entries.
+
+    The object-based GGD representation stores heterogeneous object collections per
+    topological dimension.  IMAS-ParaView/imas2vtu can usually infer 0D/1D/2D types from
+    object dimension and connectivity width, but for 3D cells this often remains ambiguous
+    unless the corresponding objects_per_dimension geometry type is labelled explicitly.
+
+    Returned mapping keys are the 0-based objects_per_dimension indices; the integer value is
+    the 1-based IMAS geometry_type index for that object family where known.
+    """
+    kind = str(conn_kind or '').strip().lower()
+    labels: dict[int, tuple[str, int, str]] = {
+        0: ('node', 1, '0D node objects'),
+        1: ('line', 2, '1D line/edge objects'),
+    }
+    if kind in ('fe_tri', 'tri', 'triangle'):
+        labels[2] = ('triangle', 3, '2D triangular face objects')
+    elif kind in ('quad', 'quadrangle'):
+        labels[2] = ('quadrangle', 4, '2D quadrilateral face objects')
+    elif kind in ('fe_wedge', 'wedge', 'prism'):
+        labels[2] = ('triangle', 3, '2D triangular face objects')
+        labels[3] = ('wedge', 7, '3D wedge / triangular-prism cell objects')
+    elif kind in ('hex', 'hexa', 'hexahedron'):
+        labels[2] = ('quadrangle', 4, '2D quadrilateral face objects')
+        labels[3] = ('hexahedron', 8, '3D hexahedral cell objects')
+    else:
+        labels[2] = ('polygon', 0, '2D polygonal face objects')
+        labels[3] = ('polyhedron', 0, '3D polyhedral cell objects')
+    return labels
+
+
+def _ggd_build_face_topology(conn_kind: str | None, connectivity: "np.ndarray") -> dict[str, "np.ndarray"] | None:
+    """Build 2D face objects and 3D cell->face boundary references for volumetric GGD cells.
+
+    Returns ``None`` for non-volumetric connectivities. For supported volumetric connectivities,
+    returns padded arrays suitable for direct HDF5 bulk writing:
+      * face_nodes          : (n_faces, max_face_nodes) int32, 1-based node indices
+      * face_nodes_shape    : (n_faces,) int32, number of nodes per face
+      * cell_boundary       : (n_cells, max_cell_faces) int32, 1-based face indices
+      * cell_boundary_shape : (n_cells,) int32, number of boundary faces per cell
+
+    Important: faces are emitted *per owning cell* rather than globally deduplicated.
+    For polyhedron-style readers, each cell boundary face must carry that cell's own
+    outward orientation. Reusing one shared face object between adjacent cells loses
+    the per-cell orientation and can make volumetric cells unreadable downstream.
+    """
+    import numpy as np
+
+    conn = np.asarray(connectivity, dtype=np.int32)
+    if conn.ndim != 2 or conn.shape[0] == 0:
+        return None
+
+    kind = str(conn_kind or '').strip().lower()
+    nverts = int(conn.shape[1]) if conn.ndim == 2 else 0
+
+    # VTK / polyhedron readers require all boundary faces to have outward-pointing normals.
+    # We therefore keep the base 2D cell ordering conventional in (R,Z), and orient the 3D
+    # cell faces here so the bottom face points toward -phi, the top face toward +phi, and the
+    # side faces are outward.
+    if kind in ('hex', 'hexa', 'hexahedron') or nverts == 8:
+        local_faces = (
+            (0, 3, 2, 1),
+            (4, 5, 6, 7),
+            (0, 1, 5, 4),
+            (1, 2, 6, 5),
+            (2, 3, 7, 6),
+            (3, 0, 4, 7),
+        )
+    elif kind in ('fe_wedge', 'wedge', 'prism') or nverts == 6:
+        local_faces = (
+            (0, 2, 1),
+            (3, 4, 5),
+            (0, 1, 4, 3),
+            (1, 2, 5, 4),
+            (2, 0, 3, 5),
+        )
+    else:
+        return None
+
+    face_nodes_list: list[np.ndarray] = []
+    cell_boundary_list: list[np.ndarray] = []
+
+    for cell in conn:
+        boundary_idx: list[int] = []
+        for lf in local_faces:
+            face_nodes = np.asarray([int(cell[i]) for i in lf], dtype=np.int32)
+            face_nodes_list.append(face_nodes)
+            boundary_idx.append(len(face_nodes_list))  # IMAS uses 1-based indices
+        cell_boundary_list.append(np.asarray(boundary_idx, dtype=np.int32))
+
+    n_faces = len(face_nodes_list)
+    n_cells = len(cell_boundary_list)
+    max_face_nodes = max((len(f) for f in face_nodes_list), default=0)
+    max_cell_faces = max((len(b) for b in cell_boundary_list), default=0)
+
+    face_nodes = np.zeros((n_faces, max_face_nodes), dtype=np.int32)
+    face_nodes_shape = np.zeros((n_faces,), dtype=np.int32)
+    for i, face in enumerate(face_nodes_list):
+        face_nodes[i, :len(face)] = face
+        face_nodes_shape[i] = int(len(face))
+
+    cell_boundary = np.zeros((n_cells, max_cell_faces), dtype=np.int32)
+    cell_boundary_shape = np.zeros((n_cells,), dtype=np.int32)
+    for i, boundary in enumerate(cell_boundary_list):
+        cell_boundary[i, :len(boundary)] = boundary
+        cell_boundary_shape[i] = int(len(boundary))
+
+    return {
+        'face_nodes': face_nodes,
+        'face_nodes_shape': face_nodes_shape,
+        'cell_boundary': cell_boundary,
+        'cell_boundary_shape': cell_boundary_shape,
+    }
+
 def _write_unstructured_ggd_aux_h5(entry_dir: str, ids_name: str, occ: int, data: Dict[str, Any], args) -> None:
     """Populate IMAS-standard grid_ggd structures (h5py direct).
 
@@ -8480,7 +10593,13 @@ def _write_unstructured_ggd_aux_h5(entry_dir: str, ids_name: str, occ: int, data
 
     log = logging.getLogger(__name__)
 
+    rep = str(getattr(args, "ggd_representation", "packed") or "packed").lower().strip()
+
     nodes_xyz, connectivity, meta = _build_unstructured_nodes_connectivity(data, args)
+
+    # In full-object mode we still patch the persisted HDF5 after put()/put_slice().
+    # The IDS-side placeholder scaffolding is only there to make the backend create the
+    # canonical leaves; the real object arrays and subset references are written here.
 
     # 1) Ensure node coordinate vectors are present in grid_ggd.space (portable standard location).
     try:
@@ -8496,12 +10615,40 @@ def _write_unstructured_ggd_aux_h5(entry_dir: str, ids_name: str, occ: int, data
     except Exception as e:
         log.warning("unstructured grid_ggd: failed to write space geometry vectors: %s", e)
 
-    # 2) Populate official grid_ggd grid_subset node coordinates and connectivity.
+    # 2) Write either the packed (grid_subset) or IMAS-ParaView-compatible full-object representation.
+    #    The packed grid_subset writer stores per-element payloads in object[]&real/index leaves,
+    #    while IMAS-ParaView expects grid_subset.element.object to reference objects_per_dimension
+    #    through scalar space/dimension/index leaves. These layouts conflict on the same HDF5 leaf
+    #    names, so the full-object mode must write a dedicated reference-style grid_subset tree
+    #    instead of the packed payload tree.
     if connectivity is not None and int(np.prod(connectivity.shape)) > 0:
-        try:
-            _write_unstructured_gridggd_packed_h5(entry_dir, ids_name, occ, nodes_xyz, connectivity, log=log)
-        except Exception as e:
-            log.warning("unstructured grid_ggd: failed to packed-write grid_subset connectivity: %s", e)
+        if _ggd_write_full_objects_enabled(args):
+            _write_unstructured_gridggd_full_objects_h5(
+                entry_dir,
+                ids_name,
+                occ,
+                nodes_xyz,
+                connectivity,
+                conn_kind=meta.get("connectivity_kind"),
+                log=log,
+            )
+            try:
+                _write_unstructured_gridggd_subset_refs_h5(
+                    entry_dir,
+                    ids_name,
+                    occ,
+                    n_nodes=int(nodes_xyz.shape[0]),
+                    n_cells=int(connectivity.shape[0]),
+                    cell_obj_dim=_ggd_connectivity_object_dimension(meta.get("connectivity_kind"), connectivity),
+                    log=log,
+                )
+            except Exception as e:
+                log.warning("unstructured grid_ggd: failed to write IMAS-ParaView grid_subset references: %s", e)
+        else:
+            try:
+                _write_unstructured_gridggd_packed_h5(entry_dir, ids_name, occ, nodes_xyz, connectivity, log=log)
+            except Exception as e:
+                log.warning("unstructured grid_ggd: failed to packed-write grid_subset connectivity: %s", e)
 
     # 3) Best-effort: patch any missing values_SHAPE datasets for GGD quantity leaves, using
     #    the known (nr,nz,nphi) product-grid shape. (This does *not* affect connectivity.)
@@ -8534,6 +10681,624 @@ def _write_unstructured_ggd_aux_h5(entry_dir: str, ids_name: str, occ: int, data
                                     pass
     except Exception:
         pass
+def _write_unstructured_gridggd_full_objects_h5(
+    entry_dir: str,
+    ids_name: str,
+    occ: int,
+    nodes_xyz: "np.ndarray",
+    connectivity: "np.ndarray",
+    *,
+    conn_kind: str | None = None,
+    log: "logging.Logger | None" = None,
+) -> None:
+    """Write IMAS-ParaView compatible unstructured grid_ggd (object-based) into HDF5."""
+    import os
+    import h5py
+    import numpy as np
+
+    if log is None:
+        log = logging.getLogger(__name__)
+
+    h5_path = os.path.join(entry_dir, f"{ids_name}_{occ}.h5")
+    grp_name = f"{ids_name}_{occ}"
+    if not os.path.exists(h5_path):
+        log.error("full grid_ggd writer: HDF5 file not found: %s", h5_path)
+        return
+
+    nodes_xyz = np.asarray(nodes_xyz)
+    connectivity = np.asarray(connectivity)
+    if nodes_xyz.ndim != 2 or nodes_xyz.shape[1] != 3:
+        raise ValueError(f"nodes_xyz must have shape (N,3); got {nodes_xyz.shape}")
+    if connectivity.ndim != 2:
+        raise ValueError(f"connectivity must be 2D (Ncells,Nverts); got {connectivity.shape}")
+
+    n_nodes = int(nodes_xyz.shape[0])
+    n_cells = int(connectivity.shape[0])
+    n_verts = int(connectivity.shape[1])
+    cell_obj_dim = _ggd_connectivity_object_dimension(conn_kind, connectivity)
+
+    geom_rpz = np.empty((n_nodes, 3), dtype=np.float64)
+    geom_rpz[:, 0] = nodes_xyz[:, 0]
+    geom_rpz[:, 1] = nodes_xyz[:, 2]
+    geom_rpz[:, 2] = nodes_xyz[:, 1]
+
+    conn_i32 = np.asarray(connectivity, dtype=np.int32)
+    try:
+        if conn_i32.size and int(conn_i32.min()) == 0:
+            conn_i32 = conn_i32 + 1
+    except Exception:
+        pass
+
+    face_topology = _ggd_build_face_topology(conn_kind, conn_i32) if cell_obj_dim == 3 else None
+    n_faces = int(face_topology['face_nodes'].shape[0]) if face_topology is not None else 0
+    max_face_nodes = int(face_topology['face_nodes'].shape[1]) if face_topology is not None and face_topology['face_nodes'].ndim == 2 else 0
+    max_cell_faces = int(face_topology['cell_boundary'].shape[1]) if face_topology is not None and face_topology['cell_boundary'].ndim == 2 else 0
+
+    K_GGD_AOS   = "grid_ggd[]&AOS_SHAPE"
+    K_GGD_TIME  = "grid_ggd[]&time"
+    K_SPACE_AOS = "grid_ggd[]&space[]&AOS_SHAPE"
+    K_OPD_AOS   = "grid_ggd[]&space[]&objects_per_dimension[]&AOS_SHAPE"
+    K_OBJ_AOS   = "grid_ggd[]&space[]&objects_per_dimension[]&object[]&AOS_SHAPE"
+    K_GEOM      = "grid_ggd[]&space[]&objects_per_dimension[]&object[]&geometry"
+    K_GEOM_SH   = "grid_ggd[]&space[]&objects_per_dimension[]&object[]&geometry_SHAPE"
+    K_NODES     = "grid_ggd[]&space[]&objects_per_dimension[]&object[]&nodes"
+    K_NODES_SH  = "grid_ggd[]&space[]&objects_per_dimension[]&object[]&nodes_SHAPE"
+    K_BND_AOS   = "grid_ggd[]&space[]&objects_per_dimension[]&object[]&boundary[]&AOS_SHAPE"
+    K_BND_INDEX = "grid_ggd[]&space[]&objects_per_dimension[]&object[]&boundary[]&index"
+    K_BND_SPACE = "grid_ggd[]&space[]&objects_per_dimension[]&object[]&boundary[]&space"
+    K_BND_DIM   = "grid_ggd[]&space[]&objects_per_dimension[]&object[]&boundary[]&dimension"
+
+    def _recreate(g, name, *, shape, maxshape, dtype, chunks=None):
+        try:
+            if name in g:
+                del g[name]
+        except Exception:
+            pass
+        return g.create_dataset(name, shape=shape, maxshape=maxshape, dtype=dtype, chunks=chunks)
+
+    def _ensure_value_leaf(g, name, *, shape, maxshape, dtype, chunks=None, require_ndim=None):
+        if name in g:
+            ds = g[name]
+            try:
+                if require_ndim is not None and ds.ndim != require_ndim:
+                    return _recreate(g, name, shape=shape, maxshape=maxshape, dtype=dtype, chunks=chunks)
+                for ax in range(min(ds.ndim, len(shape))):
+                    if shape[ax] is not None and ds.shape[ax] != shape[ax]:
+                        return _recreate(g, name, shape=shape, maxshape=maxshape, dtype=dtype, chunks=chunks)
+                return ds
+            except Exception:
+                return _recreate(g, name, shape=shape, maxshape=maxshape, dtype=dtype, chunks=chunks)
+        return g.create_dataset(name, shape=shape, maxshape=maxshape, dtype=dtype, chunks=chunks)
+
+    def _nggd_from_file(g) -> int:
+        ng = 1
+        try:
+            if K_GGD_TIME in g:
+                ds = g[K_GGD_TIME]
+                if ds.ndim == 2:
+                    ng = int(ds.shape[1])
+                elif ds.ndim == 1:
+                    ng = int(ds.shape[0])
+        except Exception:
+            pass
+        try:
+            if K_GGD_AOS in g:
+                aos = np.asarray(g[K_GGD_AOS]).ravel()
+                if aos.size:
+                    ng = max(ng, int(aos[0]))
+        except Exception:
+            pass
+        return max(1, int(ng))
+
+    def _set_aos_value(ds, gi: int, value: int, *, space_idx: int | None = None, obj_field: int | None = None):
+        if ds.ndim == 1:
+            ds[gi] = value
+        elif ds.ndim == 2:
+            ds[gi, 0 if space_idx is None else space_idx] = value
+        elif ds.ndim == 3:
+            if obj_field is None:
+                ds[gi, 0 if space_idx is None else space_idx, 0] = value
+            else:
+                ds[gi, 0 if space_idx is None else space_idx, obj_field] = value
+        elif ds.ndim >= 4:
+            if obj_field is None:
+                ds[gi, 0 if space_idx is None else space_idx, 0, 0] = value
+            else:
+                ds[gi, 0 if space_idx is None else space_idx, obj_field, 0] = value
+
+    with h5py.File(h5_path, "r+") as h5:
+        if grp_name not in h5:
+            log.error("full grid_ggd writer: group '/%s' not found in %s", grp_name, h5_path)
+            return
+        g = h5[grp_name]
+        nggd = _nggd_from_file(g)
+
+        if K_GGD_AOS in g:
+            try:
+                ds = g[K_GGD_AOS]
+                ds[...] = 0
+                ds.ravel()[0] = nggd
+            except Exception:
+                pass
+
+        if K_SPACE_AOS in g:
+            try:
+                ds = g[K_SPACE_AOS]
+                ds[...] = 0
+                for gi in range(nggd):
+                    _set_aos_value(ds, gi, 1, space_idx=0)
+            except Exception:
+                pass
+
+        try:
+            opd_counts = np.full((nggd, 1, 1), 4, dtype=np.int32)
+            if K_OPD_AOS in g:
+                try:
+                    del g[K_OPD_AOS]
+                except Exception:
+                    pass
+            g.create_dataset(K_OPD_AOS, data=opd_counts, maxshape=(None, 1, 1), dtype=np.int32)
+        except Exception:
+            pass
+
+        try:
+            # object[] is nested under objects_per_dimension[], so its AoS count must include
+            # an explicit trailing singleton axis: (grid_ggd, space, objects_per_dimension, 1).
+            # A rank-3 layout lets the backend reuse the first count (nodes) for every opd.
+            obj_counts = np.zeros((nggd, 1, 4, 1), dtype=np.int32)
+            obj_counts[:, 0, 0, 0] = n_nodes
+            if face_topology is not None:
+                obj_counts[:, 0, 2, 0] = n_faces
+                obj_counts[:, 0, 3, 0] = n_cells
+            else:
+                obj_counts[:, 0, cell_obj_dim, 0] = n_cells
+            if K_OBJ_AOS in g:
+                try:
+                    del g[K_OBJ_AOS]
+                except Exception:
+                    pass
+            g.create_dataset(K_OBJ_AOS, data=obj_counts, maxshape=(None, 1, 4, 1), dtype=np.int32)
+        except Exception as e:
+            log.warning("full grid_ggd writer: could not set object AOS_SHAPE counts (%s): %s", K_OBJ_AOS, e)
+
+        # Explicit geometry labels per objects_per_dimension. Without these labels the
+        # downstream IMAS-ParaView/imas2vtu conversion may treat 3D objects as generic
+        # polyhedra or unknown VTK cell types and silently drop the volumetric cells.
+        K_OPD_GEOT_N = "grid_ggd[]&space[]&objects_per_dimension[]&geometry_type&name"
+        K_OPD_GEOT_D = "grid_ggd[]&space[]&objects_per_dimension[]&geometry_type&description"
+        K_OPD_GEOT_I = "grid_ggd[]&space[]&objects_per_dimension[]&geometry_type&index"
+        try:
+            _labels = _ggd_opd_geometry_labels(conn_kind)
+            opd_geot_n = np.empty((nggd, 1, 4), dtype=object)
+            opd_geot_d = np.empty((nggd, 1, 4), dtype=object)
+            opd_geot_i = np.zeros((nggd, 1, 4), dtype=np.int32)
+            for _dim in range(4):
+                _nm, _idx, _desc = _labels.get(_dim, ('unspecified', 0, 'unspecified'))
+                opd_geot_n[:, 0, _dim] = str(_nm)
+                opd_geot_d[:, 0, _dim] = str(_desc)
+                opd_geot_i[:, 0, _dim] = int(_idx)
+            if K_OPD_GEOT_N in g:
+                del g[K_OPD_GEOT_N]
+            g.create_dataset(K_OPD_GEOT_N, data=opd_geot_n, dtype=h5py.string_dtype(encoding='utf-8'), maxshape=(None, 1, 4))
+            if K_OPD_GEOT_D in g:
+                del g[K_OPD_GEOT_D]
+            g.create_dataset(K_OPD_GEOT_D, data=opd_geot_d, dtype=h5py.string_dtype(encoding='utf-8'), maxshape=(None, 1, 4))
+            if K_OPD_GEOT_I in g:
+                del g[K_OPD_GEOT_I]
+            g.create_dataset(K_OPD_GEOT_I, data=opd_geot_i, dtype=np.int32, maxshape=(None, 1, 4))
+        except Exception as e:
+            log.warning("full grid_ggd writer: could not set objects_per_dimension geometry_type labels: %s", e)
+
+        dgeom = _ensure_value_leaf(
+            g, K_GEOM,
+            shape=(nggd, 1, 4, 1, 3),
+            maxshape=(None, None, None, None, 3),
+            dtype=np.float64,
+            chunks=(1, 1, 1, 65536, 3),
+            require_ndim=5,
+        )
+        dgeom_sh = _ensure_value_leaf(
+            g, K_GEOM_SH,
+            shape=(nggd, 1, 4, 1),
+            maxshape=(None, None, None, None),
+            dtype=np.int32,
+            chunks=(1, 1, 1, 65536),
+            require_ndim=4,
+        )
+
+        width_nodes = max(3, n_verts, max_face_nodes)
+        if face_topology is not None:
+            n_obj_slots = max(n_nodes, n_faces, n_cells)
+        else:
+            n_obj_slots = max(n_nodes, n_cells)
+
+        dnodes = _ensure_value_leaf(
+            g, K_NODES,
+            shape=(nggd, 1, 4, 1, width_nodes),
+            maxshape=(None, None, None, None, None),
+            dtype=np.int32,
+            chunks=(1, 1, 1, 65536, width_nodes),
+            require_ndim=5,
+        )
+        dnodes_sh = _ensure_value_leaf(
+            g, K_NODES_SH,
+            shape=(nggd, 1, 4, 1),
+            maxshape=(None, None, None, None),
+            dtype=np.int32,
+            chunks=(1, 1, 1, 65536),
+            require_ndim=4,
+        )
+        if dgeom.shape[3] < n_nodes:
+            dgeom.resize((nggd, 1, 4, n_nodes, 3))
+        if dgeom_sh.shape[3] < n_nodes:
+            dgeom_sh.resize((nggd, 1, 4, n_nodes))
+        if dnodes.shape[3] < n_obj_slots or dnodes.shape[4] < width_nodes:
+            dnodes.resize((nggd, 1, 4, max(dnodes.shape[3], n_obj_slots), max(dnodes.shape[4], width_nodes)))
+        if dnodes_sh.shape[3] < n_obj_slots:
+            dnodes_sh.resize((nggd, 1, 4, max(dnodes_sh.shape[3], n_obj_slots)))
+
+        dbnd_aos = None
+        dbnd_idx = None
+        dbnd_space = None
+        dbnd_dim = None
+        if face_topology is not None:
+            _obj_aos_ndim = int(g[K_OBJ_AOS].ndim) if (K_OBJ_AOS in g) else 3
+            if _obj_aos_ndim >= 4:
+                dbnd_aos = _ensure_value_leaf(
+                    g, K_BND_AOS,
+                    shape=(nggd, 1, 4, 1, 1),
+                    maxshape=(None, None, None, None, 1),
+                    dtype=np.int32,
+                    chunks=(1, 1, 1, 65536, 1),
+                    require_ndim=5,
+                )
+            else:
+                dbnd_aos = _ensure_value_leaf(
+                    g, K_BND_AOS,
+                    shape=(nggd, 1, 4, 1),
+                    maxshape=(None, None, None, None),
+                    dtype=np.int32,
+                    chunks=(1, 1, 1, 65536),
+                    require_ndim=4,
+                )
+            dbnd_idx = _ensure_value_leaf(
+                g, K_BND_INDEX,
+                shape=(nggd, 1, 4, 1, max_cell_faces),
+                maxshape=(None, None, None, None, None),
+                dtype=np.int32,
+                chunks=(1, 1, 1, 65536, max_cell_faces),
+                require_ndim=5,
+            )
+            dbnd_space = _ensure_value_leaf(
+                g, K_BND_SPACE,
+                shape=(nggd, 1, 4, 1, max_cell_faces),
+                maxshape=(None, None, None, None, None),
+                dtype=np.int32,
+                chunks=(1, 1, 1, 65536, max_cell_faces),
+                require_ndim=5,
+            )
+            dbnd_dim = _ensure_value_leaf(
+                g, K_BND_DIM,
+                shape=(nggd, 1, 4, 1, max_cell_faces),
+                maxshape=(None, None, None, None, None),
+                dtype=np.int32,
+                chunks=(1, 1, 1, 65536, max_cell_faces),
+                require_ndim=5,
+            )
+            if dbnd_aos.ndim == 5:
+                if dbnd_aos.shape[3] < n_obj_slots:
+                    dbnd_aos.resize((nggd, 1, 4, max(dbnd_aos.shape[3], n_obj_slots), 1))
+            else:
+                if dbnd_aos.shape[3] < n_obj_slots:
+                    dbnd_aos.resize((nggd, 1, 4, max(dbnd_aos.shape[3], n_obj_slots)))
+            if dbnd_idx.shape[3] < n_obj_slots or dbnd_idx.shape[4] < max_cell_faces:
+                dbnd_idx.resize((nggd, 1, 4, max(dbnd_idx.shape[3], n_obj_slots), max(dbnd_idx.shape[4], max_cell_faces)))
+            if dbnd_space.shape[3] < n_obj_slots or dbnd_space.shape[4] < max_cell_faces:
+                dbnd_space.resize((nggd, 1, 4, max(dbnd_space.shape[3], n_obj_slots), max(dbnd_space.shape[4], max_cell_faces)))
+            if dbnd_dim.shape[3] < n_obj_slots or dbnd_dim.shape[4] < max_cell_faces:
+                dbnd_dim.resize((nggd, 1, 4, max(dbnd_dim.shape[3], n_obj_slots), max(dbnd_dim.shape[4], max_cell_faces)))
+
+        step = 500_000
+        for gi in range(nggd):
+            for i0 in range(0, n_nodes, step):
+                i1 = min(i0 + step, n_nodes)
+                dgeom[gi, 0, 0, i0:i1, :3] = geom_rpz[i0:i1, :3]
+            dgeom_sh[gi, 0, 0, :n_nodes] = 3
+
+            try:
+                dnodes[gi, 0, :, :, :] = 0
+            except Exception:
+                pass
+            try:
+                dnodes_sh[gi, 0, :, :] = 0
+            except Exception:
+                pass
+            if dbnd_aos is not None:
+                try:
+                    if dbnd_aos.ndim == 5:
+                        dbnd_aos[gi, 0, :, :, :] = 0
+                    else:
+                        dbnd_aos[gi, 0, :, :] = 0
+                except Exception:
+                    pass
+            if dbnd_idx is not None:
+                try:
+                    dbnd_idx[gi, 0, :, :, :] = 0
+                except Exception:
+                    pass
+            if dbnd_space is not None:
+                try:
+                    dbnd_space[gi, 0, :, :, :] = 0
+                except Exception:
+                    pass
+            if dbnd_dim is not None:
+                try:
+                    dbnd_dim[gi, 0, :, :, :] = 0
+                except Exception:
+                    pass
+
+            for i0 in range(0, n_nodes, step):
+                i1 = min(i0 + step, n_nodes)
+                dnodes[gi, 0, 0, i0:i1, 0] = np.arange(i0 + 1, i1 + 1, dtype=np.int32)
+            dnodes_sh[gi, 0, 0, :n_nodes] = 1
+
+            if face_topology is not None:
+                face_nodes = face_topology['face_nodes']
+                face_nodes_shape = face_topology['face_nodes_shape']
+                for i0 in range(0, n_faces, step):
+                    i1 = min(i0 + step, n_faces)
+                    dnodes[gi, 0, 2, i0:i1, :face_nodes.shape[1]] = face_nodes[i0:i1, :]
+                dnodes_sh[gi, 0, 2, :n_faces] = face_nodes_shape
+
+                nk = min(dnodes.shape[4], n_verts)
+                for i0 in range(0, n_cells, step):
+                    i1 = min(i0 + step, n_cells)
+                    dnodes[gi, 0, 3, i0:i1, :nk] = conn_i32[i0:i1, :nk]
+                dnodes_sh[gi, 0, 3, :n_cells] = int(n_verts)
+
+                cell_boundary = face_topology['cell_boundary']
+                cell_boundary_shape = face_topology['cell_boundary_shape']
+                for i0 in range(0, n_cells, step):
+                    i1 = min(i0 + step, n_cells)
+                    nb = cell_boundary.shape[1]
+                    dbnd_idx[gi, 0, 3, i0:i1, :nb] = cell_boundary[i0:i1, :]
+                    dbnd_space[gi, 0, 3, i0:i1, :nb] = 1
+                    dbnd_dim[gi, 0, 3, i0:i1, :nb] = 3
+                if dbnd_aos.ndim == 5:
+                    dbnd_aos[gi, 0, 3, :n_cells, 0] = cell_boundary_shape
+                else:
+                    dbnd_aos[gi, 0, 3, :n_cells] = cell_boundary_shape
+            else:
+                nk = min(dnodes.shape[4], n_verts)
+                for i0 in range(0, n_cells, step):
+                    i1 = min(i0 + step, n_cells)
+                    dnodes[gi, 0, cell_obj_dim, i0:i1, :nk] = conn_i32[i0:i1, :nk]
+                dnodes_sh[gi, 0, cell_obj_dim, :n_cells] = int(n_verts)
+
+        try:
+            _obj_ds = g[K_OBJ_AOS]
+            if _obj_ds.ndim == 4:
+                _obj_counts_sample = _obj_ds[0, 0, :, 0].tolist()
+            else:
+                _obj_counts_sample = _obj_ds[0, 0, :].tolist()
+            log.info("full grid_ggd writer: object-count sample per dimension = %s", _obj_counts_sample)
+        except Exception:
+            pass
+        try:
+            _labels = _ggd_opd_geometry_labels(conn_kind)
+            _sample = {int(k): {'name': v[0], 'index': int(v[1])} for k, v in _labels.items()}
+            log.info("full grid_ggd writer: objects_per_dimension geometry labels = %s", _sample)
+        except Exception:
+            pass
+
+        if face_topology is not None:
+            log.info(
+                "Wrote object-based grid_ggd geometry/faces/volumes for %d grid indices into %s (occ=%d; nodes=%d; faces=%d; cells=%d)",
+                nggd, h5_path, occ, n_nodes, n_faces, n_cells
+            )
+        else:
+            log.info("Wrote object-based grid_ggd geometry/nodes for %d grid indices into %s (occ=%d)", nggd, h5_path, occ)
+
+def _write_unstructured_gridggd_subset_refs_h5(
+    entry_dir: str,
+    ids_name: str,
+    occ: int,
+    *,
+    n_nodes: int,
+    n_cells: int,
+    cell_obj_dim: int,
+    log: "logging.Logger | None" = None,
+) -> None:
+    """Write a grid_subset tree whose elements reference objects_per_dimension entries."""
+    import os
+    import h5py
+    import numpy as np
+
+    if log is None:
+        log = logging.getLogger(__name__)
+
+    h5_path = os.path.join(entry_dir, f"{ids_name}_{occ}.h5")
+    grp_name = f"{ids_name}_{occ}"
+    if not os.path.exists(h5_path):
+        log.warning("grid_subset-ref writer: HDF5 file not found: %s", h5_path)
+        return
+
+    n_nodes = max(0, int(n_nodes))
+    n_cells = max(0, int(n_cells))
+    subset_dim_nodes = 1
+    subset_dim_cells = int(cell_obj_dim) + 1
+    n_subsets = 2 if n_cells > 0 else 1
+    max_elem = max(1, n_nodes, n_cells)
+
+    K_GGD_AOS   = 'grid_ggd[]&AOS_SHAPE'
+    K_GGD_TIME  = 'grid_ggd[]&time'
+    K_SUB_AOS   = 'grid_ggd[]&grid_subset[]&AOS_SHAPE'
+    K_SUB_ID_N  = 'grid_ggd[]&grid_subset[]&identifier&name'
+    K_SUB_ID_D  = 'grid_ggd[]&grid_subset[]&identifier&description'
+    K_SUB_ID_I  = 'grid_ggd[]&grid_subset[]&identifier&index'
+    K_SUB_DIM   = 'grid_ggd[]&grid_subset[]&dimension'
+    K_SUB_BASE  = 'grid_ggd[]&grid_subset[]&base[]&AOS_SHAPE'
+    K_ELEM_AOS  = 'grid_ggd[]&grid_subset[]&element[]&AOS_SHAPE'
+    K_EOBJ_AOS  = 'grid_ggd[]&grid_subset[]&element[]&object[]&AOS_SHAPE'
+    K_EOBJ_SPACE = 'grid_ggd[]&grid_subset[]&element[]&object[]&space'
+    K_EOBJ_DIM   = 'grid_ggd[]&grid_subset[]&element[]&object[]&dimension'
+    K_EOBJ_INDEX = 'grid_ggd[]&grid_subset[]&element[]&object[]&index'
+
+    def _delete_if_exists(g, name: str):
+        try:
+            if name in g:
+                del g[name]
+        except Exception:
+            pass
+
+    def _existing_ndim(g, name: str, default: int) -> int:
+        try:
+            if name in g:
+                return int(g[name].ndim)
+        except Exception:
+            pass
+        return int(default)
+
+    def _write_num(g, name: str, data, *, dtype, maxshape=None, chunks=None):
+        arr = np.asarray(data, dtype=dtype)
+        _delete_if_exists(g, name)
+        kwargs = {'dtype': np.dtype(dtype)}
+        if maxshape is not None:
+            kwargs['maxshape'] = maxshape
+        if chunks is not None:
+            kwargs['chunks'] = chunks
+        g.create_dataset(name, data=arr, **kwargs)
+
+    def _write_text(g, name: str, data, *, maxshape=None, chunks=None):
+        arr = np.asarray(data, dtype=object)
+        _delete_if_exists(g, name)
+        kwargs = {'dtype': h5py.string_dtype(encoding='utf-8')}
+        if maxshape is not None:
+            kwargs['maxshape'] = maxshape
+        if chunks is not None:
+            kwargs['chunks'] = chunks
+        g.create_dataset(name, data=arr, **kwargs)
+
+    with h5py.File(h5_path, 'r+') as h5:
+        if grp_name not in h5:
+            log.warning("grid_subset-ref writer: group '/%s' not found in %s", grp_name, h5_path)
+            return
+        g = h5[grp_name]
+        # Remove stale packed/full-object grid_subset leaves from previous schema variants
+        # before writing the IMAS-ParaView reference tree.
+        for _stale in [
+            'grid_ggd[]&grid_subset[]&element[]&object[]&real',
+            'grid_ggd[]&grid_subset[]&element[]&object[]&real_SHAPE',
+            'grid_ggd[]&grid_subset[]&element[]&object[]&index_SHAPE',
+            'grid_ggd[]&grid_subset[]&element[]&object[]&boundary[]&AOS_SHAPE',
+            'grid_ggd[]&grid_subset[]&element[]&object[]&boundary[]&index',
+            'grid_ggd[]&grid_subset[]&element[]&object[]&boundary[]&space',
+            'grid_ggd[]&grid_subset[]&element[]&object[]&boundary[]&dimension',
+        ]:
+            _delete_if_exists(g, _stale)
+
+        nggd = 1
+        try:
+            if K_GGD_TIME in g:
+                ds = g[K_GGD_TIME]
+                nggd = max(nggd, int(ds.shape[1] if ds.ndim == 2 else ds.shape[0]))
+        except Exception:
+            pass
+        try:
+            if K_GGD_AOS in g:
+                arr = np.asarray(g[K_GGD_AOS]).reshape(-1)
+                if arr.size:
+                    nggd = max(nggd, int(arr[0]))
+        except Exception:
+            pass
+
+        _write_num(g, K_SUB_AOS, np.full((nggd, 1), n_subsets, dtype=np.int32), dtype=np.int32, maxshape=(None, 1))
+
+        if n_subsets == 2:
+            sub_names = np.asarray([['nodes', 'cells']] * nggd, dtype=object)
+            sub_desc = np.asarray([['Unstructured nodes', 'Unstructured cells']] * nggd, dtype=object)
+            sub_idx  = np.tile(np.asarray([[1, 5]], dtype=np.int32), (nggd, 1))
+            sub_dim  = np.tile(np.asarray([[subset_dim_nodes, subset_dim_cells]], dtype=np.int32), (nggd, 1))
+            sub_base = np.zeros((nggd, 2, 1), dtype=np.int32)
+            sub_base[:, 1, 0] = 1
+            elem_aos = np.zeros((nggd, 2, 1), dtype=np.int32)
+            elem_aos[:, 0, 0] = n_nodes
+            elem_aos[:, 1, 0] = n_cells
+            eobj_aos = np.zeros((nggd, 2, max_elem), dtype=np.int32)
+            if n_nodes > 0:
+                eobj_aos[:, 0, :n_nodes] = 1
+            if n_cells > 0:
+                eobj_aos[:, 1, :n_cells] = 1
+        else:
+            sub_names = np.asarray([['nodes']] * nggd, dtype=object)
+            sub_desc = np.asarray([['Unstructured nodes']] * nggd, dtype=object)
+            sub_idx  = np.tile(np.asarray([[1]], dtype=np.int32), (nggd, 1))
+            sub_dim  = np.tile(np.asarray([[subset_dim_nodes]], dtype=np.int32), (nggd, 1))
+            sub_base = np.zeros((nggd, 1, 1), dtype=np.int32)
+            elem_aos = np.zeros((nggd, 1, 1), dtype=np.int32)
+            elem_aos[:, 0, 0] = n_nodes
+            eobj_aos = np.zeros((nggd, 1, max_elem), dtype=np.int32)
+            if n_nodes > 0:
+                eobj_aos[:, 0, :n_nodes] = 1
+
+        _write_text(g, K_SUB_ID_N, sub_names, maxshape=(None, n_subsets))
+        _write_text(g, K_SUB_ID_D, sub_desc, maxshape=(None, n_subsets))
+        _write_num(g, K_SUB_ID_I, sub_idx, dtype=np.int32, maxshape=(None, n_subsets))
+        _write_num(g, K_SUB_DIM, sub_dim, dtype=np.int32, maxshape=(None, n_subsets))
+
+        sub_base_ndim = _existing_ndim(g, K_SUB_BASE, 3)
+        if sub_base_ndim <= 2:
+            sub_base_out = sub_base[..., 0]
+            sub_base_maxshape = (None, n_subsets)
+        else:
+            sub_base_out = sub_base
+            sub_base_maxshape = (None, n_subsets, 1)
+        _write_num(g, K_SUB_BASE, sub_base_out, dtype=np.int32, maxshape=sub_base_maxshape)
+
+        elem_aos_ndim = _existing_ndim(g, K_ELEM_AOS, 2)
+        if elem_aos_ndim <= 2:
+            elem_aos_out = elem_aos[..., 0]
+            elem_aos_maxshape = (None, n_subsets)
+        else:
+            elem_aos_out = elem_aos
+            elem_aos_maxshape = (None, n_subsets, 1)
+        _write_num(g, K_ELEM_AOS, elem_aos_out, dtype=np.int32, maxshape=elem_aos_maxshape)
+
+        eobj_aos_ndim = _existing_ndim(g, K_EOBJ_AOS, 3)
+        if eobj_aos_ndim <= 2:
+            eobj_aos_out = eobj_aos[..., 0]
+            eobj_aos_maxshape = (None, n_subsets)
+        else:
+            eobj_aos_out = eobj_aos
+            eobj_aos_maxshape = (None, n_subsets, None)
+        _write_num(g, K_EOBJ_AOS, eobj_aos_out, dtype=np.int32, maxshape=eobj_aos_maxshape)
+
+        # Nested AoS scalar leaves under element[]/object[] need an explicit object axis
+        # even when every element references exactly one object. Without this trailing
+        # singleton dimension, the IMAS low-level backend reports a wrong scalar rank
+        # when resolving object[0].space / dimension / index lazily.
+        space = np.zeros((nggd, n_subsets, max_elem, 1), dtype=np.int32)
+        dim = np.zeros((nggd, n_subsets, max_elem, 1), dtype=np.int32)
+        index = np.zeros((nggd, n_subsets, max_elem, 1), dtype=np.int32)
+        if n_nodes > 0:
+            space[:, 0, :n_nodes, 0] = 1
+            dim[:, 0, :n_nodes, 0] = subset_dim_nodes
+            index[:, 0, :n_nodes, 0] = np.arange(1, n_nodes + 1, dtype=np.int32)[None, :]
+        if n_subsets == 2 and n_cells > 0:
+            space[:, 1, :n_cells, 0] = 1
+            dim[:, 1, :n_cells, 0] = subset_dim_cells
+            index[:, 1, :n_cells, 0] = np.arange(1, n_cells + 1, dtype=np.int32)[None, :]
+        scalar_maxshape = (None, n_subsets, None, 1)
+
+        _write_num(g, K_EOBJ_SPACE, space, dtype=np.int32, maxshape=scalar_maxshape)
+        _write_num(g, K_EOBJ_DIM, dim, dtype=np.int32, maxshape=scalar_maxshape)
+        _write_num(g, K_EOBJ_INDEX, index, dtype=np.int32, maxshape=scalar_maxshape)
+
+        log.info(
+            "Wrote IMAS-ParaView grid_subset references for %d grids into %s (occ=%d; nodes=%d; cells=%d)",
+            nggd, h5_path, occ, n_nodes, n_cells,
+        )
+
 def _write_unstructured_gridggd_packed_h5(
     entry_dir: str,
     ids_name: str,
@@ -8571,8 +11336,8 @@ def _write_unstructured_gridggd_packed_h5(
     if log is None:
         log = logging.getLogger(__name__)
 
-    h5_path = os.path.join(entry_dir, f"{ids_name}_{occ}.h5")
-    grp_name = f"{ids_name}_{occ}"
+    h5_path, grp_name = _ids_backend_h5_loc(entry_dir, ids_name, occ)
+    grp_name = grp_name[1:] if str(grp_name).startswith('/') else str(grp_name)
 
     if not os.path.exists(h5_path):
         log.warning("Packed grid_ggd writer: HDF5 file not found: %s", h5_path)
@@ -8605,11 +11370,40 @@ def _write_unstructured_gridggd_packed_h5(
 
         # Discover datasets.
         keys = list(g.keys())
+
+        def _nggd_from_group(g) -> int:
+            ng = 1
+            try:
+                if 'time' in g:
+                    ds = g['time']
+                    ng = max(ng, int(ds.shape[-1] if ds.ndim >= 2 else ds.shape[0]))
+            except Exception:
+                pass
+            try:
+                if 'grid_ggd[]&time' in g:
+                    ds = g['grid_ggd[]&time']
+                    ng = max(ng, int(ds.shape[-1] if ds.ndim >= 2 else ds.shape[0]))
+            except Exception:
+                pass
+            try:
+                if 'grid_ggd[]&AOS_SHAPE' in g:
+                    arr = np.asarray(g['grid_ggd[]&AOS_SHAPE']).reshape(-1)
+                    if arr.size:
+                        ng = max(ng, int(arr.sum() if arr.size > 1 else arr[0]))
+            except Exception:
+                pass
+            try:
+                if ds_real is not None and ds_real in g:
+                    ng = max(ng, int(g[ds_real].shape[0]))
+            except Exception:
+                pass
+            return max(1, int(ng))
         ds_subset_aos = next((k for k in keys if pat_subset_aos.match(k)), None)
         ds_elem_aos = next((k for k in keys if pat_elem_aos.match(k)), None)
         ds_obj_aos = next((k for k in keys if pat_obj_aos.match(k)), None)
         ds_real = next((k for k in keys if pat_real.match(k)), None)
         ds_index = next((k for k in keys if pat_index.match(k)), None)
+        nggd = _nggd_from_group(g)
 
         # We must have subset/element AOS_SHAPE datasets to size the tree.
         # Normally these are created by the IMAS HDF5 backend when grid_ggd.grid_subset is non-empty.
@@ -8620,7 +11414,7 @@ def _write_unstructured_gridggd_packed_h5(
             if ds_subset_aos not in g:
                 g.create_dataset(
                     ds_subset_aos,
-                    shape=(1, 1),
+                    shape=(nggd, 1),
                     maxshape=(None, 1),
                     dtype=np.int32,
                 )
@@ -8630,8 +11424,8 @@ def _write_unstructured_gridggd_packed_h5(
             if ds_elem_aos not in g:
                 g.create_dataset(
                     ds_elem_aos,
-                    shape=(1, n_subsets),
-                    maxshape=(None, n_subsets),
+                    shape=(nggd, n_subsets, 1),
+                    maxshape=(None, n_subsets, 1),
                     dtype=np.int32,
                 )
 
@@ -8641,8 +11435,8 @@ def _write_unstructured_gridggd_packed_h5(
             if ds_obj_aos not in g:
                 g.create_dataset(
                     ds_obj_aos,
-                    shape=(1, n_subsets, 1),
-                    maxshape=(None, n_subsets, None),
+                    shape=(nggd, n_subsets, 1),
+                    maxshape=(None, n_subsets, 1),
                     dtype=np.int32,
                 )
 
@@ -8654,8 +11448,8 @@ def _write_unstructured_gridggd_packed_h5(
             if ds_real not in g:
                 g.create_dataset(
                     ds_real,
-                    shape=(1, n_subsets, 1, 1),
-                    maxshape=(1, n_subsets, None, None),
+                    shape=(nggd, n_subsets, 1, 1),
+                    maxshape=(None, n_subsets, None, None),
                     dtype=np.float64,
                 )
         if ds_index is None:
@@ -8663,8 +11457,8 @@ def _write_unstructured_gridggd_packed_h5(
             if ds_index not in g:
                 g.create_dataset(
                     ds_index,
-                    shape=(1, n_subsets, 1, 1),
-                    maxshape=(1, n_subsets, None, None),
+                    shape=(nggd, n_subsets, 1, 1),
+                    maxshape=(None, n_subsets, None, None),
                     dtype=np.int32,
                 )
 
@@ -8673,23 +11467,30 @@ def _write_unstructured_gridggd_packed_h5(
         try:
             # Typical shape is (nggd, 1)
             dsa[...] = 0
-            dsa[0, 0] = n_subsets
+            for gi in range(min(int(getattr(dsa, 'shape', [nggd])[0]), nggd)):
+                dsa[gi, 0] = n_subsets
         except Exception as e:
             log.warning("Packed grid_ggd writer: failed to write %s: %s", ds_subset_aos, e)
 
         # 2) element AOS_SHAPE: store number of elements per subset.
         dea = g[ds_elem_aos]
         try:
-            # Expected shape (nggd, nsubsets)
-            if dea.shape[1] != n_subsets:
-                # Resize if possible
-                try:
+            # Expected shape (nggd, nsubsets[,1])
+            try:
+                if dea.ndim == 2 and dea.shape[1] != n_subsets:
                     dea.resize((dea.shape[0], n_subsets))
-                except Exception:
-                    pass
+                elif dea.ndim == 3 and dea.shape[1] != n_subsets:
+                    dea.resize((dea.shape[0], n_subsets, dea.shape[2]))
+            except Exception:
+                pass
             dea[...] = 0
-            dea[0, nodes_subset_index] = n_nodes
-            dea[0, vols_subset_index] = n_cells
+            for gi in range(min(int(dea.shape[0]), nggd)):
+                if dea.ndim == 3:
+                    dea[gi, nodes_subset_index, 0] = 1
+                    dea[gi, vols_subset_index, 0] = 1
+                else:
+                    dea[gi, nodes_subset_index] = 1
+                    dea[gi, vols_subset_index] = 1
         except Exception as e:
             log.warning("Packed grid_ggd writer: failed to write %s: %s", ds_elem_aos, e)
 
@@ -8701,46 +11502,80 @@ def _write_unstructured_gridggd_packed_h5(
                 #  - (nggd, nsubsets, nelem) : per-element object count
                 #  - (nggd, nsubsets, 1)     : uniform count per subset
                 if doa.ndim == 3:
+
                     # Prefer a compact representation: keep the last dimension = 1 when possible.
+
                     # This avoids allocating per-element object-count arrays for very large meshes.
+
                     try:
+
                         if doa.shape[2] == 1:
-                            doa[0, nodes_subset_index, 0] = 3
-                            doa[0, vols_subset_index, 0] = n_verts
+
+                            for gi in range(min(int(doa.shape[0]), nggd)):
+                                doa[gi, nodes_subset_index, 0] = 3
+                                doa[gi, vols_subset_index, 0] = n_verts
+
                         else:
+
                             # Per-element counts: write only the required ranges (avoid doa[...] = 0).
+
                             step = 4_000_000  # ints per write (~16 MiB)
+
                             for i0 in range(0, n_nodes, step):
+
                                 i1 = min(i0 + step, n_nodes)
-                                doa[0, nodes_subset_index, i0:i1] = 3
+
+                                for gi in range(min(int(doa.shape[0]), nggd)):
+                                    doa[gi, nodes_subset_index, i0:i1] = 3
+
                             for i0 in range(0, n_cells, step):
+
                                 i1 = min(i0 + step, n_cells)
-                                doa[0, vols_subset_index, i0:i1] = n_verts
+
+                                for gi in range(min(int(doa.shape[0]), nggd)):
+                                    doa[gi, vols_subset_index, i0:i1] = n_verts
 
                     except Exception as e:
+
                         # If chunk allocation fails, fall back to recreating a compact AoS_SHAPE dataset (dim=1).
+
                         if "memory allocation failed for chunk" in str(e).lower():
+
                             try:
+
                                 del g[ds_obj_aos]
+
                             except Exception:
+
                                 pass
+
                             g.create_dataset(
+
                                 ds_obj_aos,
+
                                 shape=(1, n_subsets, 1),
+
                                 maxshape=(None, n_subsets, 1),
+
                                 dtype=np.int32,
+
                                 chunks=(1, 1, 1),
+
                                 compression=None,
+
                                 compression_opts=None,
+
                                 shuffle=False,
+
                                 fillvalue=0,
+
                             )
 
                             doa = g[ds_obj_aos]
 
-                            doa[0, nodes_subset_index, 0] = 3
-
-                            doa[0, vols_subset_index, 0] = n_verts
+                            for gi in range(min(int(doa.shape[0]), nggd)):
+                                doa[gi, nodes_subset_index, 0] = 3
+                                doa[gi, vols_subset_index, 0] = n_verts
 
                         else:
 
@@ -8750,8 +11585,9 @@ def _write_unstructured_gridggd_packed_h5(
 
                     # (nggd, nsubsets)
                     doa[...] = 0
-                    doa[0, nodes_subset_index] = 3
-                    doa[0, vols_subset_index] = n_verts
+                    for gi in range(min(int(doa.shape[0]), nggd)):
+                        doa[gi, nodes_subset_index] = 3
+                        doa[gi, vols_subset_index] = n_verts
             except Exception as e:
                 log.warning("Packed grid_ggd writer: failed to write %s: %s", ds_obj_aos, e)
 
@@ -8833,8 +11669,8 @@ def _write_unstructured_gridggd_packed_h5(
         if hasattr(dreal, "chunks") and dreal.ndim == 4:
             _ensure_reasonable_chunks(
                 dreal, ds_real,
-                want_shape=(1, n_subsets, n_nodes, 3),
-                want_maxshape=(1, n_subsets, None, 3),
+                want_shape=(nggd, n_subsets, n_nodes, 3),
+                want_maxshape=(None, n_subsets, None, 3),
                 elem_axis=2, elem_count=n_nodes,
                 obj_axis=3, obj_count=3,
                 bytes_per_item=8,
@@ -8844,8 +11680,8 @@ def _write_unstructured_gridggd_packed_h5(
         if hasattr(dind, "chunks") and dind.ndim == 4:
             _ensure_reasonable_chunks(
                 dind, ds_index,
-                want_shape=(1, n_subsets, n_cells, n_verts),
-                want_maxshape=(1, n_subsets, None, n_verts),
+                want_shape=(nggd, n_subsets, n_cells, n_verts),
+                want_maxshape=(None, n_subsets, None, n_verts),
                 elem_axis=2, elem_count=n_cells,
                 obj_axis=3, obj_count=n_verts,
                 bytes_per_item=4,
@@ -8865,11 +11701,11 @@ def _write_unstructured_gridggd_packed_h5(
         if dreal.ndim == 4 and dind.ndim == 4:
             # Resize to hold maximum elements and objects.
             try:
-                dreal.resize((1, n_subsets, n_nodes, 3))
+                dreal.resize((nggd, n_subsets, n_nodes, 3))
             except Exception:
                 pass
             try:
-                dind.resize((1, n_subsets, n_cells, n_verts))
+                dind.resize((nggd, n_subsets, n_cells, n_verts))
             except Exception:
                 pass
             # NOTE: do not clear the full packed datasets here (can trigger massive I/O and memory pressure).
@@ -8879,13 +11715,15 @@ def _write_unstructured_gridggd_packed_h5(
             nodes_f8 = nodes_xyz.astype(np.float64, copy=False)
             for i0 in range(0, n_nodes, node_step):
                 i1 = min(i0 + node_step, n_nodes)
-                dreal[0, nodes_subset_index, i0:i1, :3] = nodes_f8[i0:i1, :3]
+                for gi in range(min(int(dreal.shape[0]), nggd)):
+                    dreal[gi, nodes_subset_index, i0:i1, :3] = nodes_f8[i0:i1, :3]
 
             # Volumes subset: connectivity indices (write in slabs)
             cell_step = min(8192, n_cells) if n_cells > 0 else 1
             for i0 in range(0, n_cells, cell_step):
                 i1 = min(i0 + cell_step, n_cells)
-                dind[0, vols_subset_index, i0:i1, :n_verts] = conn_1b[i0:i1, :n_verts]
+                for gi in range(min(int(dind.shape[0]), nggd)):
+                    dind[gi, vols_subset_index, i0:i1, :n_verts] = conn_1b[i0:i1, :n_verts]
         else:
             # Fallback: try to write flattened payloads if the backend chose a packed 1D layout.
             # We do this best-effort and warn if it doesn't fit.
@@ -8896,24 +11734,26 @@ def _write_unstructured_gridggd_packed_h5(
             try:
                 if dreal.ndim == 3:
                     # (nggd, nsubsets, nflat)
-                    dreal.resize((1, n_subsets, flat_nodes.size))
+                    dreal.resize((nggd, n_subsets, flat_nodes.size))
                     # NOTE: avoid full-dataset clears; write only the required slice below.
                     step = 2_000_000  # ~16 MiB per write for float64
                     for i0 in range(0, flat_nodes.size, step):
                         i1 = min(i0 + step, flat_nodes.size)
-                        dreal[0, nodes_subset_index, i0:i1] = flat_nodes[i0:i1]
+                        for gi in range(min(int(dreal.shape[0]), nggd)):
+                            dreal[gi, nodes_subset_index, i0:i1] = flat_nodes[i0:i1]
                     wrote_any = True
             except Exception as e:
                 log.warning("Packed grid_ggd writer: could not write flattened real: %s", e)
 
             try:
                 if dind.ndim == 3:
-                    dind.resize((1, n_subsets, flat_conn.size))
+                    dind.resize((nggd, n_subsets, flat_conn.size))
                     # NOTE: avoid full-dataset clears; write only the required slice below.
                     step = 4_000_000  # ~16 MiB per write for int32
                     for i0 in range(0, flat_conn.size, step):
                         i1 = min(i0 + step, flat_conn.size)
-                        dind[0, vols_subset_index, i0:i1] = flat_conn[i0:i1]
+                        for gi in range(min(int(dind.shape[0]), nggd)):
+                            dind[gi, vols_subset_index, i0:i1] = flat_conn[i0:i1]
                     wrote_any = True
             except Exception as e:
                 log.warning("Packed grid_ggd writer: could not write flattened index: %s", e)
@@ -8982,6 +11822,15 @@ def _write_gridggd_space_geometry_vectors_h5(
         g = h5[grp_name]
         if ds_name in g:
             ds = g[ds_name]
+            # If the dataset already exists in the *object-based* layout used by IMAS-ParaView
+            # (e.g. shape (nggd, 1, 4, N, 3)), do NOT overwrite it with the legacy vector layout.
+            # Just skip silently to avoid confusing downstream tooling.
+            try:
+                if getattr(ds, "ndim", 0) == 5 and ds.shape[-1] == 3 and ds.shape[2] >= 4:
+                    return
+            except Exception:
+                pass
+
             try:
                 ds.resize(geom.shape)
             except Exception:
@@ -8989,49 +11838,6 @@ def _write_gridggd_space_geometry_vectors_h5(
             ds[...] = geom
         else:
             g.create_dataset(ds_name, data=geom, maxshape=(1, 3, 1, 1, None, 1))
-
-        # Ensure minimal AoS metadata exists for downstream readers (e.g. GGD contour plotters).
-        # Some tools rely on these helper datasets to interpret coordinate ordering.
-        try:
-            nggd, nspace, nopd, nobj, npts, _ = geom.shape
-
-            def _ensure_int_dataset(name: str, payload):
-                if name in g:
-                    return
-                g.create_dataset(name, data=np.asarray(payload, dtype=np.int32), dtype=np.int32)
-
-            _ensure_int_dataset("grid_ggd[]&space[]&objects_per_dimension[]&AOS_SHAPE", [[nggd, nspace, nopd]])
-            _ensure_int_dataset("grid_ggd[]&space[]&objects_per_dimension[]&object[]&AOS_SHAPE", [[nggd, nspace, nopd, nobj]])
-            _ensure_int_dataset("grid_ggd[]&space[]&coordinates_type[]&AOS_SHAPE", [[nggd, nspace, 1]])
-
-            # Coordinate names and indices (r,z,phi). Write only if missing.
-            strdt = h5py.string_dtype("utf-8")
-            shp = (nggd, nspace, 1)
-
-            if "grid_ggd[]&space[]&coordinates_type[]&name" not in g:
-                nm = np.empty(shp, dtype=object)
-                desc = np.empty(shp, dtype=object)
-                idx = np.empty(shp, dtype=np.int32)
-
-                base_names = ["r", "z", "phi"]
-                base_idx = [4, 3, 5]
-
-                for ig in range(nggd):
-                    for ispace in range(nspace):
-                        n = base_names[ispace] if ispace < len(base_names) else f"coord{ispace}"
-                        nm[ig, ispace, 0] = n
-                        desc[ig, ispace, 0] = n
-                        idx[ig, ispace, 0] = base_idx[ispace] if ispace < len(base_idx) else -1
-
-                g.create_dataset("grid_ggd[]&space[]&coordinates_type[]&name", data=nm, dtype=strdt)
-                g.create_dataset("grid_ggd[]&space[]&coordinates_type[]&description", data=desc, dtype=strdt)
-                g.create_dataset("grid_ggd[]&space[]&coordinates_type[]&index", data=idx, dtype=np.int32)
-
-        except Exception as e:
-            try:
-                log.debug("space-geometry writer: could not write metadata datasets: %s", e)
-            except Exception:
-                pass
 
 def populate_mhd_linear(
     mhd: Any,
@@ -9448,6 +12254,42 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+
+    p.add_argument(
+        "--ggd-write-full-objects",
+        action="store_true",
+        help=(
+            "Also write the IMAS-standard object-based unstructured GGD representation under "
+            "grid_ggd.space[0].objects_per_dimension, in addition to the packed connectivity leaves. "
+            "This is the recommended switch for IMAS-ParaView compatibility."
+        ),
+    )
+
+    p.add_argument(
+        "--ggd-write-once",
+        action="store_true",
+        help=(
+            "Write GGD-bearing IDS content only for the first processed dump/time step. Later dumps still "
+            "update non-GGD outputs, but mhd.ggd/core_profiles.ggd/edge_profiles.ggd are skipped."
+        ),
+    )
+
+    p.add_argument(
+        "--ggd-representation",
+        dest="ggd_representation",
+        choices=["packed", "full", "both"],
+        default="full",
+        help=(
+            "Legacy representation selector for unstructured GGD geometry. "
+            "'full' (default) writes the IMAS-standard object-based representation under "
+            "grid_ggd.space[0].objects_per_dimension and is the recommended choice for IMAS-ParaView. "
+            "'both' also requests the object-based representation. "
+            "'packed' writes node/connectivity only in compact packed HDF5 leaves under grid_subset and "
+            "is primarily intended for specialized downstream workflows, not ParaView. Prefer the simpler "
+            "--ggd-write-full-objects flag for explicit IMAS-ParaView workflows."
+        ),
+    )
+
     p.add_argument(
         "--ggd-reuse-grid",
         action="store_true",
@@ -9553,6 +12395,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     log = logging.getLogger("dump2imas")
+    # For ParaView / IMAS-ParaView, the object-based GGD representation is the robust default.
+    # Keep the packed layout available only when the user explicitly requests it.
+    if bool(getattr(args, "ggd_unstructured", False)):
+        _rep = str(getattr(args, "ggd_representation", "full") or "full").strip().lower()
+        _conn = str(getattr(args, "ggd_connectivity", "none") or "none").strip().lower()
+        if (_rep == "packed") and (_conn in ("fe_tri", "fe_wedge", "hex")):
+            logging.getLogger("dump2imas").warning(
+                "Using --ggd-representation=packed with unstructured %s connectivity. This layout is compact, "
+                "but IMAS-ParaView may not reconstruct connected 3D cells correctly. Prefer 'full' or "
+                "--ggd-write-full-objects for ParaView workflows.",
+                _conn,
+            )
 
     # Safety guard: best-effort process memory cap (Linux RLIMIT_AS).
     try:
@@ -9627,6 +12481,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         pass
 
 
+    pending_gridggd_repairs = []
+    pending_unstructured_aux = {}
+
+    # Track which MHD occurrences have already been bootstrapped during this run.
+    # This must live outside the per-file loop: otherwise each new dump file is
+    # treated as a first write and db.put() overwrites the prior occurrence
+    # instead of appending a new homogeneous_time slice via put_slice().
+    mhd_bootstrap_done: set[int] = set()
+
     # Important implementation detail:
     # We append time slices using put_slice() to avoid corruption issues observed
     # when repeatedly db.get() -> resize(AOS) -> db.put() on HDF5 entries.
@@ -9637,9 +12500,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         # Directory of the current dump file (used to resolve optional inputs like contours.h5/peqdsk)
         setattr(args, "_run_dir", str(fn.parent))
-        # Communicate per-file grid-write policy to GGD helpers.
+        # Communicate per-file GGD write policy to helpers.
         # When --ggd-reuse-grid is enabled, we only write grid_ggd on the first processed dump.
         setattr(args, "_ggd_write_grid", (ifile == 1))
+        # When --ggd-write-once is enabled, we only write GGD-bearing IDS content for the first dump.
+        setattr(args, "_ggd_write_step", (ifile == 1))
 
         _log(f"Reading {fn.name} ({ifile}/{len(dump_files)})", args.quiet)
         data = read_and_stitch_dump(fn, args)
@@ -9715,7 +12580,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         cp = factory.new("core_profiles") if hasattr(factory, "new") else factory("core_profiles")
         populate_core_profiles(cp, data, t_index=0, args=args)
-        populate_core_profiles_ggd(cp, data, args=args)
+        if _ggd_should_write_step(args):
+            populate_core_profiles_ggd(cp, data, args=args)
 
         try:
             has_1d = hasattr(cp, "profiles_1d") and _aos_has_entries(cp.profiles_1d)
@@ -9751,7 +12617,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if do_profiles_once:
             ep = factory.new("edge_profiles") if hasattr(factory, "new") else factory("edge_profiles")
             populate_edge_profiles(ep, data, t_index=0, args=args)
-            populate_edge_profiles_ggd(ep, data, args=args)
+            if _ggd_should_write_step(args):
+                populate_edge_profiles_ggd(ep, data, args=args)
 
             try:
                 has_1d = hasattr(ep, "profiles_1d") and _aos_has_entries(ep.profiles_1d)
@@ -10185,7 +13052,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                 )
 
                                 # ion velocity: replicate bulk v for all ions
-                                vq = (vq if vq is not None else data.get('vq', None))
+                                _vq0 = locals().get('vq', None)
+                                vq = _vq0 if _vq0 is not None else data.get('vq', None)
                                 if vq is not None:
                                     vqA = np.asarray(vq, dtype=float)
                                     if vqA.ndim >= 3 and vqA.shape[-1] >= 3:
@@ -10265,7 +13133,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
                                 # total current density components (R, Z, phi) from equilibrium jq
                                 try:
-                                    jq = (jq if jq is not None else data.get('jq', None))
+                                    _jq0 = locals().get('jq', None)
+                                    jq = _jq0 if _jq0 is not None else data.get('jq', None)
                                     if jq is not None:
                                         jqA = np.asarray(jq, dtype=float)
                                         if jqA.ndim >= 3 and jqA.shape[-1] >= 3:
@@ -10301,7 +13170,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
                             except Exception as e:
                                 log.warning('edge_profiles GGD required leaves (h5py direct) write failed: %s', e)
-                                log.exception('edge_profiles GGD required leaves (h5py direct) write failed')
                     # If unstructured GGD is requested, we'll mirror edge_profiles electrons.temperature from the mhd GGD
                     # after the mhd IDS is written (see below). This avoids fragile interpolation and keeps node ordering identical.
                     edge_profiles_need_mirror = bool(getattr(args, 'ggd_unstructured', False) and (str(getattr(args, 'edge_ggd_values', 'equilibrium') or 'equilibrium').strip().lower() == 'full'))
@@ -10366,7 +13234,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
             _db_put_slice(db, mhd_ids, occ)
         # For nonlinear runs, also write the GGD-based mhd IDS (full fields) alongside mhd_linear.
-        if write_mhd and (mhd is not None):
+        if write_mhd and _ggd_should_write_step(args) and (mhd is not None):
             try:
                 # Write one mhd IDS occurrence per species (aligned with mhd_linear):
                 #   occ_base+0 : electrons/common
@@ -10413,15 +13281,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     except Exception:
                         pass
                     # Best-effort: tag IDS with output COCOS metadata when supported by this DD
+                    _ensure_gridggd_exists(mhd_s)
+                    #_ensure_gridggd_space_identifier(mhd_s)
+
+                    _ensure_gridggd_space_identifier(mhd_s)
                     _set_ids_cocos(mhd_s, COCOS_OUT_DEFAULT)
 
-                    _db_put_slice(db, mhd_s, occ)
+                    if occ not in mhd_bootstrap_done:
+
+                        _db_put_full_once(db, mhd_s, occ)
+
+                        mhd_bootstrap_done.add(occ)
+
+                    else:
+
+                        _db_put_slice(db, mhd_s, occ)
                     if s == 0:
                         mhd0 = mhd_s
 
                 # Keep mhd pointing to electrons/common occurrence for follow-on HDF5 writes below.
                 if mhd0 is not None:
                     mhd = mhd0
+
+                # Defer a minimal root-AoS repair until after db.close(). Some IMAS/AL builds
+                # rewrite the HDF5 metadata on close, so patching the root grid_ggd skeleton here
+                # can be undone before the process exits.
+                try:
+                    _rep = str(getattr(args, 'ggd_representation', 'packed') or 'packed').strip().lower()
+                    _nphi_rep = max(1, int(getattr(args, 'ggd_nphi', 8) or 1))
+                    if bool(getattr(args, 'ggd_unstructured', False)) and _ggd_write_full_objects_enabled(args):
+                        _nspace_rep = 1
+                        _space_names_rep = ['cyl_rpz']
+                    else:
+                        _nspace_rep = (3 if _nphi_rep > 1 else 2)
+                        _space_names_rep = (['R', 'Z', 'Phi'] if _nspace_rep == 3 else ['R', 'Z'])
+                    for _s in range(nspec_mhd):
+                        _occ_s = occ_base + int(_s)
+                        pending_gridggd_repairs.append((str(entry_dir), 'mhd', int(_occ_s), float(data['time']), int(_nspace_rep), tuple(_space_names_rep)))
+                except Exception:
+                    pass
 
                 # DD-compliant FE-triangle mode: ensure IMAS-standard space geometry vectors are present.
                 # Some bindings/backends only create the scaffolding for grid_ggd.space but not the
@@ -10433,7 +13331,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         and bool(getattr(args, 'ggd_unstructured_fe_nodes', False))
                         and conn_kind in ('fe_tri', 'fe_wedge', 'fe_pointcloud')
                     )
-                    if use_fe_nodes and _use_h5py_patches(args):
+                    if use_fe_nodes and _use_h5py_patches(args) and (str(getattr(args, 'ggd_representation', 'packed') or 'packed').lower().strip() == 'packed'):
                         import numpy as _np
                         nphi = max(1, int(getattr(args, 'ggd_nphi', 8) or 1))
                         phi_list = _np.linspace(0.0, 2.0*_np.pi, num=nphi, endpoint=False)
@@ -10458,9 +13356,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     try:
                         for _s in range(nspec_mhd):
                             _occ_s = occ_base + int(_s)
-                            # Writes IMAS-standard grid_ggd.space vectors + grid_ggd.grid_subset connectivity (packed).
                             _write_unstructured_ggd_aux_h5(entry_dir, 'mhd', _occ_s, data, args)
-                        _log('Wrote IMAS-standard unstructured grid_ggd nodes/connectivity into mhd HDF5 (h5py)', args.quiet)
+                            pending_unstructured_aux[(str(entry_dir), 'mhd', int(_occ_s))] = data
+                        if _ggd_write_full_objects_enabled(args):
+                            _log('Wrote IMAS-ParaView object-based unstructured grid_ggd into mhd HDF5 (h5py)', args.quiet)
+                        else:
+                            _log('Wrote IMAS-standard unstructured grid_ggd nodes/connectivity into mhd HDF5 (h5py)', args.quiet)
                     except Exception as _e:
                         _log(f"[warn] Could not write unstructured grid_ggd nodes/connectivity: {_e}", args.quiet)
                 _log("Populated mhd IDS (GGD full-field snapshot)", args.quiet)
@@ -10473,7 +13374,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     and _edge_mode in ("full", "mhd", "mirror")
                 ):
                     try:
-                        #_mirror_edge_profiles_from_mhd_h5(entry_dir, occ_base, args=args)
                         mhd_h5, _  = _ids_backend_h5_loc(entry_dir, "mhd", occ_base)
                         edge_h5, _ = _ids_backend_h5_loc(entry_dir, "edge_profiles", occ_base)
                         if os.path.exists(mhd_h5) and os.path.exists(edge_h5):
@@ -10483,6 +13383,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                        _log(f"[warn] edge_profiles mirror failed: {_e}", args.quiet)
             except Exception as e:
                 _log(f"[warn] Failed to populate/put mhd IDS (GGD): {e}", args.quiet)
+
+        if write_mhd and (mhd is not None) and (not _ggd_should_write_step(args)):
+            _log("Skipped GGD-bearing IDS writes for this dump because --ggd-write-once is enabled", args.quiet)
 
         _log(f"Appended IDS slices for {fn.name}", args.quiet)
 
@@ -10518,6 +13421,103 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except Exception:
         pass
 
+    # Post-close repair of the top-level grid_ggd AoS skeleton for HDF5-backed mhd IDSs.
+    # This specifically addresses cases where nested grid datasets are present on disk but the
+    # Access Layer still reconstructs len(ids.grid_ggd)==0 on readback.
+    try:
+        _repair_map = {}
+        for _repair_entry_dir, _repair_ids_name, _repair_occ, _repair_time, _repair_nspace, _repair_space_names in pending_gridggd_repairs:
+            _key = (_repair_entry_dir, _repair_ids_name, int(_repair_occ))
+            _rec = _repair_map.setdefault(_key, {
+                'times': [],
+                'nspace': int(_repair_nspace),
+                'space_names': list(_repair_space_names),
+            })
+            try:
+                _rec['times'].append(float(_repair_time))
+            except Exception:
+                pass
+            if int(_repair_nspace) > int(_rec['nspace']):
+                _rec['nspace'] = int(_repair_nspace)
+                _rec['space_names'] = list(_repair_space_names)
+
+        for (_repair_entry_dir, _repair_ids_name, _repair_occ), _rec in _repair_map.items():
+            _times = sorted(set(_rec['times']))
+            _repair_gridggd_root_h5(
+                _repair_entry_dir,
+                _repair_ids_name,
+                int(_repair_occ),
+                times=_times if _times else None,
+                nspace=int(_rec['nspace']),
+                space_names=list(_rec['space_names']),
+                log=log,
+            )
+            _repair_gridggd_full_space_meta_h5(
+                _repair_entry_dir,
+                _repair_ids_name,
+                int(_repair_occ),
+                log=log,
+            )
+            _repair_gridggd_full_object_aos_h5(
+                _repair_entry_dir,
+                _repair_ids_name,
+                int(_repair_occ),
+                log=log,
+            )
+            _repair_gridggd_full_boundary_aos_h5(
+                _repair_entry_dir,
+                _repair_ids_name,
+                int(_repair_occ),
+                log=log,
+            )
+            try:
+                # IMPORTANT: the two-grid rebuild/finalize helpers below are for the legacy
+                # packed grid_subset payload layout (real/index).  In full-object mode they
+                # clobber the IMAS-ParaView reference tree by collapsing
+                #   grid_subset[]&element[]&AOS_SHAPE
+                # back to 1 element per subset and by overwriting
+                #   grid_subset[]&element[]&object[]&AOS_SHAPE
+                # with packed vertex-count semantics (for example [3, 3]).
+                # The full-object writer already writes the full nggd-leading arrays directly,
+                # so only run these helpers for the packed path.
+                _skip_packed_two_grid_repairs = (
+                    bool(getattr(args, 'ggd_unstructured', False))
+                    and _ggd_write_full_objects_enabled(args)
+                )
+                if len(_times) >= 2 and not _skip_packed_two_grid_repairs:
+                    _repair_gridggd_two_grid_consistent_h5(
+                        _repair_entry_dir,
+                        _repair_ids_name,
+                        int(_repair_occ),
+                        times=_times,
+                        log=log,
+                    )
+                    _repair_gridggd_three_nested_aos_h5(
+                        _repair_entry_dir,
+                        _repair_ids_name,
+                        int(_repair_occ),
+                        times=_times,
+                        log=log,
+                    )
+                    _finalize_gridggd_object_counts_h5(
+                        _repair_entry_dir,
+                        _repair_ids_name,
+                        int(_repair_occ),
+                        times=_times,
+                        log=log,
+                    )
+                elif len(_times) >= 2 and _skip_packed_two_grid_repairs:
+                    log.info(
+                        'Skipping packed two-grid/finalize grid_ggd repairs for %s occ=%s because full-object GGD writing is enabled',
+                        _repair_ids_name,
+                        _repair_occ,
+                    )
+            except Exception as _e_two_grid:
+                log.warning('two-grid grid_ggd repair failed for %s occ=%s: %s', _repair_ids_name, _repair_occ, _e_two_grid)
+                _log(f"[warn] two-grid grid_ggd repair failed for {_repair_ids_name} occ={_repair_occ}: {_e_two_grid}", args.quiet)
+    except Exception as _e:
+        _log(f"[warn] post-close grid_ggd root repair failed: {_e}", args.quiet)
+
     return 0
 
 
@@ -10548,6 +13548,8 @@ def _mirror_edge_profiles_from_mhd_h5(
 
     import re as _re
     import h5py as _h5py
+
+import numpy as np
 
 def _write_arr(dst_g, name: str, arr, *, dtype=None, overwrite=True, **kwargs):
     """Write/overwrite a dataset via _h5_write_dataset (local to mirror helper)."""

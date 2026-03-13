@@ -3,15 +3,7 @@
     ".": {
       "release-type": "python",
       "package-name": "nimrod2imas",
-      "version-file": "nimrod2imas.py", 
-      "extra-files": [
-        "gamma2imas.py",
-        "dump2imas.py",
-        "input2imas.py",
-        "plot_mhd.py",
-        "plot_mhd_linear.py",
-        "plot_profiles_1d.py"
-      ]
+      "version-file": "nimrod2imas.py" 
     }
   }
 }

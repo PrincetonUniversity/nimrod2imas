@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.3.4...nimrod2imas-v0.4.0) (2026-03-13)
+
+
+### Features
+
+* Compatibility with IMAS-Paraview ([7682804](https://github.com/PrincetonUniversity/nimrod2imas/commit/7682804b86047e7b1998565e6679bc12b43dd1d3))
+* Compatibility with IMAS-Paraview ([2193422](https://github.com/PrincetonUniversity/nimrod2imas/commit/219342232629002128e928ce30f0db9790584a6b))
+
 ## [0.3.4](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.3.3...nimrod2imas-v0.3.4) (2026-03-06)
 
 

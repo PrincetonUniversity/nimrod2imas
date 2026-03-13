@@ -192,25 +192,51 @@ These flags control how `mhd.grid_ggd` is constructed when the nonlinear pathway
 #### Unstructured `ggd` mode (recommended for robust downstream consumption)
 
 By default, the converter may rely on **implicit structured axes** (regular R–Z resampling and toroidal replication).
-For workflows that need explicit node coordinates and explicit connectivity (e.g., robust reconstruction of array shapes, ML pipelines, or backends that store packed value arrays), enable **unstructured GGD**:
+For workflows that need explicit node coordinates and explicit connectivity (e.g., robust reconstruction of array shapes, ML pipelines, and ParaView/IMAS-ParaView conversion), enable **unstructured GGD**.
 
 - `--ggd-unstructured`
-  - Stores explicit per-node coordinates `(R,Z,φ)` in `grid_ggd.space`.
+  - Stores explicit per-node coordinates in `grid_ggd.space`.
+  - For current full-object output, node geometry is written in cylindrical **`(R, φ, Z)`** ordering.
   - Optionally stores explicit connectivity in `grid_ggd.grid_subset`.
 
 - `--ggd-unstructured-fe-nodes`
-  - With `--ggd-unstructured`, export the native stitched NIMROD finite-element node locations `(R,Z)` as the node set (no poloidal resampling).
+  - With `--ggd-unstructured`, export the native stitched NIMROD finite-element node locations as the node set (no poloidal resampling).
+  - This is the preferred choice when you want IMAS to preserve the original NIMROD FE geometry as closely as possible.
 
-- `--ggd-connectivity {none,fe_pointcloud,hex,fe_tri,fe_wedge}` (default: `fe_tri`)
+- `--ggd-connectivity {none,fe_pointcloud,hex,fe_tri,fe_wedge}`
   - `none`: do not write connectivity.
-  - `fe_pointcloud`: write nodes only and omit connectivity/cells (good for very large meshes).
-  - `fe_tri`: triangulated 2D connectivity on the native stitched `(R,Z)` node lattice (two triangles per valid quad cell); replicated per toroidal plane when `--ggd-nphi > 1`.
-  - `fe_wedge`: volumetric wedge (triangular-prism) connectivity obtained by extruding the `fe_tri` connectivity between adjacent toroidal planes (periodic in φ).
-  - `hex`: hexahedral connectivity on the reconstructed `(R,Z,φ)` product grid with periodicity in φ (legacy/regular-grid mode).
+  - `fe_pointcloud`: write nodes only and omit connectivity/cells (good for very large meshes or point-cloud workflows).
+  - `fe_tri`: toroidally connected **surface** triangulation based on the stitched `(R,Z)` FE node lattice. This is useful for surface visualization and for constructing `fe_wedge`, but it is **not** a volumetric 3D cell representation.
+  - `fe_wedge`: volumetric wedge (triangular-prism) connectivity obtained by extruding the `fe_tri` connectivity between adjacent toroidal planes. This is the recommended option for a true 3D toroidal mesh in ParaView.
+  - `hex`: hexahedral connectivity on the reconstructed `(R,Z,φ)` product grid with periodicity in φ. Use this only for regular-grid workflows; it is not the native FE-preserving representation.
+
+- `--ggd-representation {full,packed}`
+  - `full`: write the DD4-style object-based `grid_ggd.space[].objects_per_dimension[]` representation. This is the recommended mode for ParaView/IMAS-ParaView and for downstream tools that need explicit node/cell objects.
+  - `packed`: compact representation using packed subsets/elements. Keep this only for legacy consumers that explicitly expect it.
 
 - `--ggd-reuse-grid`
   - Assume grid and connectivity are invariant over time.
   - Write `grid_ggd` geometry/connectivity only for the first dump and reuse it for subsequent time slices (subsequent values reference `grid_index=1`).
+
+##### Recommended GGD options for ParaView / IMAS-ParaView
+
+For the most robust ParaView workflow, prefer:
+
+```bash
+python dump2imas.py dumpgll.*.h5   --dd <device> --dd-version 4.1.1 --pulse <pulse> --run <run>   --backend hdf5   --ggd-unstructured --ggd-unstructured-fe-nodes   --ggd-connectivity fe_wedge   --ggd-representation full   --ggd-reuse-grid
+```
+
+Notes:
+- `fe_wedge` is the recommended connectivity for a **3D volumetric torus**.
+- `fe_tri` is a **surface** representation only; it should not be expected to produce volumetric cells in ParaView.
+- `full` is preferred over `packed` for `ggd2vtk` / `imas2vtu` conversion.
+- When changing GGD layout or connectivity options, write to a **fresh IMAS run/entry**. Reusing an older HDF5 entry can leave stale `grid_ggd` leaves that confuse downstream readers.
+
+##### ParaView / `ggd2vtk` remarks
+
+- ParaView conversion relies on the IMAS-ParaView reader to interpret `grid_ggd` objects. If you see messages such as `vtkGeometryFilter ... Unknown cell type`, first verify that the reader is selecting the 3D cell objects rather than only 2D faces.
+- For `fe_wedge`, the VTK output should contain volumetric cells, not only toroidal surfaces. If only surfaces appear, the problem is usually in the reader's interpretation of the GGD cell objects, not in the toroidal-node indexing itself.
+- Because ParaView support for unstructured GGD is still sensitive to exact metadata/layout, `fe_wedge + full` is the recommended starting point for debugging and validation.
 
 **Safety / resource control**
 - `--mem-limit-gb <float>`: best-effort memory cap for the process in GB (Linux `RLIMIT_AS`). Use to reduce the risk of OS-level OOM for large GGD exports.
@@ -350,12 +376,18 @@ Optional: `cmasher` colormaps can be used via `--cmap cmr.gothic` if installed.
 
 ### 7) `plot_mhd.py` — contour plots from `mhd` (GGD) with HDF5 fallback
 
-Attempts to read axes from IMAS `mhd.grid_ggd`; if not possible, falls back to auxiliary HDF5 datasets written by the conversion pipeline (when present).
+Attempts to read axes and connectivity from IMAS `mhd.grid_ggd`; if not possible, falls back to auxiliary HDF5 datasets written by the conversion pipeline (when present).
+
+Recent updates improved compatibility with the DD4-style full-object GGD representation written by `dump2imas.py`:
+- node geometry can be read from `grid_ggd.space[].objects_per_dimension[]`
+- node-centered and cell-centered data are distinguished through `grid_subset_index`
+- full-object node/cell connectivity is preferred when present
+
+When reading newer full-object exports, note that GGD node geometry is stored in cylindrical `(R, φ, Z)` order. `plot_mhd.py` handles this internally, but external readers should not assume `(R, Z, φ)`.
 
 **Example**
 ```bash
-python plot_mhd.py --entry mast/4/45272/8/ \
-  --dd-version 4.1.1 --occ 1 --time-index 0 --phi-index 0 --quantity te
+python plot_mhd.py --entry mast/4/45272/8/   --dd-version 4.1.1 --occ 1 --time-index 0 --phi-index 0 --quantity te
 ```
 
 ---
@@ -387,5 +419,11 @@ Some environments require setting `IMAS_VERSION` or passing `dd_version` directl
 
 - **Missing limiter/wall or empty IDS**  
   Check that GEQDSK includes limiter arrays (`LIMITR`, `RLIM`, `ZLIM`) and that you used the expected occurrence (`--occ`) when reading.
+
+- **ParaView shows isolated toroidal planes or `vtkGeometryFilter ... Unknown cell type`**  
+  Start with `--ggd-unstructured --ggd-unstructured-fe-nodes --ggd-connectivity fe_wedge --ggd-representation full`. Verify that the IMAS-ParaView reader is selecting 3D cell objects, not only 2D faces. Also make sure you are writing to a fresh IMAS entry after changing GGD options.
+
+- **`plot_mhd.py` shows distorted contours after switching to full-object GGD**  
+  Update to the current plotting script so that it correctly interprets cylindrical node geometry ordering and resolves `grid_subset_index` against the actual `grid_subset[].identifier.index` values.
 
 ---

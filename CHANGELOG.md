@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.1](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.4.0...nimrod2imas-v0.4.1) (2026-03-13)
+
+
+### Bug Fixes
+
+* Updated README with Paraview option description ([2476714](https://github.com/PrincetonUniversity/nimrod2imas/commit/2476714cd3d38ea23b408c7f64db3ba1b47aa7e4))
+* Updated README with Paraview option description ([3bcf850](https://github.com/PrincetonUniversity/nimrod2imas/commit/3bcf85010d619b0f38b44cc1f564185e5e3bc210))
+
 ## [0.4.0](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.3.4...nimrod2imas-v0.4.0) (2026-03-13)
 
 

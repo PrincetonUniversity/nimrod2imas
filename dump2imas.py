@@ -61,6 +61,8 @@ from nimrod2imas import (
 
 VERSION = __version__
 
+_INTERNAL_META_KEY = "__dump2imas__"
+
 def _import_imas():
     import imas
     return imas
@@ -3402,6 +3404,165 @@ def populate_core_profiles(cp: Any, data: Dict[str, Any], t_index: int, args) ->
 
     ps = np.asarray(psi2d, dtype=float)
     psi_pol_norm2d = (ps - float(psi_axis)) / den
+
+    # Keep core_profiles sourcing consistent with edge_profiles:
+    # prefer preprocessed IMAS core_profiles (typically from input2imas), then PEQDSK,
+    # and only fall back to dump-derived 2D binning if those are unavailable.
+    cp_pre = getattr(args, "_preproc_cp", None)
+    prof_imas = _imas_core_profiles_te_ne(cp_pre, target_time=t, log=log) if (cp_pre is not None) else None
+    prof_peqdsk = None
+    if prof_imas is None:
+        peqdsk_path = _resolve_optional_file(args, "peqdsk", "peqdsk")
+        if peqdsk_path:
+            try:
+                prof_peqdsk = _peqdsk_te_ne_si(peqdsk_path, log=log)
+            except Exception:
+                prof_peqdsk = None
+
+    prof_ref = prof_imas if (prof_imas is not None) else prof_peqdsk
+    if prof_ref is not None:
+        ps1d, te_ref_ev, ne_ref_m3 = prof_ref
+        try:
+            ps1d = _as_f64(ps1d)
+            te_ref_ev = _as_f64(te_ref_ev)
+            ne_ref_m3 = _as_f64(ne_ref_m3)
+        except Exception:
+            ps1d = np.asarray(ps1d, dtype=float)
+            te_ref_ev = np.asarray(te_ref_ev, dtype=float)
+            ne_ref_m3 = np.asarray(ne_ref_m3, dtype=float)
+
+        ok = np.isfinite(ps1d) & np.isfinite(te_ref_ev) & np.isfinite(ne_ref_m3)
+        ps1d = ps1d[ok]; te_ref_ev = te_ref_ev[ok]; ne_ref_m3 = ne_ref_m3[ok]
+        if ps1d.size >= 2:
+            o = np.argsort(ps1d)
+            ps1d = ps1d[o]; te_ref_ev = te_ref_ev[o]; ne_ref_m3 = ne_ref_m3[o]
+            if ps1d.size > 1:
+                keep = np.ones(ps1d.size, dtype=bool)
+                keep[1:] = (np.diff(ps1d) > 0.0)
+                ps1d = ps1d[keep]; te_ref_ev = te_ref_ev[keep]; ne_ref_m3 = ne_ref_m3[keep]
+
+        if ps1d.size >= 2:
+            psi_pol_norm_1d = _as_f64(np.clip(ps1d, 0.0, 1.0))
+
+            # Prefer absolute psi from preprocessed equilibrium occ0 when available.
+            pa_abs = float(psi_axis)
+            pb_abs = float(psi_lcfs)
+            eq_pre = getattr(args, "_preproc_eq", None)
+            if eq_pre is not None:
+                try:
+                    ts = getattr(eq_pre, "time_slice", None)
+                    if ts is not None and len(ts) > 0:
+                        gq = getattr(ts[0], "global_quantities", None)
+                        if gq is not None:
+                            pa2 = float(getattr(gq, "psi_axis")) if hasattr(gq, "psi_axis") else pa_abs
+                            pb2 = float(getattr(gq, "psi_boundary")) if hasattr(gq, "psi_boundary") else pb_abs
+                            if (abs(pb2 - pa2) > 1e-12) and np.isfinite(pa2) and np.isfinite(pb2):
+                                pa_abs, pb_abs = pa2, pb2
+                except Exception:
+                    pass
+
+            den_abs = float(pb_abs - pa_abs)
+            if (not np.isfinite(den_abs)) or abs(den_abs) < 1e-12:
+                den_abs = den
+
+            psi_abs_1d = float(pa_abs) + psi_pol_norm_1d * den_abs
+            psi_tor_norm_1d = np.clip(psi_pol_norm_1d, 0.0, 1.0)
+            rho_tor_norm_1d = np.sqrt(np.clip(psi_tor_norm_1d, 0.0, None))
+
+            pe1d = _as_f64(ne_ref_m3) * qe * _as_f64(te_ref_ev)
+
+            z_main = 1.0
+            try:
+                zlist = sp.get("z_ions", None) or []
+                if zlist:
+                    z_main = float(zlist[0])
+            except Exception:
+                z_main = 1.0
+            zeff_input = sp.get("zeff_input", None)
+            try:
+                zeff_v = float(zeff_input) if zeff_input not in (None, "") else None
+            except Exception:
+                zeff_v = None
+            divisor = float(zeff_v) if (zeff_v is not None and np.isfinite(zeff_v) and zeff_v > 0.0) else float(z_main if (np.isfinite(z_main) and z_main > 0.0) else 1.0)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ni1d = _as_f64(ne_ref_m3) / divisor
+
+            idx = _append_time_core_profiles(cp, t)
+            p = cp.profiles_1d[idx]
+            try:
+                p.time = float(t)
+            except Exception:
+                pass
+
+            if hasattr(p, "grid"):
+                g = p.grid
+                if hasattr(g, "psi"):
+                    try:
+                        g.psi = _as_f64(psi_abs_1d)
+                    except Exception:
+                        pass
+                if hasattr(g, "rho_tor_norm"):
+                    try:
+                        g.rho_tor_norm = _as_f64(rho_tor_norm_1d)
+                    except Exception:
+                        pass
+                if hasattr(g, "psi_tor_norm"):
+                    try:
+                        g.psi_tor_norm = _as_f64(psi_tor_norm_1d)
+                    except Exception:
+                        pass
+                if hasattr(g, "psi_norm"):
+                    try:
+                        g.psi_norm = _as_f64(psi_pol_norm_1d)
+                    except Exception:
+                        pass
+                if hasattr(g, "rho_pol_norm"):
+                    try:
+                        g.rho_pol_norm = _as_f64(psi_pol_norm_1d)
+                    except Exception:
+                        pass
+
+            try:
+                e = p.electrons
+                if hasattr(e, "density"):
+                    e.density = _as_f64(ne_ref_m3)
+                if hasattr(e, "temperature"):
+                    e.temperature = _as_f64(te_ref_ev)
+                if hasattr(e, "pressure"):
+                    e.pressure = _as_f64(pe1d)
+            except Exception:
+                pass
+
+            try:
+                ions = getattr(p, "ion", None)
+                if ions is not None:
+                    ions.resize(1)
+                    it = ions[0]
+                    if hasattr(it, "density"):
+                        it.density = _as_f64(ni1d)
+                    if hasattr(it, "temperature"):
+                        it.temperature = _as_f64(te_ref_ev)
+                    if hasattr(it, "pressure"):
+                        it.pressure = _as_f64(ne_ref_m3 * qe * te_ref_ev)
+                    if hasattr(it, "z_ion"):
+                        try:
+                            it.z_ion = float(z_main)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            try:
+                cp.code.name = "NIMROD"
+            except Exception:
+                pass
+
+            src_tag = "preproc_core_profiles" if (prof_imas is not None) else "peqdsk"
+            log.info(
+                "core_profiles: wrote profiles_1d from %s with %d points (psi_axis=%.6g, psi_lcfs=%.6g, tag=%s)",
+                src_tag, int(psi_pol_norm_1d.size), float(psi_axis), float(psi_lcfs), str(tag),
+            )
+            return
 
     # Optional: include perturbations in core_profiles when requested.
     # For --edge-ggd-values=full we reconstruct a "full field" snapshot at phi=0:
@@ -11502,87 +11663,49 @@ def _write_unstructured_gridggd_packed_h5(
                 #  - (nggd, nsubsets, nelem) : per-element object count
                 #  - (nggd, nsubsets, 1)     : uniform count per subset
                 if doa.ndim == 3:
-
                     # Prefer a compact representation: keep the last dimension = 1 when possible.
-
                     # This avoids allocating per-element object-count arrays for very large meshes.
-
                     try:
-
                         if doa.shape[2] == 1:
-
                             for gi in range(min(int(doa.shape[0]), nggd)):
                                 doa[gi, nodes_subset_index, 0] = 3
                                 doa[gi, vols_subset_index, 0] = n_verts
-
                         else:
-
                             # Per-element counts: write only the required ranges (avoid doa[...] = 0).
-
                             step = 4_000_000  # ints per write (~16 MiB)
-
                             for i0 in range(0, n_nodes, step):
-
                                 i1 = min(i0 + step, n_nodes)
-
                                 for gi in range(min(int(doa.shape[0]), nggd)):
                                     doa[gi, nodes_subset_index, i0:i1] = 3
-
                             for i0 in range(0, n_cells, step):
-
                                 i1 = min(i0 + step, n_cells)
-
                                 for gi in range(min(int(doa.shape[0]), nggd)):
                                     doa[gi, vols_subset_index, i0:i1] = n_verts
-
                     except Exception as e:
-
                         # If chunk allocation fails, fall back to recreating a compact AoS_SHAPE dataset (dim=1).
-
                         if "memory allocation failed for chunk" in str(e).lower():
-
                             try:
-
                                 del g[ds_obj_aos]
-
                             except Exception:
-
                                 pass
-
                             g.create_dataset(
-
                                 ds_obj_aos,
-
                                 shape=(1, n_subsets, 1),
-
                                 maxshape=(None, n_subsets, 1),
-
                                 dtype=np.int32,
-
                                 chunks=(1, 1, 1),
-
                                 compression=None,
-
                                 compression_opts=None,
-
                                 shuffle=False,
-
                                 fillvalue=0,
-
                             )
-
                             doa = g[ds_obj_aos]
-
                             for gi in range(min(int(doa.shape[0]), nggd)):
                                 doa[gi, nodes_subset_index, 0] = 3
                                 doa[gi, vols_subset_index, 0] = n_verts
-
                         else:
-
                             raise
-
                 elif doa.ndim == 2:
-
                     # (nggd, nsubsets)
                     doa[...] = 0
                     for gi in range(min(int(doa.shape[0]), nggd)):
@@ -13356,6 +13479,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     try:
                         for _s in range(nspec_mhd):
                             _occ_s = occ_base + int(_s)
+                            # Writes IMAS-standard grid_ggd.space vectors + grid_ggd.grid_subset connectivity (packed).
                             _write_unstructured_ggd_aux_h5(entry_dir, 'mhd', _occ_s, data, args)
                             pending_unstructured_aux[(str(entry_dir), 'mhd', int(_occ_s))] = data
                         if _ggd_write_full_objects_enabled(args):
@@ -13374,6 +13498,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     and _edge_mode in ("full", "mhd", "mirror")
                 ):
                     try:
+                        #_mirror_edge_profiles_from_mhd_h5(entry_dir, occ_base, args=args)
                         mhd_h5, _  = _ids_backend_h5_loc(entry_dir, "mhd", occ_base)
                         edge_h5, _ = _ids_backend_h5_loc(entry_dir, "edge_profiles", occ_base)
                         if os.path.exists(mhd_h5) and os.path.exists(edge_h5):
@@ -13548,8 +13673,6 @@ def _mirror_edge_profiles_from_mhd_h5(
 
     import re as _re
     import h5py as _h5py
-
-import numpy as np
 
 def _write_arr(dst_g, name: str, arr, *, dtype=None, overwrite=True, **kwargs):
     """Write/overwrite a dataset via _h5_write_dataset (local to mirror helper)."""

@@ -94,6 +94,8 @@ if not hasattr(integrate, "cumtrapz"):
 # small helpers
 # ----------------------------------------------------------------------
 
+_INTERNAL_META_KEY = "__nimrod2imas__"
+
 def all_zero(arr, tol=1e-12):
     """Return True if array is empty or all entries are ~0."""
     a = np.asarray(arr, dtype=float)
@@ -109,6 +111,8 @@ def load_metadata_yaml(yaml_path):
     """Load optional metadata YAML.
 
     Returns an empty dict on missing/invalid YAML, but prints a warning.
+    The returned mapping carries an internal block with the original YAML text
+    and absolute source path so the full YAML can be preserved in provenance.
     """
     if not yaml_path:
         print("Warning: --input YAML was not provided; summary/dataset_fair/workflow will be written with minimal metadata.")
@@ -119,10 +123,18 @@ def load_metadata_yaml(yaml_path):
         return {}
     try:
         with open(yaml_path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+            raw_text = f.read()
+        data = yaml.safe_load(raw_text) or {}
         if not isinstance(data, dict):
             print(f"Warning: metadata YAML root is not a mapping/dict: {yaml_path}. Proceeding without it.")
             return {}
+        data = dict(data)
+        internal = data.get(_INTERNAL_META_KEY, {})
+        if not isinstance(internal, dict):
+            internal = {}
+        internal["yaml_path"] = yaml_path
+        internal["raw_text"] = raw_text
+        data[_INTERNAL_META_KEY] = internal
         return data
     except Exception as exc:
         print(f"Warning: failed to read metadata YAML {yaml_path}: {exc}. Proceeding without it.")
@@ -137,6 +149,123 @@ def yget(dct, *keys, default=None):
             return default
         cur = cur[k]
     return cur
+
+
+def internal_metadata(meta):
+    """Return the internal metadata block carried alongside parsed YAML."""
+    if not isinstance(meta, dict):
+        return {}
+    internal = meta.get(_INTERNAL_META_KEY, {})
+    return internal if isinstance(internal, dict) else {}
+
+
+def metadata_yaml_path(meta):
+    """Return absolute path of the original YAML file, if known."""
+    return str(internal_metadata(meta).get("yaml_path", "") or "")
+
+
+def metadata_yaml_text(meta):
+    """Return original YAML file contents, preserving user formatting/comments when possible."""
+    raw = internal_metadata(meta).get("raw_text", "")
+    return str(raw or "")
+
+
+def public_metadata_dict(meta):
+    """Return metadata dict without internal bookkeeping keys."""
+    if not isinstance(meta, dict):
+        return {}
+    return {k: v for k, v in meta.items() if k != _INTERNAL_META_KEY}
+
+
+def metadata_yaml_dump(meta):
+    """Best-effort YAML serialization of user metadata without internal keys."""
+    raw = metadata_yaml_text(meta)
+    if raw:
+        return raw
+    try:
+        return yaml.safe_dump(public_metadata_dict(meta), sort_keys=False, allow_unicode=True)
+    except Exception:
+        return ""
+
+
+def build_metadata_comment(meta, args=None):
+    """Human-readable metadata summary for ids_properties.comment."""
+    lines = []
+    descr = yget(meta, "dataset", "description", default=None) or yget(meta, "description", default=None)
+    identifier = yget(meta, "dataset", "identifier", default=None)
+    rights_holder = yget(meta, "dataset", "rights_holder", default=None)
+    license_ = yget(meta, "dataset", "license", default=None)
+    valid = yget(meta, "dataset", "valid", default=None)
+    replaces = yget(meta, "dataset", "replaces", default=None)
+    is_replaced_by = yget(meta, "dataset", "is_replaced_by", default=None)
+    yaml_path = metadata_yaml_path(meta)
+
+    if descr:
+        lines.append(f"dataset.description: {descr}")
+    if identifier:
+        lines.append(f"dataset.identifier: {identifier}")
+    if rights_holder:
+        lines.append(f"dataset.rights_holder: {rights_holder}")
+    if license_:
+        lines.append(f"dataset.license: {license_}")
+    if valid:
+        lines.append(f"dataset.valid: {valid}")
+    if replaces:
+        lines.append(f"dataset.replaces: {replaces}")
+    if is_replaced_by:
+        lines.append(f"dataset.is_replaced_by: {is_replaced_by}")
+    if yaml_path:
+        lines.append(f"metadata_yaml.path: {yaml_path}")
+    if args is not None:
+        lines.append(
+            f"effective_imas: dd={getattr(args, 'dd', '')}; pulse={getattr(args, 'pulse', '')}; run={getattr(args, 'run', '')}"
+        )
+    return "\n".join([ln for ln in lines if ln])
+
+
+def _append_xml_copy(parent, xml_obj, wrapper_tag=None):
+    """Append an XML element/string to parent, optionally wrapped in a new tag."""
+    if xml_obj is None:
+        return None
+    target_parent = parent
+    if wrapper_tag:
+        target_parent = ET.SubElement(parent, wrapper_tag)
+    try:
+        if isinstance(xml_obj, ET.Element):
+            target_parent.append(ET.fromstring(ET.tostring(xml_obj, encoding="unicode")))
+        else:
+            target_parent.append(ET.fromstring(str(xml_obj)))
+        return target_parent
+    except Exception:
+        text_el = ET.SubElement(target_parent, "text")
+        text_el.text = str(xml_obj)
+        return target_parent
+
+
+def build_component_parameters_xml(root_tag, fields=None, *, input_xml=None, meta=None, extra_xml=None):
+    """Create XML blob for workflow component parameters."""
+    root = ET.Element(root_tag)
+
+    info = ET.SubElement(root, "metadata")
+    for key, val in (fields or {}).items():
+        if val is None:
+            continue
+        sval = str(val).strip()
+        if not sval:
+            continue
+        el = ET.SubElement(info, "field", name=str(key))
+        el.text = sval
+
+    yaml_path = metadata_yaml_path(meta)
+    if yaml_path:
+        ET.SubElement(root, "metadata_yaml", path=yaml_path)
+
+    if input_xml is not None:
+        _append_xml_copy(root, input_xml, wrapper_tag="input_snapshot")
+    if extra_xml is not None:
+        _append_xml_copy(root, extra_xml, wrapper_tag="extra")
+
+    return ET.tostring(root, encoding="unicode")
 
 
 def file_checksum(path, algo="sha256", chunk_bytes=1024 * 1024):
@@ -160,11 +289,16 @@ def file_checksum(path, algo="sha256", chunk_bytes=1024 * 1024):
 
 
 def build_input2imas_workflow_parameters_xml(args, dd_version, meta, extra_files=None):
-    """Build XML string describing input2imas run parameters (incl. optional checksums)."""
+    """Build XML string describing input2imas run parameters (incl. optional checksums).
+
+    This also preserves the original YAML file text and an effective metadata snapshot
+    where IMAS machine/pulse/run come from the CLI arguments.
+    """
     root = ET.Element("nimrod2imas_input2imas")
 
-    def add_text(parent, tag, text):
-        el = ET.SubElement(parent, tag)
+    def add_text(parent, tag, text, **attrs):
+        attrs = {k: str(v) for k, v in attrs.items() if v is not None and str(v) != ""}
+        el = ET.SubElement(parent, tag, **attrs)
         el.text = "" if text is None else str(text)
         return el
 
@@ -180,9 +314,15 @@ def build_input2imas_workflow_parameters_xml(args, dd_version, meta, extra_files
     add_text(root, "run", getattr(args, "run", "") or "")
     add_text(root, "occ_inputs", getattr(args, "occ", 0))
 
-    # Input file paths
+    effective = ET.SubElement(root, "effective_imas")
+    add_text(effective, "machine", getattr(args, "dd", "") or "")
+    add_text(effective, "pulse", getattr(args, "pulse", "") or "")
+    add_text(effective, "run", getattr(args, "run", "") or "")
+    add_text(effective, "dd_version", dd_version)
+
     files_el = ET.SubElement(root, "inputs")
     in_files = {
+        "metadata_yaml": getattr(args, "input_yaml", None),
         "geqdsk": getattr(args, "geqdsk", None),
         "peqdsk": getattr(args, "peqdsk", None),
         "nimeq_in": getattr(args, "nimeq", None),
@@ -214,6 +354,51 @@ def build_input2imas_workflow_parameters_xml(args, dd_version, meta, extra_files
                 fel = ET.SubElement(cs_el, "file", role=role)
                 fel.set("path", pth_abs)
                 fel.text = h
+
+    raw_yaml = metadata_yaml_text(meta)
+    yaml_path = metadata_yaml_path(meta)
+    if raw_yaml:
+        raw_el = ET.SubElement(root, "metadata_yaml_raw")
+        if yaml_path:
+            raw_el.set("path", yaml_path)
+        raw_el.text = raw_yaml
+
+    parsed_public = public_metadata_dict(meta)
+    if parsed_public:
+        try:
+            dumped = yaml.safe_dump(parsed_public, sort_keys=False, allow_unicode=True)
+        except Exception:
+            dumped = ""
+        if dumped:
+            parsed_el = ET.SubElement(root, "metadata_yaml_public")
+            if yaml_path:
+                parsed_el.set("path", yaml_path)
+            parsed_el.text = dumped
+
+    applied = ET.SubElement(root, "applied_metadata")
+    dataset_block = ET.SubElement(applied, "dataset")
+    for key in ("description", "identifier", "rights_holder", "license", "valid", "replaces", "is_replaced_by"):
+        val = yget(meta, "dataset", key, default=None)
+        if val not in (None, ""):
+            add_text(dataset_block, key, val)
+
+    nimrod_block = ET.SubElement(applied, "nimrod")
+    for key in ("name", "description", "repository", "comment", "commit", "version"):
+        val = yget(meta, "nimrod", key, default=None)
+        if val not in (None, ""):
+            add_text(nimrod_block, key, val)
+
+    converter_block = ET.SubElement(applied, "converter")
+    for key in ("repository", "comment", "commit", "version", "record_checksums", "checksum_algorithm"):
+        val = yget(meta, "converter", key, default=None)
+        if val not in (None, ""):
+            add_text(converter_block, key, val)
+
+    fgnimeq_block = ET.SubElement(applied, "fgnimeq")
+    for key in ("name", "description", "repository", "comment", "commit", "version"):
+        val = yget(meta, "fgnimeq", key, default=None)
+        if val not in (None, ""):
+            add_text(fgnimeq_block, key, val)
 
     return ET.tostring(root, encoding="unicode")
 
@@ -279,7 +464,11 @@ def build_summary_ids(factory, args, meta, geq=None, time0=0.0):
         pass
 
     provider = yget(meta, "contact", "provider", default=None) or yget(meta, "provider", default=None)
-    attach_ids_properties_minimal(s, provider=provider, comment="Generated by nimrod2imas input2imas.py", homogeneous_time=2)
+    comment_lines = ["Generated by nimrod2imas input2imas.py"]
+    meta_comment = build_metadata_comment(meta, args=args)
+    if meta_comment:
+        comment_lines.append(meta_comment)
+    attach_ids_properties_minimal(s, provider=provider, comment="\n".join(comment_lines), homogeneous_time=2)
     return s
 
 
@@ -308,7 +497,13 @@ def build_dataset_fair_ids(factory, meta):
 
     descr = yget(meta, "dataset", "description", default=None) or None
     provider = yget(meta, "contact", "provider", default=None) or yget(meta, "provider", default=None)
-    attach_ids_properties_minimal(df, provider=provider, comment=descr, homogeneous_time=2)
+    comment_lines = []
+    if descr:
+        comment_lines.append(str(descr))
+    meta_comment = build_metadata_comment(meta)
+    if meta_comment:
+        comment_lines.append(meta_comment)
+    attach_ids_properties_minimal(df, provider=provider, comment="\n".join(comment_lines) if comment_lines else None, homogeneous_time=2)
     return df
 
 
@@ -316,23 +511,37 @@ def build_workflow_ids(factory, args, dd_version, meta, nimrod_inputs_xml=None, 
     """Create workflow IDS describing NIMROD + conversion tools."""
     wf = factory.workflow()
     provider = yget(meta, "contact", "provider", default=None) or yget(meta, "provider", default=None)
+    comment_lines = ["Workflow metadata for NIMROD and nimrod2imas conversion"]
+    yaml_path = metadata_yaml_path(meta)
+    if yaml_path:
+        comment_lines.append(f"metadata_yaml.path: {yaml_path}")
     attach_ids_properties_minimal(
         wf,
         provider=provider,
-        comment="Workflow metadata for NIMROD and nimrod2imas conversion",
+        comment="\n".join(comment_lines),
         homogeneous_time=2,
     )
 
     comps = []
 
-    # Component: NIMROD (metadata mostly from YAML)
+    nimrod_params = build_component_parameters_xml(
+        "nimrod_component",
+        {
+            "comment": yget(meta, "nimrod", "comment", default="") or "",
+            "commit": yget(meta, "nimrod", "commit", default="") or "",
+            "version": yget(meta, "nimrod", "version", default="") or "",
+        },
+        input_xml=nimrod_inputs_xml,
+        meta=meta,
+    )
+
     comps.append({
         "name": yget(meta, "nimrod", "name", default="NIMROD") or "NIMROD",
         "description": yget(meta, "nimrod", "description", default="Extended-MHD code") or "Extended-MHD code",
         "repository": yget(meta, "nimrod", "repository", default="") or "",
         "commit": yget(meta, "nimrod", "commit", default="") or "",
         "version": yget(meta, "nimrod", "version", default="") or "",
-        "parameters": yget(meta, "nimrod", "parameters_xml", default="") or "",
+        "parameters": nimrod_params,
     })
 
     # Component: input2imas converter (fixed repo + version from this script)
@@ -344,9 +553,9 @@ def build_workflow_ids(factory, args, dd_version, meta, nimrod_inputs_xml=None, 
     try:
         root = ET.fromstring(conv_params)
         if nimrod_inputs_xml is not None:
-            root.append(ET.fromstring(ET.tostring(nimrod_inputs_xml, encoding='unicode')))
+            _append_xml_copy(root, nimrod_inputs_xml, wrapper_tag="nimrod_inputs_snapshot")
         if fgnimeq_inputs_xml is not None:
-            root.append(ET.fromstring(ET.tostring(fgnimeq_inputs_xml, encoding='unicode')))
+            _append_xml_copy(root, fgnimeq_inputs_xml, wrapper_tag="fgnimeq_inputs_snapshot")
         conv_params = ET.tostring(root, encoding="unicode")
     except Exception:
         pass
@@ -356,19 +565,29 @@ def build_workflow_ids(factory, args, dd_version, meta, nimrod_inputs_xml=None, 
         "description": "Convert NIMROD input files (GEQDSK/PEQDSK + namelists) to IMAS",
         "repository": str(conv_repo),
         "commit": str(conv_commit),
-        "version": __version__,
+        "version": str(yget(meta, "converter", "version", default=__version__) or __version__),
         "parameters": conv_params,
     })
 
     # Optional component: fgnimeq (if XML exists)
     if fgnimeq_inputs_xml is not None:
+        fgnimeq_params = build_component_parameters_xml(
+            "fgnimeq_component",
+            {
+                "comment": yget(meta, "fgnimeq", "comment", default="") or "",
+                "commit": yget(meta, "fgnimeq", "commit", default="") or "",
+                "version": yget(meta, "fgnimeq", "version", default="") or "",
+            },
+            input_xml=fgnimeq_inputs_xml,
+            meta=meta,
+        )
         comps.append({
-            "name": "fgnimeq",
-            "description": "NIMROD preprocessing inputs (grid/equilibrium mapping)",
+            "name": yget(meta, "fgnimeq", "name", default="fgnimeq") or "fgnimeq",
+            "description": yget(meta, "fgnimeq", "description", default="NIMROD preprocessing inputs (grid/equilibrium mapping)") or "NIMROD preprocessing inputs (grid/equilibrium mapping)",
             "repository": yget(meta, "fgnimeq", "repository", default="") or "",
             "commit": yget(meta, "fgnimeq", "commit", default="") or "",
             "version": yget(meta, "fgnimeq", "version", default="") or "",
-            "parameters": ET.tostring(fgnimeq_inputs_xml, encoding="unicode") if isinstance(fgnimeq_inputs_xml, ET.Element) else str(fgnimeq_inputs_xml),
+            "parameters": fgnimeq_params,
         })
 
     # Attach to workflow.time_loop.component array
@@ -1181,7 +1400,18 @@ def main():
         print(f"Warning: failed to build dataset_fair IDS: {exc}")
         dataset_fair_ids = None
 
-    workflow_ids = None  # workflow provenance is recorded incrementally via update_workflow_and_dataset_fair()
+    try:
+        workflow_ids = build_workflow_ids(
+            _ids_factory,
+            args,
+            dd_version,
+            meta,
+            nimrod_inputs_xml=nimrod_xml,
+            fgnimeq_inputs_xml=fgnimeq_xml,
+        )
+    except Exception as exc:
+        print(f"Warning: failed to build workflow IDS: {exc}")
+        workflow_ids = None
 
     # --- build wall from GEQDSK limiter ---
     wall_ids = geqdsk_to_wall(geq, time=time0)
@@ -1199,6 +1429,8 @@ def main():
         put_ids(db, summary_ids, meta_occ)
     if dataset_fair_ids is not None:
         put_ids(db, dataset_fair_ids, meta_occ)
+    if workflow_ids is not None:
+        put_ids(db, workflow_ids, meta_occ)
 
     put_ids(db, eq_ids, args.occ)
     put_ids(db, cp_ids, args.occ)
@@ -1234,6 +1466,12 @@ def main():
                 "pulse": str(args.pulse),
                 "run": str(args.run),
                 "occ": str(int(getattr(args, "occ", 0) or 0)),
+                "metadata_yaml": metadata_yaml_path(meta) or "",
+                "metadata_identifier": str(yget(meta, "dataset", "identifier", default="") or ""),
+                "nimrod_repository": str(yget(meta, "nimrod", "repository", default="") or ""),
+                "nimrod_version": str(yget(meta, "nimrod", "version", default="") or ""),
+                "converter_repository": str(yget(meta, "converter", "repository", default="") or ""),
+                "converter_version": str(yget(meta, "converter", "version", default="") or __version__),
             },
         )
     except Exception as exc:
@@ -1243,7 +1481,7 @@ def main():
     except Exception:
         pass
 
-    print(f"Saved summary, dataset_fair, equilibrium, core_profiles, wall (and mhd if present) to IMAS entry: {entry_path} (occ={args.occ})")
+    print(f"Saved summary, dataset_fair, workflow, equilibrium, core_profiles, wall (and mhd if present) to IMAS entry: {entry_path} (occ={args.occ})")
 
 
 if __name__ == "__main__":

@@ -27,7 +27,11 @@ import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from nimrod2imas import __version__, VERSION
+
+__version__ =  0.4.0
+
+VERSION = __version__
+
 
 try:
     import numpy as np

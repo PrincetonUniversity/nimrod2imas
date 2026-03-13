@@ -5,11 +5,5 @@ f90nml
 matplotlib
 cmasher
 omfit-classes
-logging
-pathlib
-typing
-xml
-hashlib
-datetime
-yaml
-
+PyYAML
+imas-python

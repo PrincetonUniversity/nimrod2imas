@@ -227,6 +227,7 @@ python dump2imas.py dumpgll.*.h5   --dd <device> --dd-version 4.1.1 --pulse <pul
 ```
 
 Notes:
+- The script inverts the toroidal angle consistent with COCOS=2 to COCOS=17 conversion
 - `fe_wedge` is the recommended connectivity for a **3D volumetric torus**.
 - `fe_tri` is a **surface** representation only; it should not be expected to produce volumetric cells in ParaView.
 - `full` is preferred over `packed` for `ggd2vtk` / `imas2vtu` conversion.

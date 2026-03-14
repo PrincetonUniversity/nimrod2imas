@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.2](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.4.1...nimrod2imas-v0.4.2) (2026-03-14)
+
+
+### Bug Fixes
+
+* Readme info for Cocos 2 ([b1a5009](https://github.com/PrincetonUniversity/nimrod2imas/commit/b1a5009c480efe23254659368184c0f724be2f61))
+* Readme info for Cocos 2 ([f122907](https://github.com/PrincetonUniversity/nimrod2imas/commit/f122907693c384fa334d16bdc65ec18538c06846))
+
 ## [0.4.1](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.4.0...nimrod2imas-v0.4.1) (2026-03-13)
 
 

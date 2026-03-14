@@ -1,33 +1,29 @@
 imas:
-  machine: NSTX
-  pulse: 120968
+  machine: D3D
+  pulse: 163518
   run: 1
 
 dataset:
-  description: "NIMROD run for <case>; inputs converted to IMAS."
+  description: "NIMROD run for DIII-D discharge 163518; inputs converted to IMAS."
   identifier: "https://doi.org/<future-doi-or-http-pid>"
   rights_holder: "Princeton Plasma Physics Laboratory"
   license: "https://creativecommons.org/licenses/by/4.0/"
-  valid: "2026-02-09/"   # YYYY-MM-DD/ (open-ended)
+  valid: "2026-03-12/"   # YYYY-MM-DD/ (open-ended)
   replaces: ""
   is_replaced_by: ""
 
 nimrod:
   name: "NIMROD"
-  description: "Extended-MHD simulation"
-  repository: "<git-url>"
-  version: "<tag-or-version>"
-  commit: "<git-commit-sha>"
-  parameters_xml: ""   # optional: pre-built XML blob if you want
+  description: "SVN repository for extended MHD NIMROD code"
+  repository: "https://ice.txcorp.com/nimsvn/nimroot"
+  comment: "repository UUID 130c4dc-fc0e-0410-ad24-a22569409021"
+  version: "7020"
 
 converter:
   repository: "https://github.com/PrincetonUniversity/nimrod2imas"
-  commit: "<nimrod2imas-commit-sha>"     # optional but recommended
+  version: "0.4.2"
+  commit: "a128e91"  
   record_checksums: true
   checksum_algorithm: "sha256"
 
-fgnimeq:
-  repository: "<git-url>"
-  version: "<tag>"
-  commit: "<sha>"
 

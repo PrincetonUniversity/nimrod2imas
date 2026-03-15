@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.3](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.4.2...nimrod2imas-v0.4.3) (2026-03-15)
+
+
+### Bug Fixes
+
+* Addressing bugs on how fields are saved for consequitive times w… ([aebc3ea](https://github.com/PrincetonUniversity/nimrod2imas/commit/aebc3ea755e4bdb25d3d17abbc9c18cd7a64ffed))
+* Addressing bugs on how fields are saved for consequitive times when ggd grid is not saved ([c71f62f](https://github.com/PrincetonUniversity/nimrod2imas/commit/c71f62f156246504687f8a17f4f11b3a20ec3a27))
+
 ## [0.4.2](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.4.1...nimrod2imas-v0.4.2) (2026-03-14)
 
 

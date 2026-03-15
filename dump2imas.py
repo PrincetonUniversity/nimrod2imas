@@ -101,6 +101,16 @@ def _use_imas_connectivity_writer(args) -> bool:
     return (b != "hdf5")
 
 
+def _ggd_reuse_grid_copy_mode(args) -> str:
+    """Return which implementation should materialize --ggd-reuse-grid copies."""
+    mode = str(getattr(args, "ggd_reuse_grid_via", "auto") or "auto").strip().lower()
+    if mode == "h5py":
+        return "h5py"
+    if mode == "imas":
+        return "imas"
+    return "h5py" if _use_h5py_patches(args) else "imas"
+
+
 
 def _die(msg: str) -> None:
     raise SystemExit(f"ERROR: {msg}")
@@ -4681,29 +4691,54 @@ def populate_edge_profiles(ep: Any, data: Dict[str, Any], t_index: int, args) ->
     )
 
 
-def _ggd_should_write_grid(args: Any) -> bool:
-    """Return True if this call should (re)write grid_ggd for the current slice.
+def _ggd_grid_copy_mode(args: Any) -> bool:
+    """Return True when later GGD grid/topology should be copied from the first slice.
 
-    When --ggd-reuse-grid is enabled, we write grid_ggd only for the first processed dump
-    and reuse it for all subsequent time slices. The per-file decision is communicated
-    via args._ggd_write_grid (set in main()).
+    --ggd-reuse-grid requests *copy* semantics.  If both --ggd-reuse-grid and
+    --ggd-write-once are supplied, copy semantics win and --ggd-write-once is ignored.
     """
-    if not bool(getattr(args, "ggd_reuse_grid", False)):
+    return bool(getattr(args, "ggd_reuse_grid", False))
+
+
+def _ggd_grid_write_once_mode(args: Any) -> bool:
+    """Return True when later GGD slices should reference the first grid only."""
+    return (not _ggd_grid_copy_mode(args)) and bool(getattr(args, "ggd_write_once", False))
+
+
+def _ggd_should_write_grid(args: Any) -> bool:
+    """Return True if this call should materialize a grid_ggd entry for this slice.
+
+    Modes:
+      - default: reconstruct grid/connectivity for every processed dump
+      - --ggd-write-once: only the first processed dump materializes grid_ggd
+      - --ggd-reuse-grid: every processed dump has a grid_ggd entry, but later ones
+        are copied from the first slice instead of being treated as a distinct topology
+    """
+    if _ggd_grid_copy_mode(args):
         return True
-    return bool(getattr(args, "_ggd_write_grid", False))
+    if _ggd_grid_write_once_mode(args):
+        return bool(getattr(args, "_ggd_write_grid", False))
+    return True
+
+
+def _ggd_should_reuse_first_grid(args: Any) -> bool:
+    """Return True when later slices should reference the first grid entry directly."""
+    return _ggd_grid_write_once_mode(args)
+
+
+def _ggd_should_copy_first_grid(args: Any) -> bool:
+    """Return True when later slices should copy grid/topology from the first entry."""
+    return _ggd_grid_copy_mode(args) and (not bool(getattr(args, "_ggd_write_grid", False)))
 
 
 def _ggd_should_write_step(args: Any) -> bool:
-    """Return True if GGD-bearing IDS content should be written for this processed dump.
+    """Return True if GGD values should be written for this processed dump.
 
-    When --ggd-write-once is enabled, we keep only the first processed GGD time slice
-    (for example mhd.ggd, core_profiles.ggd, edge_profiles.ggd) and skip GGD writes for
-    all later dumps. The per-file decision is communicated via args._ggd_write_step
-    (set in main()).
+    Current semantics: GGD *values* are written for every processed dump. Controls such
+    as --ggd-reuse-grid and --ggd-write-once only suppress repeated grid/connectivity
+    writes; they do not suppress time-dependent field updates.
     """
-    if not bool(getattr(args, "ggd_write_once", False)):
-        return True
-    return bool(getattr(args, "_ggd_write_step", False))
+    return True
 
 
 def _ggd_write_full_objects_enabled(args: Any) -> bool:
@@ -4727,8 +4762,9 @@ def _append_time_ggd(mhd: Any, t: float, *, write_grid: bool = True, reuse_grid:
 
     Reuse semantics:
         If reuse_grid=True and write_grid=False, `grid_ggd` is *not* extended; instead, the
-        first grid entry (igrid=0) is reused for all subsequent slices. This is intended to
-        prevent pathological output growth when the grid/connectivity are time-invariant.
+        first grid entry (igrid=0) is reused for all subsequent slices. This implements the
+        --ggd-write-once behavior.  The distinct --ggd-reuse-grid mode still extends
+        `grid_ggd`; the later per-slice copies are handled after persistence.
     """
     # Always extend the values AoS
     cur = _aos_len(getattr(mhd, "ggd"))
@@ -5160,7 +5196,7 @@ def _gridggd_write_full_objects_imas(
             op2 = sp.objects_per_dimension[2]
             op2.object.resize(n_cells)
             for i in range(n_cells):
-                op2.object[i].nodes = conn_i32[i, :].tolist()
+                op2.object[i].nodes = _np.asarray(conn_i32[i, :], dtype=_np.int32)
         except Exception as e:
             raise RuntimeError(f"Failed to populate 2D cell objects: {e}") from e
     elif cell_obj_dim == 3:
@@ -5177,14 +5213,14 @@ def _gridggd_write_full_objects_imas(
             op2.object.resize(n_faces)
             for i in range(n_faces):
                 nf = int(face_nodes_shape[i])
-                op2.object[i].nodes = face_nodes[i, :nf].tolist()
+                op2.object[i].nodes = _np.asarray(face_nodes[i, :nf], dtype=_np.int32)
         except Exception as e:
             raise RuntimeError(f"Failed to populate 2D face objects: {e}") from e
         try:
             op3 = sp.objects_per_dimension[3]
             op3.object.resize(n_cells)
             for i in range(n_cells):
-                op3.object[i].nodes = conn_i32[i, :].tolist()
+                op3.object[i].nodes = _np.asarray(conn_i32[i, :], dtype=_np.int32)
                 nb = int(cell_boundary_shape[i])
                 try:
                     op3.object[i].boundary.resize(nb)
@@ -5534,7 +5570,7 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
 
     if use_fe_nodes:
         write_grid = _ggd_should_write_grid(args)
-        it, ig = _append_time_ggd(mhd, t, write_grid=write_grid, reuse_grid=bool(getattr(args, "ggd_reuse_grid", False)))
+        it, ig = _append_time_ggd(mhd, t, write_grid=write_grid, reuse_grid=_ggd_should_reuse_first_grid(args))
         g = mhd.grid_ggd[ig]
         gidx = int(ig + 1)
         try:
@@ -6449,7 +6485,7 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
         V3 = _np.stack(vals_phi, axis=2)
         return rc, zc, V3
 
-    it, ig = _append_time_ggd(mhd, t, write_grid=_ggd_should_write_grid(args), reuse_grid=bool(getattr(args, "ggd_reuse_grid", False)))
+    it, ig = _append_time_ggd(mhd, t, write_grid=_ggd_should_write_grid(args), reuse_grid=_ggd_should_reuse_first_grid(args))
     g = mhd.grid_ggd[ig]
     gidx = int(ig + 1)
     try:
@@ -6529,7 +6565,7 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
                     _nverts_full = 8 if _conn_kind_full == 'hex' else (6 if _conn_kind_full == 'fe_wedge' else (3 if _conn_kind_full == 'fe_tri' else 3))
                     op_cell = sp.objects_per_dimension[_cell_dim_full]
                     op_cell.object.resize(1)
-                    op_cell.object[0].nodes = [1] * int(max(2, _nverts_full))
+                    op_cell.object[0].nodes = np.ones(int(max(2, _nverts_full)), dtype=np.int32)
                 except Exception:
                     pass
 
@@ -7497,6 +7533,224 @@ def _ids_backend_h5_loc(entry_dir: str, ids_name: str, occ: int):
         if os.path.exists(p):
             return p, g
     return cands[0]
+
+
+def _ids_reflective_copy(dst: Any, src: Any, *, _depth: int = 0, _max_depth: int = 32) -> None:
+    """Best-effort recursive copy between IMAS-Python wrapper objects."""
+    if _depth > _max_depth or (src is None) or (dst is None):
+        return
+
+    def _is_scalar_like(v: Any) -> bool:
+        return isinstance(v, (str, bytes, bool, int, float, complex, np.generic))
+
+    def _is_array_like(v: Any) -> bool:
+        return isinstance(v, np.ndarray)
+
+    def _is_aos_like(v: Any) -> bool:
+        if v is None or isinstance(v, (str, bytes, np.ndarray, list, tuple, dict)):
+            return False
+        return hasattr(v, 'resize') and hasattr(v, '__len__') and hasattr(v, '__getitem__')
+
+    def _iter_public_attrs(obj: Any):
+        names = []
+        try:
+            d = getattr(obj, '__dict__', None)
+            if isinstance(d, dict):
+                names.extend(list(d.keys()))
+        except Exception:
+            pass
+        if not names:
+            try:
+                names.extend(dir(obj))
+            except Exception:
+                return []
+        seen = set()
+        out = []
+        for name in names:
+            if (not name) or name.startswith('_') or (name in seen):
+                continue
+            seen.add(name)
+            try:
+                val = getattr(obj, name)
+            except Exception:
+                continue
+            if callable(val):
+                continue
+            out.append(name)
+        return out
+
+    for name in _iter_public_attrs(src):
+        try:
+            s = getattr(src, name)
+        except Exception:
+            continue
+        try:
+            d = getattr(dst, name)
+        except Exception:
+            d = None
+
+        if _is_scalar_like(s):
+            try:
+                setattr(dst, name, s.item() if isinstance(s, np.generic) else s)
+            except Exception:
+                pass
+            continue
+
+        if _is_array_like(s):
+            arr = np.array(s, copy=True)
+            try:
+                if d is not None and hasattr(d, 'shape'):
+                    try:
+                        d[...] = arr
+                    except Exception:
+                        setattr(dst, name, arr)
+                else:
+                    setattr(dst, name, arr)
+            except Exception:
+                pass
+            continue
+
+        if _is_aos_like(s):
+            if d is None:
+                continue
+            try:
+                n = len(s)
+            except Exception:
+                n = 0
+            try:
+                d.resize(n)
+            except Exception:
+                pass
+            for i in range(n):
+                try:
+                    _ids_reflective_copy(d[i], s[i], _depth=_depth + 1, _max_depth=_max_depth)
+                except Exception:
+                    continue
+            continue
+
+        if isinstance(s, (list, tuple)):
+            try:
+                setattr(dst, name, list(s))
+            except Exception:
+                pass
+            continue
+
+        if d is not None:
+            try:
+                _ids_reflective_copy(d, s, _depth=_depth + 1, _max_depth=_max_depth)
+            except Exception:
+                pass
+
+
+
+def _copy_first_gridggd_entry_imas(db: Any, factory: Any, ids_name: str, occ: int, ids_current: Any, *, log=None) -> bool:
+    """Copy the first persisted ``grid_ggd`` entry into the current slice via IMAS objects."""
+    if log is None:
+        log = logging.getLogger(__name__)
+    try:
+        src_ids = _db_get(db, factory, ids_name, occ)
+    except Exception:
+        src_ids = None
+    if src_ids is None:
+        return False
+    try:
+        src_grid = getattr(src_ids, 'grid_ggd', None)
+        dst_grid = getattr(ids_current, 'grid_ggd', None)
+    except Exception:
+        return False
+    if (src_grid is None) or (dst_grid is None):
+        return False
+    try:
+        if len(src_grid) == 0:
+            return False
+    except Exception:
+        return False
+    try:
+        if len(dst_grid) == 0:
+            dst_grid.resize(1)
+    except Exception:
+        return False
+    try:
+        _ids_reflective_copy(dst_grid[0], src_grid[0])
+        log.info("%s occ=%d: copied grid_ggd from first persisted slice via IMAS-Python objects", ids_name, occ)
+        return True
+    except Exception as e:
+        log.warning("%s occ=%d: native IMAS grid_ggd copy failed: %s", ids_name, occ, e)
+        return False
+
+
+def _copy_first_gridggd_entry_h5(entry_dir: str, ids_name: str, occ: int, *, log=None) -> None:
+    """Copy the first persisted ``grid_ggd`` entry into the latest entry.
+
+    This implements the storage semantics of ``--ggd-reuse-grid``: each time slice keeps its
+    own ``grid_ggd`` entry, but the geometry/connectivity payload for later slices is copied
+    from slice 0 instead of being treated as a distinct reconstructed topology.
+    """
+    import os
+    import h5py
+    import numpy as np
+
+    if log is None:
+        log = logging.getLogger(__name__)
+
+    h5_path, grp_name = _ids_backend_h5_loc(entry_dir, ids_name, occ)
+    grp_name = str(grp_name).lstrip("/")
+    if not os.path.exists(h5_path):
+        return
+
+    with h5py.File(h5_path, "r+") as h5:
+        if grp_name not in h5:
+            return
+        g = h5[grp_name]
+
+        nggd = None
+        try:
+            if "grid_ggd[]&time" in g:
+                ds = g["grid_ggd[]&time"]
+                if ds.ndim >= 1:
+                    nggd = int(ds.shape[0])
+                    if ds.ndim >= 2:
+                        nggd = int(ds.shape[0])
+        except Exception:
+            nggd = None
+        if (nggd is None) or (nggd < 2):
+            try:
+                if "grid_ggd[]&space[]&AOS_SHAPE" in g:
+                    ds = g["grid_ggd[]&space[]&AOS_SHAPE"]
+                    if ds.ndim >= 1:
+                        nggd = int(ds.shape[0])
+            except Exception:
+                nggd = None
+        if (nggd is None) or (nggd < 2):
+            return
+
+        last = int(nggd - 1)
+        copied = 0
+        for name, ds in list(g.items()):
+            if not isinstance(ds, h5py.Dataset):
+                continue
+            if not str(name).startswith("grid_ggd[]&"):
+                continue
+            if str(name) == "grid_ggd[]&time":
+                continue
+            if ds.ndim < 1:
+                continue
+            if int(ds.shape[0]) != int(nggd):
+                continue
+            try:
+                ds[last, ...] = ds[0, ...]
+                copied += 1
+            except Exception:
+                continue
+
+        if copied > 0:
+            try:
+                log.info(
+                    "%s occ=%d: copied persisted grid_ggd geometry/connectivity from first slice to slice %d",
+                    str(ids_name), int(occ), int(last),
+                )
+            except Exception:
+                pass
 
 
 def _repair_gridggd_root_h5(entry_dir: str, ids_name: str, occ: int, *, times=None, nspace: int = 1, space_names=None, log=None) -> None:
@@ -9406,7 +9660,7 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
     )
 
     if use_fe_nodes:
-        it, ig = _append_time_ggd(ep, t, write_grid=_ggd_should_write_grid(args), reuse_grid=bool(getattr(args, "ggd_reuse_grid", False)))
+        it, ig = _append_time_ggd(ep, t, write_grid=_ggd_should_write_grid(args), reuse_grid=_ggd_should_reuse_first_grid(args))
         g = ep.grid_ggd[ig]
         try:
             g.identifier.name = "nimrod_fe_rz_nodes_tri"
@@ -9975,7 +10229,7 @@ def populate_edge_profiles_ggd(ep: Any, data: Dict[str, Any], args) -> None:
             jr2d = jz2d = jtor2d = None
 
     # Append time slice to GGD arrays.
-    it, ig = _append_time_ggd(ep, t, write_grid=_ggd_should_write_grid(args), reuse_grid=bool(getattr(args, "ggd_reuse_grid", False)))
+    it, ig = _append_time_ggd(ep, t, write_grid=_ggd_should_write_grid(args), reuse_grid=_ggd_should_reuse_first_grid(args))
     g = ep.grid_ggd[ig]
     gidx = int(ig)
 
@@ -12366,8 +12620,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--ggd-write-once",
         action="store_true",
         help=(
-            "Write GGD-bearing IDS content only for the first processed dump/time step. Later dumps still "
-            "update non-GGD outputs, but mhd.ggd/core_profiles.ggd/edge_profiles.ggd are skipped."
+            "Write GGD grid/connectivity only for the first processed dump/time step. Later GGD field slices are still "
+            "written, but they reference the first grid instead of storing another copy. If used together with "
+            "--ggd-reuse-grid, this option is ignored and copy semantics are used."
         ),
     )
 
@@ -12391,8 +12646,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--ggd-reuse-grid",
         action="store_true",
         help=(
-            "Assume grid and connectivity are invariant over time. Write grid_ggd geometry/connectivity only for the "
-            "first input dump, and reuse it for subsequent time slices (ggd values will reference grid_index=1)."
+            "Assume grid and connectivity are invariant over time. For each later processed dump/time step, copy the "
+            "first grid_ggd grid/connectivity into the new slice instead of reconstructing it. If used together with "
+            "--ggd-write-once, copy semantics take precedence and --ggd-write-once is ignored."
+        ),
+    )
+
+    p.add_argument(
+        "--ggd-reuse-grid-via",
+        choices=("auto", "h5py", "imas"),
+        default="auto",
+        help=(
+            "Implementation used for --ggd-reuse-grid copies. auto follows --writer/--backend: "
+            "HDF5 backend with direct patching uses h5py; otherwise the first grid_ggd entry is copied through "
+            "IMAS-Python objects. Use 'imas' to force native object copying even on HDF5 backends."
         ),
     )
 
@@ -12486,12 +12753,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # h5py patching can only target HDF5 backend directories.
         args.writer = "imas"
 
+    args.ggd_reuse_grid_via = str(getattr(args, "ggd_reuse_grid_via", "auto") or "auto").strip().lower()
+    if args.ggd_reuse_grid_via not in ("auto", "h5py", "imas"):
+        args.ggd_reuse_grid_via = "auto"
+    if (str(args.backend).strip().lower() != "hdf5") and (args.ggd_reuse_grid_via == "h5py"):
+        args.ggd_reuse_grid_via = "imas"
+
     # Logging (explicitly show which psi reconstruction/fallback path is selected)
     logging.basicConfig(
         level=(logging.WARNING if getattr(args, "quiet", False) else logging.INFO),
         format="%(asctime)s %(levelname)s %(message)s",
     )
     log = logging.getLogger("dump2imas")
+    if bool(getattr(args, "ggd_reuse_grid", False)) and bool(getattr(args, "ggd_write_once", False)):
+        log.warning(
+            "Conflicting GGD grid controls: both --ggd-reuse-grid and --ggd-write-once were supplied. "
+            "The script will copy grid/connectivity from the first slice for later slices; "
+            "--ggd-write-once is ignored."
+        )
+    if bool(getattr(args, "ggd_reuse_grid", False)):
+        log.info("GGD reuse-grid copy mode: %s", _ggd_reuse_grid_copy_mode(args))
     # For ParaView / IMAS-ParaView, the object-based GGD representation is the robust default.
     # Keep the packed layout available only when the user explicitly requests it.
     if bool(getattr(args, "ggd_unstructured", False)):
@@ -12597,11 +12878,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         # Directory of the current dump file (used to resolve optional inputs like contours.h5/peqdsk)
         setattr(args, "_run_dir", str(fn.parent))
-        # Communicate per-file GGD write policy to helpers.
-        # When --ggd-reuse-grid is enabled, we only write grid_ggd on the first processed dump.
+        # Communicate per-file GGD grid policy to helpers.
+        #   default            -> reconstruct grid/connectivity for every processed dump
+        #   --ggd-write-once   -> only the first processed dump materializes grid_ggd
+        #   --ggd-reuse-grid   -> later dumps get a grid_ggd entry copied from the first one
         setattr(args, "_ggd_write_grid", (ifile == 1))
-        # When --ggd-write-once is enabled, we only write GGD-bearing IDS content for the first dump.
-        setattr(args, "_ggd_write_step", (ifile == 1))
+        # GGD values are written for every processed dump; keep this flag for compatibility.
+        setattr(args, "_ggd_write_step", True)
 
         _log(f"Reading {fn.name} ({ifile}/{len(dump_files)})", args.quiet)
         data = read_and_stitch_dump(fn, args)
@@ -12679,6 +12962,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         populate_core_profiles(cp, data, t_index=0, args=args)
         if _ggd_should_write_step(args):
             populate_core_profiles_ggd(cp, data, args=args)
+        if (ifile > 1) and _ggd_should_copy_first_grid(args) and (_ggd_reuse_grid_copy_mode(args) == "imas"):
+            _copy_first_gridggd_entry_imas(db, factory, "core_profiles", int(cp_occ), cp, log=log)
 
         try:
             has_1d = hasattr(cp, "profiles_1d") and _aos_has_entries(cp.profiles_1d)
@@ -12699,6 +12984,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             log.info("Wrote core_profiles (occ=%d)", int(cp_occ))
             if has_ggd and _use_h5py_patches(args):
                 _patch_core_profiles_ggd_required_leaves_h5(str(entry_dir), int(cp_occ), data, args, log)
+            if has_ggd and (str(getattr(args, "backend", "hdf5") or "hdf5").strip().lower() == "hdf5") and _ggd_should_copy_first_grid(args) and (_ggd_reuse_grid_copy_mode(args) == "h5py"):
+                    _copy_first_gridggd_entry_h5(str(entry_dir), "core_profiles", int(cp_occ), log=log)
 
 
         # edge_profiles: equilibrium-only (profiles_1d + optional GGD)
@@ -12716,6 +13003,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             populate_edge_profiles(ep, data, t_index=0, args=args)
             if _ggd_should_write_step(args):
                 populate_edge_profiles_ggd(ep, data, args=args)
+            if (ifile > 1) and _ggd_should_copy_first_grid(args) and (_ggd_reuse_grid_copy_mode(args) == "imas"):
+                _copy_first_gridggd_entry_imas(db, factory, "edge_profiles", int(occ_base), ep, log=log)
 
             try:
                 has_1d = hasattr(ep, "profiles_1d") and _aos_has_entries(ep.profiles_1d)
@@ -13267,6 +13556,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
                             except Exception as e:
                                 log.warning('edge_profiles GGD required leaves (h5py direct) write failed: %s', e)
+                    if has_ggd and (str(getattr(args, "backend", "hdf5") or "hdf5").strip().lower() == "hdf5") and _ggd_should_copy_first_grid(args) and (_ggd_reuse_grid_copy_mode(args) == "h5py"):
+                        _copy_first_gridggd_entry_h5(str(entry_dir), "edge_profiles", int(occ_base), log=log)
+
                     # If unstructured GGD is requested, we'll mirror edge_profiles electrons.temperature from the mhd GGD
                     # after the mhd IDS is written (see below). This avoids fragile interpolation and keeps node ordering identical.
                     edge_profiles_need_mirror = bool(getattr(args, 'ggd_unstructured', False) and (str(getattr(args, 'edge_ggd_values', 'equilibrium') or 'equilibrium').strip().lower() == 'full'))
@@ -13384,6 +13676,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     _ensure_gridggd_space_identifier(mhd_s)
                     _set_ids_cocos(mhd_s, COCOS_OUT_DEFAULT)
 
+                    if (ifile > 1) and _ggd_should_copy_first_grid(args) and (_ggd_reuse_grid_copy_mode(args) == "imas"):
+                        _copy_first_gridggd_entry_imas(db, factory, "mhd", int(occ), mhd_s, log=log)
+
                     if occ not in mhd_bootstrap_done:
 
                         _db_put_full_once(db, mhd_s, occ)
@@ -13462,6 +13757,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             _log('Wrote IMAS-standard unstructured grid_ggd nodes/connectivity into mhd HDF5 (h5py)', args.quiet)
                     except Exception as _e:
                         _log(f"[warn] Could not write unstructured grid_ggd nodes/connectivity: {_e}", args.quiet)
+                if (str(getattr(args, "backend", "hdf5") or "hdf5").strip().lower() == "hdf5") and _ggd_should_copy_first_grid(args) and (_ggd_reuse_grid_copy_mode(args) == "h5py"):
+                    try:
+                        for _s in range(nspec_mhd):
+                            _occ_s = occ_base + int(_s)
+                            _copy_first_gridggd_entry_h5(str(entry_dir), "mhd", int(_occ_s), log=log)
+                    except Exception as _e:
+                        _log(f"[warn] Could not copy persisted grid_ggd from first slice: {_e}", args.quiet)
+
                 _log("Populated mhd IDS (GGD full-field snapshot)", args.quiet)
                 # Mirror edge_profiles electrons.temperature from mhd GGD ONLY when requested.
                 # For --edge-ggd-values equilibrium we want edge_profiles to remain equilibrium-only.
@@ -13483,8 +13786,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             except Exception as e:
                 _log(f"[warn] Failed to populate/put mhd IDS (GGD): {e}", args.quiet)
 
-        if write_mhd and (mhd is not None) and (not _ggd_should_write_step(args)):
-            _log("Skipped GGD-bearing IDS writes for this dump because --ggd-write-once is enabled", args.quiet)
+        if write_mhd and (mhd is not None):
+            if _ggd_grid_write_once_mode(args) and (not _ggd_should_write_grid(args)):
+                _log("Reused previously written GGD grid/connectivity for this dump (--ggd-write-once)", args.quiet)
+            elif _ggd_should_copy_first_grid(args):
+                _log(f"Copied GGD grid/connectivity from the first dump for this slice (--ggd-reuse-grid, via={_ggd_reuse_grid_copy_mode(args)})", args.quiet)
 
         _log(f"Appended IDS slices for {fn.name}", args.quiet)
 
@@ -13644,6 +13950,12 @@ def _mirror_edge_profiles_from_mhd_h5(
     """
     if log is None:
         log = logging.getLogger("dump2imas")
+    if bool(getattr(args, "ggd_reuse_grid", False)) and bool(getattr(args, "ggd_write_once", False)):
+        log.warning(
+            "Conflicting GGD grid controls: both --ggd-reuse-grid and --ggd-write-once were supplied. "
+            "The script will copy grid/connectivity from the first slice for later slices; "
+            "--ggd-write-once is ignored."
+        )
 
     import re as _re
     import h5py as _h5py

@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.4](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.4.3...nimrod2imas-v0.4.4) (2026-03-16)
+
+
+### Bug Fixes
+
+* Saving sequence of times in mhd ids ([02ccd21](https://github.com/PrincetonUniversity/nimrod2imas/commit/02ccd217ed8102fabf2573cd24509f8faa4c09c7))
+* Saving sequence of times in mhd ids ([3e47d13](https://github.com/PrincetonUniversity/nimrod2imas/commit/3e47d13a694e936e776fd65f3d42c5e275e873d8))
+
 ## [0.4.3](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.4.2...nimrod2imas-v0.4.3) (2026-03-15)
 
 

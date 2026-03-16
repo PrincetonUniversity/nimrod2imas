@@ -22,6 +22,19 @@ Install the Python dependencies listed in `requirements.txt`:
 python -m pip install -r requirements.txt
 ```
 
+The repository also provides a `constraints.txt`, install with constraints so that indirect dependencies are added consistently across environments:
+
+```bash
+python -m pip install -U pip setuptools wheel
+python -m pip install -r requirements.txt -c constraints.txt
+```
+
+Recommended convention:
+- `requirements.txt`: direct project dependencies
+- `constraints.txt`: indirect/transitive packages and environment-specific compatibility
+
+This is particularly useful for packages pulled in by `omfit-classes` and related tooling.
+
 `omfit-classes` must be available to read/write GEQDSK and p-files (Osborne format).
 
 > Note: Some scripts are compatible with “IMAS-Python-only” (URI filesystem backend). Others may also support “IMAS-Core/HLI” environments. Prefer the filesystem-backed mode unless you explicitly need HLI.
@@ -59,6 +72,7 @@ Most scripts follow the same argument set for selecting the entry:
 
 Some scripts also support:
 - `--entry <path>`: explicit entry directory; overrides `--dbpath/--dd/...`
+- `--writer {auto,h5py,imas}`: for scripts such as `dump2imas.py`, select whether IDS content is written via direct HDF5 patching or via native IMAS-Python objects.
 
 ---
 
@@ -141,11 +155,29 @@ To control how far outside the LCFS the 1D grid extends:
 
 **Usage (typical)**
 ```bash
-python dump2imas.py dumpgll.0000*.h5 \
-  --dd d3d --dd-version 4.1.1 --pulse 163518 --run 1 \
-  --backend hdf5  
+python dump2imas.py dumpgll.0000*.h5   --dd d3d --dd-version 4.1.1 --pulse 163518 --run 1   --backend hdf5
 ```
 
+#### Write implementation selection (recent change)
+
+`dump2imas.py` now separates the **IMAS backend** from the **writer implementation** used to populate IDS content:
+
+- `--backend {hdf5,ascii,netcdf,...}`
+  - Selects the IMAS storage backend.
+- `--writer {auto,h5py,imas}`
+  - `auto`: use direct HDF5 patching only when the backend is HDF5; otherwise use IMAS-Python objects.
+  - `h5py`: force direct HDF5 patching (fast, HDF5-only).
+  - `imas`: force native IMAS-Python writing (DD-aware; required for non-HDF5 backends, typically slower for large GGD writes).
+
+Examples:
+
+```bash
+# Native IMAS-Python path
+python dump2imas.py dumpgll.*.h5   --dd d3d --dd-version 4.1.1 --pulse 163518 --run 77   --backend hdf5 --writer imas
+
+# Direct HDF5 patch path
+python dump2imas.py dumpgll.*.h5   --dd d3d --dd-version 4.1.1 --pulse 163518 --run 77   --backend hdf5 --writer h5py
+```
 
 #### Additional flags (profiles, units, time, and GGD)
 
@@ -210,27 +242,50 @@ For workflows that need explicit node coordinates and explicit connectivity (e.g
   - `fe_wedge`: volumetric wedge (triangular-prism) connectivity obtained by extruding the `fe_tri` connectivity between adjacent toroidal planes. This is the recommended option for a true 3D toroidal mesh in ParaView.
   - `hex`: hexahedral connectivity on the reconstructed `(R,Z,φ)` product grid with periodicity in φ. Use this only for regular-grid workflows; it is not the native FE-preserving representation.
 
-- `--ggd-representation {full,packed}`
-  - `full`: write the DD4-style object-based `grid_ggd.space[].objects_per_dimension[]` representation. This is the recommended mode for ParaView/IMAS-ParaView and for downstream tools that need explicit node/cell objects.
-  - `packed`: compact representation using packed subsets/elements. Keep this only for legacy consumers that explicitly expect it.
+- `--ggd-representation {packed,full,both}`
+  - `full` (default): write the DD4-style object-based `grid_ggd.space[].objects_per_dimension[]` representation. This is the recommended mode for ParaView/IMAS-ParaView and for downstream tools that need explicit node/cell objects.
+  - `both`: also request the object-based representation.
+  - `packed`: compact representation using packed subsets/elements. Keep this only for specialized legacy consumers.
+
+- `--ggd-write-full-objects`
+  - Explicitly request the IMAS-standard object-based unstructured GGD representation under `grid_ggd.space[0].objects_per_dimension`.
+  - This is the recommended switch for IMAS-ParaView compatibility.
+
+- `--ggd-write-once`
+  - Write grid + connectivity only for the first processed dump/time slice.
+  - Later GGD field slices are still written, but they reuse/reference the first grid instead of storing another copy.
 
 - `--ggd-reuse-grid`
   - Assume grid and connectivity are invariant over time.
-  - Write `grid_ggd` geometry/connectivity only for the first dump and reuse it for subsequent time slices (subsequent values reference `grid_index=1`).
+  - For each later processed dump/time slice, copy the first `grid_ggd` grid/connectivity into the new slice instead of reconstructing it.
+
+- `--ggd-reuse-grid-via {auto,h5py,imas}`
+  - Select how `--ggd-reuse-grid` performs the copy.
+  - `auto`: follow `--writer/--backend`.
+  - `h5py`: force HDF5-level copy of the first persisted `grid_ggd`.
+  - `imas`: force native IMAS-Python object copying.
+
+**Interaction between `--ggd-write-once` and `--ggd-reuse-grid`**
+- The two options are treated as conflicting policies.
+- If both are set, **copy semantics win**: `--ggd-reuse-grid` takes precedence and `--ggd-write-once` is ignored.
 
 ##### Recommended GGD options for ParaView / IMAS-ParaView
 
-For the most robust ParaView workflow, prefer:
+For the most robust ParaView workflow, prefer one of the following:
 
 ```bash
-python dump2imas.py dumpgll.*.h5   --dd <device> --dd-version 4.1.1 --pulse <pulse> --run <run>   --backend hdf5   --ggd-unstructured --ggd-unstructured-fe-nodes   --ggd-connectivity fe_wedge   --ggd-representation full   --ggd-reuse-grid
+# Single stored grid_ggd, later field slices reference it
+python dump2imas.py dumpgll.*.h5   --dd <device> --dd-version 4.1.1 --pulse <pulse> --run <run>   --backend hdf5 --writer h5py   --ggd-unstructured --ggd-unstructured-fe-nodes   --ggd-connectivity fe_wedge   --ggd-write-full-objects   --ggd-write-once
+
+# Copy the first grid_ggd into later slices instead of reconstructing it
+python dump2imas.py dumpgll.*.h5   --dd <device> --dd-version 4.1.1 --pulse <pulse> --run <run>   --backend hdf5 --writer imas   --ggd-unstructured --ggd-unstructured-fe-nodes   --ggd-connectivity fe_wedge   --ggd-write-full-objects   --ggd-reuse-grid --ggd-reuse-grid-via imas
 ```
 
 Notes:
 - The script inverts the toroidal angle consistent with COCOS=2 to COCOS=17 conversion
 - `fe_wedge` is the recommended connectivity for a **3D volumetric torus**.
 - `fe_tri` is a **surface** representation only; it should not be expected to produce volumetric cells in ParaView.
-- `full` is preferred over `packed` for `ggd2vtk` / `imas2vtu` conversion.
+- `--ggd-write-full-objects` (or equivalently `--ggd-representation full`) is preferred over packed-only output for `ggd2vtk` / `imas2vtu` conversion.
 - When changing GGD layout or connectivity options, write to a **fresh IMAS run/entry**. Reusing an older HDF5 entry can leave stale `grid_ggd` leaves that confuse downstream readers.
 
 ##### ParaView / `ggd2vtk` remarks
@@ -422,7 +477,10 @@ Some environments require setting `IMAS_VERSION` or passing `dd_version` directl
   Check that GEQDSK includes limiter arrays (`LIMITR`, `RLIM`, `ZLIM`) and that you used the expected occurrence (`--occ`) when reading.
 
 - **ParaView shows isolated toroidal planes or `vtkGeometryFilter ... Unknown cell type`**  
-  Start with `--ggd-unstructured --ggd-unstructured-fe-nodes --ggd-connectivity fe_wedge --ggd-representation full`. Verify that the IMAS-ParaView reader is selecting 3D cell objects, not only 2D faces. Also make sure you are writing to a fresh IMAS entry after changing GGD options.
+  Start with `--ggd-unstructured --ggd-unstructured-fe-nodes --ggd-connectivity fe_wedge --ggd-write-full-objects`. Verify that the IMAS-ParaView reader is selecting 3D cell objects, not only 2D faces. Also make sure you are writing to a fresh IMAS entry after changing GGD options.
+
+- **`ALBackendException = Unable to extend the existing dataset` on later `mhd` slices**  
+  This usually indicates that the entry already contains an incompatible `grid_ggd` layout from an earlier run, or that the GGD policy changed between runs. Write to a fresh IMAS run/entry when switching among reconstruction, `--ggd-write-once`, and `--ggd-reuse-grid` workflows.
 
 - **`plot_mhd.py` shows distorted contours after switching to full-object GGD**  
   Update to the current plotting script so that it correctly interprets cylindrical node geometry ordering and resolves `grid_subset_index` against the actual `grid_subset[].identifier.index` values.

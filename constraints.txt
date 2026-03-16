@@ -1,0 +1,6 @@
+pexpect
+uncertainties
+netcdf4
+omas
+tqdm
+fortranformat

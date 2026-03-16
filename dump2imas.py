@@ -4731,6 +4731,26 @@ def _ggd_should_copy_first_grid(args: Any) -> bool:
     return _ggd_grid_copy_mode(args) and (not bool(getattr(args, "_ggd_write_grid", False)))
 
 
+def _mhd_should_defer_grid_to_postwrite(args: Any) -> bool:
+    """Return True when later nonlinear MHD slices must not materialize ``grid_ggd`` via put_slice().
+
+    In HDF5-backed flows that reuse/copy a previously persisted grid, handing a non-empty
+    ``grid_ggd`` AoS to ``put_slice()`` can make the Access Layer try to extend large persisted
+    object arrays again.  That is exactly the failure mode behind errors such as
+    ``al_begin_arraystruct_action: Unable to extend the existing dataset`` on the second slice.
+
+    For these later slices we write only the time-dependent ``ggd`` values through IMAS and let
+    the post-write repair/copy path manage ``grid_ggd``.
+    """
+    if bool(getattr(args, "_ggd_write_grid", False)):
+        return False
+    if _ggd_grid_write_once_mode(args):
+        return True
+    if _ggd_should_copy_first_grid(args) and (_ggd_reuse_grid_copy_mode(args) == "h5py"):
+        return True
+    return False
+
+
 def _ggd_should_write_step(args: Any) -> bool:
     """Return True if GGD values should be written for this processed dump.
 
@@ -4753,7 +4773,7 @@ def _ggd_write_full_objects_enabled(args: Any) -> bool:
     return rep in ("full", "both")
 
 
-def _append_time_ggd(mhd: Any, t: float, *, write_grid: bool = True, reuse_grid: bool = False) -> tuple[int, int]:
+def _append_time_ggd(mhd: Any, t: float, *, write_grid: bool = True, reuse_grid: bool = False, ensure_reuse_grid_exists: bool = True) -> tuple[int, int]:
     """Append a new time slice to `mhd.ggd` and (optionally) `mhd.grid_ggd`.
 
     Returns:
@@ -4775,16 +4795,19 @@ def _append_time_ggd(mhd: Any, t: float, *, write_grid: bool = True, reuse_grid:
         mhd.grid_ggd.resize(cur + 1)
         igrid = cur
     else:
-        # Ensure at least one grid exists if we intend to reuse it
-        try:
-            ng = _aos_len(getattr(mhd, "grid_ggd"))
-        except Exception:
-            ng = 0
-        if ng < 1:
+        # Optionally ensure at least one grid exists if we intend to reuse it.
+        # Later HDF5-backed reuse/copy flows may explicitly suppress even this shallow
+        # placeholder so that put_slice() only appends the time-dependent GGD values.
+        if ensure_reuse_grid_exists:
             try:
-                mhd.grid_ggd.resize(1)
+                ng = _aos_len(getattr(mhd, "grid_ggd"))
             except Exception:
-                pass
+                ng = 0
+            if ng < 1:
+                try:
+                    mhd.grid_ggd.resize(1)
+                except Exception:
+                    pass
         igrid = 0
 
     def _set_time(aos, idx: int, val: float, label: str) -> None:
@@ -4823,7 +4846,7 @@ def _append_time_ggd(mhd: Any, t: float, *, write_grid: bool = True, reuse_grid:
     # keep the existing grid time (typically the first slice time).
     if write_grid:
         _set_time(mhd.grid_ggd, cur, t, "mhd.grid_ggd")
-    elif reuse_grid:
+    elif reuse_grid and ensure_reuse_grid_exists:
         # Best-effort: ensure grid_ggd[0].time exists (set once if missing).
         try:
             _ = mhd.grid_ggd[0].time
@@ -5570,83 +5593,92 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
 
     if use_fe_nodes:
         write_grid = _ggd_should_write_grid(args)
-        it, ig = _append_time_ggd(mhd, t, write_grid=write_grid, reuse_grid=_ggd_should_reuse_first_grid(args))
-        g = mhd.grid_ggd[ig]
-        gidx = int(ig + 1)
-        try:
-            g.identifier.name = "nimrod_fe_rzphi_nodes_tri"
-            g.identifier.index = int(ig + 1)
-            g.identifier.description = "Native stitched NIMROD FE nodes (R,Z) replicated in phi; triangulated 2D connectivity per plane"
-        except Exception:
-            pass
+        _defer_grid_to_postwrite = _mhd_should_defer_grid_to_postwrite(args)
+        it, ig = _append_time_ggd(
+            mhd,
+            t,
+            write_grid=(write_grid and (not _defer_grid_to_postwrite)),
+            reuse_grid=_ggd_should_reuse_first_grid(args),
+            ensure_reuse_grid_exists=(not _defer_grid_to_postwrite),
+        )
+        g = None if _defer_grid_to_postwrite else mhd.grid_ggd[ig]
+        gidx = 1 if _defer_grid_to_postwrite else int(ig + 1)
+        if g is not None:
+            try:
+                g.identifier.name = "nimrod_fe_rzphi_nodes_tri"
+                g.identifier.index = int(ig + 1)
+                g.identifier.description = "Native stitched NIMROD FE nodes (R,Z) replicated in phi; triangulated 2D connectivity per plane"
+            except Exception:
+                pass
 
-        # Ensure IMAS HDF5 backend creates the nested packed datasets for unstructured grid_ggd.
-        # Without at least one grid_subset/element placeholder, the backend may omit
-        # grid_ggd[]&grid_subset[]&AOS_SHAPE (and friends), and the packed writer cannot proceed.
-        try:
-            # Coordinate axes (R, Z, Phi)
-            g.space.resize(3)
-            for ii, nm in enumerate(["R", "Z", "Phi"]):
+        if g is not None:
+            # Ensure IMAS HDF5 backend creates the nested packed datasets for unstructured grid_ggd.
+            # Without at least one grid_subset/element placeholder, the backend may omit
+            # grid_ggd[]&grid_subset[]&AOS_SHAPE (and friends), and the packed writer cannot proceed.
+            try:
+                # Coordinate axes (R, Z, Phi)
+                g.space.resize(3)
+                for ii, nm in enumerate(["R", "Z", "Phi"]):
+                    try:
+                        g.space[ii].identifier.name = nm
+                        g.space[ii].identifier.index = -1
+                        g.space[ii].identifier.description = nm
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            try:
+                # Two subsets: nodes and volumes/connectivity
+                g.grid_subset.resize(2)
+
+                s0 = g.grid_subset[0]
                 try:
-                    g.space[ii].identifier.name = nm
-                    g.space[ii].identifier.index = -1
-                    g.space[ii].identifier.description = nm
+                    s0.dimension = 1
+                    s0.identifier.name = "nodes"
+                    s0.identifier.index = 1
+                    s0.identifier.description = "Unstructured nodes"
                 except Exception:
                     pass
-        except Exception:
-            pass
-
-        try:
-            # Two subsets: nodes and volumes/connectivity
-            g.grid_subset.resize(2)
-
-            s0 = g.grid_subset[0]
-            try:
-                s0.dimension = 1
-                s0.identifier.name = "nodes"
-                s0.identifier.index = 1
-                s0.identifier.description = "Unstructured nodes"
-            except Exception:
-                pass
-            try:
-                s0.element.resize(1)
                 try:
-                    s0.element[0].object.resize(0)
+                    s0.element.resize(1)
+                    try:
+                        s0.element[0].object.resize(0)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+                s1 = g.grid_subset[1]
+                try:
+                    s1.dimension = 4
+                    s1.identifier.name = "volumes"
+                    s1.identifier.index = 43
+                    s1.identifier.description = "Unstructured connectivity"
+                except Exception:
+                    pass
+                try:
+                    s1.base.resize(1)
+                    s1.base[0].index = 0
+                    s1.base[0].grid_subset_index = 1
+                except Exception:
+                    pass
+                try:
+                    s1.element.resize(1)
+                    try:
+                        s1.element[0].object.resize(0)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             except Exception:
                 pass
 
-            s1 = g.grid_subset[1]
-            try:
-                s1.dimension = 4
-                s1.identifier.name = "volumes"
-                s1.identifier.index = 43
-                s1.identifier.description = "Unstructured connectivity"
-            except Exception:
-                pass
-            try:
-                s1.base.resize(1)
-                s1.base[0].index = 0
-                s1.base[0].grid_subset_index = 1
-            except Exception:
-                pass
-            try:
-                s1.element.resize(1)
+            if conn_kind == "fe_pointcloud":
                 try:
-                    s1.element[0].object.resize(0)
+                    g.grid_subset.resize(1)
                 except Exception:
                     pass
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-        if conn_kind == "fe_pointcloud":
-            try:
-                g.grid_subset.resize(1)
-            except Exception:
-                pass
 
         Rloc = R
         Zloc = Z
@@ -5669,12 +5701,12 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
         z_nodes = np.tile(z2d, int(nphi))
         phi_nodes = np.repeat(phi_list.astype(float), nn2d)
 
-        if write_grid:
+        if (g is not None) and write_grid:
             _gridggd_write_node_vectors(g, r_nodes, z_nodes, phi_nodes)
 
         # Connectivity (optional).
         if conn_kind != "fe_pointcloud":
-            if write_grid and _use_imas_connectivity_writer(args):
+            if (g is not None) and write_grid and _use_imas_connectivity_writer(args):
                 try:
                     nodes_xyz, connectivity, _meta = _build_unstructured_nodes_connectivity(data, args)
                     if _ggd_write_full_objects_enabled(args):
@@ -6509,6 +6541,19 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
         # (points as 0D objects with geometry, cells as 2D objects with nodes) under space[0].
         if _ggd_write_full_objects_enabled(args):
             _ggd_unstructured_objspace = True
+            # When full-object grids are persisted via the HDF5 patcher, later slices must avoid
+            # materializing nested objects_per_dimension/object[] placeholders through put_slice().
+            # Otherwise the AL tries to extend the already-patched large object datasets and can fail
+            # with errors such as "Unable to extend the existing dataset".  For those later slices,
+            # keep only the shallow space metadata here and let the h5py post-write path create/copy
+            # the heavy object arrays.
+            _defer_fullobj_nested_to_h5 = (
+                _use_h5py_patches(args)
+                and (
+                    _ggd_should_copy_first_grid(args)
+                    or ((not _ggd_should_write_grid(args)) and _ggd_should_reuse_first_grid(args))
+                )
+            )
             try:
                 g.space.resize(1)
                 sp = g.space[0]
@@ -6541,37 +6586,38 @@ def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | 
                 except Exception:
                     pass
 
-                # Ensure objects_per_dimension exists.
-                try:
-                    sp.objects_per_dimension.resize(4)
-                except Exception:
+                if not _defer_fullobj_nested_to_h5:
+                    # Ensure objects_per_dimension exists.
                     try:
-                        sp.objects_per_dimension.resize(3)
+                        sp.objects_per_dimension.resize(4)
+                    except Exception:
+                        try:
+                            sp.objects_per_dimension.resize(3)
+                        except Exception:
+                            pass
+
+                    # 0D: at least one point object with a non-empty geometry vector so the backend creates geometry datasets.
+                    try:
+                        op0 = sp.objects_per_dimension[0]
+                        op0.object.resize(1)
+                        op0.object[0].geometry = [0.0, 0.0, 0.0]
                     except Exception:
                         pass
 
-                # 0D: at least one point object with a non-empty geometry vector so the backend creates geometry datasets.
-                try:
-                    op0 = sp.objects_per_dimension[0]
-                    op0.object.resize(1)
-                    op0.object[0].geometry = [0.0, 0.0, 0.0]
-                except Exception:
-                    pass
-
-                # Highest-dimensional connectivity object: faces for fe_tri, volumes for hex/fe_wedge.
-                try:
-                    _conn_kind_full = str(getattr(args, "ggd_connectivity", "none") or "none").strip().lower()
-                    _cell_dim_full = _ggd_connectivity_object_dimension(_conn_kind_full, None)
-                    _nverts_full = 8 if _conn_kind_full == 'hex' else (6 if _conn_kind_full == 'fe_wedge' else (3 if _conn_kind_full == 'fe_tri' else 3))
-                    op_cell = sp.objects_per_dimension[_cell_dim_full]
-                    op_cell.object.resize(1)
-                    op_cell.object[0].nodes = np.ones(int(max(2, _nverts_full)), dtype=np.int32)
-                except Exception:
-                    pass
+                    # Highest-dimensional connectivity object: faces for fe_tri, volumes for hex/fe_wedge.
+                    try:
+                        _conn_kind_full = str(getattr(args, "ggd_connectivity", "none") or "none").strip().lower()
+                        _cell_dim_full = _ggd_connectivity_object_dimension(_conn_kind_full, None)
+                        _nverts_full = 8 if _conn_kind_full == 'hex' else (6 if _conn_kind_full == 'fe_wedge' else (3 if _conn_kind_full == 'fe_tri' else 3))
+                        op_cell = sp.objects_per_dimension[_cell_dim_full]
+                        op_cell.object.resize(1)
+                        op_cell.object[0].nodes = np.ones(int(max(2, _nverts_full)), dtype=np.int32)
+                    except Exception:
+                        pass
 
                 # Keep only a minimal placeholder here. The real object arrays and subset
                 # references are written after put()/put_slice() by the HDF5 full-object writer.
-                if not _ggd_should_write_grid(args):
+                if (not _ggd_should_write_grid(args)) or _defer_fullobj_nested_to_h5:
                     try:
                         g.grid_subset.resize(0)
                     except Exception:
@@ -7735,10 +7781,23 @@ def _copy_first_gridggd_entry_h5(entry_dir: str, ids_name: str, occ: int, *, log
                 continue
             if ds.ndim < 1:
                 continue
-            if int(ds.shape[0]) != int(nggd):
-                continue
             try:
-                ds[last, ...] = ds[0, ...]
+                arr0 = np.asarray(ds[0, ...])
+            except Exception:
+                continue
+            target_shape = (int(nggd),) + tuple(ds.shape[1:])
+            try:
+                if int(ds.shape[0]) != int(nggd):
+                    full = np.empty(target_shape, dtype=ds.dtype)
+                    full[...] = 0
+                    ncopy = min(int(ds.shape[0]), int(nggd))
+                    if ncopy > 0:
+                        full[:ncopy, ...] = ds[...]
+                    full[last, ...] = arr0
+                    del g[name]
+                    g.create_dataset(name, data=full)
+                else:
+                    ds[last, ...] = arr0
                 copied += 1
             except Exception:
                 continue
@@ -13670,10 +13729,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     except Exception:
                         pass
                     # Best-effort: tag IDS with output COCOS metadata when supported by this DD
-                    _ensure_gridggd_exists(mhd_s)
-                    #_ensure_gridggd_space_identifier(mhd_s)
-
-                    _ensure_gridggd_space_identifier(mhd_s)
+                    if not _mhd_should_defer_grid_to_postwrite(args):
+                        _ensure_gridggd_exists(mhd_s)
+                        _ensure_gridggd_space_identifier(mhd_s)
                     _set_ids_cocos(mhd_s, COCOS_OUT_DEFAULT)
 
                     if (ifile > 1) and _ggd_should_copy_first_grid(args) and (_ggd_reuse_grid_copy_mode(args) == "imas"):

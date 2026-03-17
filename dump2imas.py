@@ -13804,15 +13804,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 # downstream tools.
                 if _use_h5py_patches(args) and getattr(args, 'ggd_unstructured', False):
                     try:
-                        for _s in range(nspec_mhd):
-                            _occ_s = occ_base + int(_s)
-                            # Writes IMAS-standard grid_ggd.space vectors + grid_ggd.grid_subset connectivity (packed).
-                            _write_unstructured_ggd_aux_h5(entry_dir, 'mhd', _occ_s, data, args)
-                            pending_unstructured_aux[(str(entry_dir), 'mhd', int(_occ_s))] = data
-                        if _ggd_write_full_objects_enabled(args):
-                            _log('Wrote IMAS-ParaView object-based unstructured grid_ggd into mhd HDF5 (h5py)', args.quiet)
-                        else:
-                            _log('Wrote IMAS-standard unstructured grid_ggd nodes/connectivity into mhd HDF5 (h5py)', args.quiet)
+                        _should_patch_unstructured_grid = (
+                            _ggd_should_write_grid(args) and (not _ggd_should_copy_first_grid(args))
+                        )
+                        if _should_patch_unstructured_grid:
+                            for _s in range(nspec_mhd):
+                                _occ_s = occ_base + int(_s)
+                                # Writes IMAS-standard grid_ggd.space vectors + grid_ggd.grid_subset connectivity (packed).
+                                _write_unstructured_ggd_aux_h5(entry_dir, 'mhd', _occ_s, data, args)
+                                pending_unstructured_aux[(str(entry_dir), 'mhd', int(_occ_s))] = data
+                            if _ggd_write_full_objects_enabled(args):
+                                _log('Wrote IMAS-ParaView object-based unstructured grid_ggd into mhd HDF5 (h5py)', args.quiet)
+                            else:
+                                _log('Wrote IMAS-standard unstructured grid_ggd nodes/connectivity into mhd HDF5 (h5py)', args.quiet)
                     except Exception as _e:
                         _log(f"[warn] Could not write unstructured grid_ggd nodes/connectivity: {_e}", args.quiet)
                 if (str(getattr(args, "backend", "hdf5") or "hdf5").strip().lower() == "hdf5") and _ggd_should_copy_first_grid(args) and (_ggd_reuse_grid_copy_mode(args) == "h5py"):

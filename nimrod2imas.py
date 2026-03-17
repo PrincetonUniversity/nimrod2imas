@@ -28,8 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ =  '0.4.4'
-
+__version__ = "0.4.4"  # x-release-please-version
 VERSION = __version__
 
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.5](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.4.4...nimrod2imas-v0.4.5) (2026-03-17)
+
+
+### Bug Fixes
+
+* another bug in ggd saving logic ([cbed06c](https://github.com/PrincetonUniversity/nimrod2imas/commit/cbed06c88a053c3a265c92da0338ed7008a5d362))
+* another bug in ggd saving logic ([4d000e9](https://github.com/PrincetonUniversity/nimrod2imas/commit/4d000e9185ae841635a5f6294977e6c484a1b652))
+* spelling ([43c4d4f](https://github.com/PrincetonUniversity/nimrod2imas/commit/43c4d4f3e6897e75ea1e093d052e8060e0d27dd4))
+* spelling ([214ce36](https://github.com/PrincetonUniversity/nimrod2imas/commit/214ce36616fc835360b0fac42a4b7398fc10c936))
+
 ## [0.4.4](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.4.3...nimrod2imas-v0.4.4) (2026-03-16)
 
 

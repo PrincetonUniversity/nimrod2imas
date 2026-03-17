@@ -3,11 +3,10 @@
     ".": {
       "release-type": "python",
       "package-name": "nimrod2imas",
-      "version-file": "nimrod2imas.py" 
+      "version-file": "nimrod2imas.py",
       "extra-files": [
         "nimrod2imas.py"
       ]
-
     }
   }
 }

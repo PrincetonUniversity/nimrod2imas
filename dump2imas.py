@@ -2924,13 +2924,7 @@ def read_and_stitch_dump(fn: Path, args) -> Dict[str, Any]:
         # Some NIMROD dumps provide only one density channel (nq[...,0]) even though IMAS
         # expects electrons + at least one ion species. Expand nq (and rend/imnd if present)
         # to [e, main ion] using zisp_input/zeff_input when available.
-        nimrod_in_guess = None
-        try:
-            cand = fn.parent / "nimrod.in"
-            if cand.is_file():
-                nimrod_in_guess = str(cand)
-        except Exception:
-            nimrod_in_guess = None
+        nimrod_in_guess = getattr(args, "_series_nimrod_in_path", None)
         try:
             nq, fields, nspec_eq = _expand_single_ion_to_e_plus_main(nq, fields, nspec_eq, nmodes, args, nimrod_in_guess)
         except Exception:
@@ -12865,6 +12859,50 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not fn.exists():
             _die(f"Input file not found: {fn}")
 
+    # Resolve nimrod.in and run type once for the whole dump series.
+    # A NIMROD dump sequence should not flip between linear and nonlinear
+    # semantics mid-stream simply because optional per-file probing changes.
+    setattr(args, "_series_nimrod_in_path", None)
+    setattr(args, "_series_nonlinear_flag", None)
+    setattr(args, "_series_nimrod_species", {})
+    try:
+        if dump_files:
+            cand0 = dump_files[0].parent / "nimrod.in"
+            if cand0.is_file():
+                setattr(args, "_series_nimrod_in_path", str(cand0.resolve()))
+    except Exception:
+        setattr(args, "_series_nimrod_in_path", None)
+    try:
+        setattr(args, "_series_nonlinear_flag", _nimrod_in_nonlinear(getattr(args, "_series_nimrod_in_path", None)))
+    except Exception:
+        setattr(args, "_series_nonlinear_flag", None)
+    try:
+        sp0 = _nimrod_species_info(getattr(args, "_series_nimrod_in_path", None)) if getattr(args, "_series_nimrod_in_path", None) else {}
+        setattr(args, "_series_nimrod_species", sp0 or {})
+    except Exception:
+        setattr(args, "_series_nimrod_species", {})
+    try:
+        _series_nl = getattr(args, "_series_nonlinear_flag", None)
+        log.info("Resolved series nimrod.in: %s (nonlinear=%s)", getattr(args, "_series_nimrod_in_path", None), _series_nl)
+        warned = False
+        for _fn in dump_files[1:]:
+            cand = _fn.parent / "nimrod.in"
+            cand_path = str(cand.resolve()) if cand.is_file() else None
+            if cand_path != getattr(args, "_series_nimrod_in_path", None):
+                if not warned:
+                    log.warning("Dump files span multiple nimrod.in contexts; using the first file's nimrod.in for the whole series: %s", getattr(args, "_series_nimrod_in_path", None))
+                    warned = True
+                continue
+            try:
+                cand_nl = _nimrod_in_nonlinear(cand_path)
+            except Exception:
+                cand_nl = None
+            if cand_nl != _series_nl and not warned:
+                log.warning("Inconsistent nonlinear flag detected while probing the same nimrod.in path; using the first resolved series value (%s) for all dumps.", _series_nl)
+                warned = True
+    except Exception:
+        pass
+
     dd_version = args.dd_version
     if (dd_version == None):
          dd_version = os.environ.get("IMAS_VERSION", '4.1.1')
@@ -12958,22 +12996,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # then an existing preprocessing mhd IDS (contains psi for some workflows).
         _ensure_psi_eq_available(data, entry_dir, occ_base=int(getattr(args, "occ_base", 0) or 0), log=log)
 
-        # Determine whether this directory corresponds to a nonlinear run (nimrod.in) and choose IDS type.
-        nimrod_in_path = None
-        try:
-            cand = fn.parent / "nimrod.in"
-            if cand.is_file():
-                nimrod_in_path = str(cand)
-        except Exception:
-            nimrod_in_path = None
-
-        nonlinear_flag = _nimrod_in_nonlinear(nimrod_in_path)
+        # Determine run type once for the whole series from the resolved series nimrod.in.
+        nimrod_in_path = getattr(args, "_series_nimrod_in_path", None)
+        nonlinear_flag = getattr(args, "_series_nonlinear_flag", None)
         # Record run type for downstream helpers (edge/core perturbations only for nonlinear runs).
         setattr(args, "_nonlinear_run", bool(nonlinear_flag is True))
         if (not getattr(args, "_nonlinear_run", False)) and str(getattr(args, "edge_ggd_values", "equilibrium") or "equilibrium").strip().lower() == "full":
             log.info("Linear run detected: forcing core_profiles/edge_profiles to equilibrium-only (ignoring --edge-ggd-values=full). Perturbations are written only to mhd_linear.")
         try:
-            args._nimrod_species = _nimrod_species_info(nimrod_in_path)
+            args._nimrod_species = dict(getattr(args, "_series_nimrod_species", {}) or {})
         except Exception:
             args._nimrod_species = {}
 

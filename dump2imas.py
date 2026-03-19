@@ -2395,7 +2395,7 @@ def _calculate_q_profile(
         A tuple of (psi_1d, q_1d) arrays, or None if the calculation fails.
     """
     from matplotlib.figure import Figure
-    from scipy.interpolate import griddata
+    from scipy.interpolate import LinearNDInterpolator, RegularGridInterpolator
 
     if not all(
         x is not None and np.any(np.isfinite(x))
@@ -2412,19 +2412,49 @@ def _calculate_q_profile(
         B_p = np.sqrt(B_R**2 + B_Z**2)
         integrand = B_phi / (R * B_p)
 
-    fig = Figure()
-    ax = fig.subplots()
-    try:
-        # Generate contours for each psi level without relying on pyplot/GUI state.
-        cs = ax.contour(R, Z, psi, levels=psi_levels)
+    interp_fn = None
+    R = np.asarray(R, dtype=float)
+    Z = np.asarray(Z, dtype=float)
+    integrand = np.asarray(integrand, dtype=float)
+    if (
+        R.ndim == 2 and Z.ndim == 2 and integrand.ndim == 2
+        and R.shape == Z.shape == integrand.shape
+        and R.shape[0] >= 2 and R.shape[1] >= 2
+    ):
+        r_axis = np.asarray(R[:, 0], dtype=float)
+        z_axis = np.asarray(Z[0, :], dtype=float)
+        is_structured = (
+            np.allclose(R, r_axis[:, None], equal_nan=True)
+            and np.allclose(Z, z_axis[None, :], equal_nan=True)
+        )
+        if is_structured:
+            if r_axis[1] < r_axis[0]:
+                r_axis = r_axis[::-1]
+                integrand = integrand[::-1, :]
+            if z_axis[1] < z_axis[0]:
+                z_axis = z_axis[::-1]
+                integrand = integrand[:, ::-1]
+            interp_fn = RegularGridInterpolator(
+                (r_axis, z_axis),
+                integrand,
+                method='linear',
+                bounds_error=False,
+                fill_value=np.nan,
+            )
 
+    if interp_fn is None:
         points = np.column_stack((R.ravel(), Z.ravel()))
         values = integrand.ravel()
         point_mask = np.all(np.isfinite(points), axis=1) & np.isfinite(values)
         if np.count_nonzero(point_mask) < 3:
             return None
-        points = points[point_mask]
-        values = values[point_mask]
+        interp_fn = LinearNDInterpolator(points[point_mask], values[point_mask], fill_value=np.nan)
+
+    fig = Figure()
+    ax = fig.subplots()
+    try:
+        # Generate contours for each psi level without relying on pyplot/GUI state.
+        cs = ax.contour(R, Z, psi, levels=psi_levels)
 
         for level, segs in zip(cs.levels, cs.allsegs):
             segments = [
@@ -2441,9 +2471,10 @@ def _calculate_q_profile(
             z_path = vertices[:, 1]
 
             # Interpolate the integrand onto the contour path.
-            integrand_path = griddata(points, values, (r_path, z_path), method='linear')
+            integrand_path = interp_fn(np.column_stack((r_path, z_path)))
             if integrand_path is None:
                 continue
+            integrand_path = np.asarray(integrand_path, dtype=float).reshape(-1)
 
             dl_p = np.sqrt(
                 np.diff(r_path, prepend=r_path[0]) ** 2

@@ -2394,7 +2394,7 @@ def _calculate_q_profile(
     Returns:
         A tuple of (psi_1d, q_1d) arrays, or None if the calculation fails.
     """
-    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
     from scipy.interpolate import griddata
 
     if not all(
@@ -2408,31 +2408,63 @@ def _calculate_q_profile(
     q_values = []
     psi_values = []
 
-    B_p = np.sqrt(B_R**2 + B_Z**2)
-    integrand = B_phi / (R * B_p)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        B_p = np.sqrt(B_R**2 + B_Z**2)
+        integrand = B_phi / (R * B_p)
 
-    # Generate contours for each psi level
-    cs = plt.contour(R, Z, psi, levels=psi_levels)
+    fig = Figure()
+    ax = fig.subplots()
+    try:
+        # Generate contours for each psi level without relying on pyplot/GUI state.
+        cs = ax.contour(R, Z, psi, levels=psi_levels)
 
-    for i, level in enumerate(cs.levels):
-        contour = cs.collections[i].get_paths()[0]
-        vertices = contour.vertices
-        r_path, z_path = vertices[:, 0], vertices[:, 1]
-
-        # Interpolate the integrand onto the contour path
         points = np.column_stack((R.ravel(), Z.ravel()))
-        integrand_path = griddata(points, integrand.ravel(), (r_path, z_path), method='linear')
+        values = integrand.ravel()
+        point_mask = np.all(np.isfinite(points), axis=1) & np.isfinite(values)
+        if np.count_nonzero(point_mask) < 3:
+            return None
+        points = points[point_mask]
+        values = values[point_mask]
 
-        # Calculate the path length element dl_p
-        dl_p = np.sqrt(np.diff(r_path, prepend=r_path[0])**2 + np.diff(z_path, prepend=z_path[0])**2)
+        for level, segs in zip(cs.levels, cs.allsegs):
+            segments = [
+                np.asarray(seg, dtype=float)
+                for seg in segs
+                if seg is not None and np.asarray(seg).ndim == 2 and np.asarray(seg).shape[0] >= 2
+            ]
+            if not segments:
+                continue
 
-        # Perform the line integral using the trapezoidal rule
-        integral = np.trapz(integrand_path, x=np.cumsum(dl_p))
+            # Prefer the longest contour segment for this psi level.
+            vertices = max(segments, key=lambda seg: seg.shape[0])
+            r_path = vertices[:, 0]
+            z_path = vertices[:, 1]
 
-        q_values.append(integral / (2 * np.pi))
-        psi_values.append(level)
+            # Interpolate the integrand onto the contour path.
+            integrand_path = griddata(points, values, (r_path, z_path), method='linear')
+            if integrand_path is None:
+                continue
 
-    plt.close()  # Close the figure created by plt.contour
+            dl_p = np.sqrt(
+                np.diff(r_path, prepend=r_path[0]) ** 2
+                + np.diff(z_path, prepend=z_path[0]) ** 2
+            )
+            s_path = np.cumsum(dl_p)
+            good = np.isfinite(integrand_path) & np.isfinite(s_path)
+            if np.count_nonzero(good) < 2:
+                continue
+
+            integral = np.trapz(integrand_path[good], x=s_path[good])
+            if not np.isfinite(integral):
+                continue
+
+            q_values.append(integral / (2 * np.pi))
+            psi_values.append(level)
+    finally:
+        fig.clear()
+
+    if not psi_values:
+        return None
 
     return np.array(psi_values), np.array(q_values)
 
@@ -2530,6 +2562,7 @@ def _set_rz_grid_mhd(plasma: Any, R: np.ndarray, Z: np.ndarray, Nx: int, Ny: int
 # -----------------------------
 
 def read_and_stitch_dump(fn: Path, args) -> Dict[str, Any]:
+    log = logging.getLogger(__name__)
     with h5py.File(fn, "r") as f:
         bids = _block_ids(f)
         if not bids:
@@ -2727,8 +2760,33 @@ def read_and_stitch_dump(fn: Path, args) -> Dict[str, Any]:
             try:
                 nimrod_species_info = _nimrod_species_info(nimrod_in_guess)
                 zimp = int(nimrod_species_info.get('zimp', 0))
-                if zimp > 0:
-                    nspec_imp = zimp + 1
+                nspec_imp = zimp + 1 if zimp > 0 else 0
+
+                def _infer_nspec_from_block() -> int:
+                    try:
+                        a0 = _read_block_ds(f, "renz", bids[0])
+                        a0 = _squeeze1(a0)
+                        if a0.ndim == 4:
+                            if a0.shape[2] == nmodes:
+                                return int(a0.shape[3])
+                            if a0.shape[3] == nmodes:
+                                return int(a0.shape[2])
+                        if a0.ndim == 3 and nmodes > 0:
+                            k = int(a0.shape[2])
+                            if k % nmodes == 0:
+                                return int(k // nmodes)
+                    except Exception:
+                        return 0
+                    return 0
+
+                inferred_nspec = _infer_nspec_from_block()
+                if inferred_nspec > 0 and inferred_nspec != nspec_imp:
+                    if log is not None:
+                        if log is not None:
+                            log.info(f"Using inferred nspec_imp={inferred_nspec} (nimrod.in zimp implies {nspec_imp}).")
+                    nspec_imp = inferred_nspec
+
+                if nspec_imp > 0:
                     def read_impurity_modes(base: str) -> np.ndarray:
                         blocks = []
                         for bid in bids:
@@ -2742,13 +2800,25 @@ def read_and_stitch_dump(fn: Path, args) -> Dict[str, Any]:
                         fields["renz"] = read_impurity_modes("renz")
                         fields["imnz"] = read_impurity_modes("imnz")
                         fields["nspec_imp"] = np.array([nspec_imp], dtype=int)
-                        log.info(f"Read renz/imnz for {nspec_imp} impurity charge states.")
+                        if log is not None:
+                            if log is not None:
+                                log.info(f"Read renz/imnz for {nspec_imp} impurity charge states.")
                     except KeyError:
-                        log.info("renz/imnz not found in dump file, skipping impurity mapping.")
+                        if log is not None:
+                            if log is not None:
+                                log.info("renz/imnz not found in dump file, skipping impurity mapping.")
                     except Exception as e:
-                        log.warning(f"Could not process renz/imnz: {e}")
+                        if log is not None:
+                            if log is not None:
+                                log.warning(f"Could not process renz/imnz: {e}")
+                else:
+                    if log is not None:
+                        if log is not None:
+                            log.info("renz/imnz not found or nspec_imp=0; skipping impurity mapping.")
             except Exception as e:
-                log.warning(f"Could not read impurity info for renz/imnz: {e}")
+                if log is not None:
+                    if log is not None:
+                        log.warning(f"Could not read impurity info for renz/imnz: {e}")
                 # Store 2D fields in a stitched IMAS-friendly (dim1,dim2) layout.
         #
         # NIMROD rblock stitching produces arrays shaped (Ny, Nx) where the first axis is the

@@ -258,7 +258,7 @@ def _default_cmap_for_part(part: str) -> str:
     part = (part or "").lower()
     if part in ("real", "imag"):
         return "RdBu_r"
-    return "viridis"
+    return "nipy_spectral" if _HAS_CMASher else "viridis"
 
 
 def _resolve_cmap(cmap: Optional[str], part: str) -> str:
@@ -765,7 +765,7 @@ def main():
     )
     ap.add_argument("--levels", type=int, default=50, help="Number of contour levels")
 
-    ap.add_argument("--cmap", default="viridis", help="Matplotlib colormap name")
+    ap.add_argument("--cmap", default="nipy_spectral", help="Matplotlib colormap name")
     ap.add_argument("--list-cmaps", action="store_true", help="List available Matplotlib colormaps and exit")
 
     ap.add_argument("--title", default=None, help="Override plot title")

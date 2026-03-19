@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.6](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.4.5...nimrod2imas-v0.4.6) (2026-03-19)
+
+
+### Bug Fixes
+
+* Fixing nonlinear flag bug ([001be3a](https://github.com/PrincetonUniversity/nimrod2imas/commit/001be3afdb966076138943ec80a5abefae3b429b))
+* Fixing nonlinear flag bug ([f129d4c](https://github.com/PrincetonUniversity/nimrod2imas/commit/f129d4c265488ca9ae3d05bacfc3d711f9116cde))
+
 ## [0.4.5](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.4.4...nimrod2imas-v0.4.5) (2026-03-17)
 
 

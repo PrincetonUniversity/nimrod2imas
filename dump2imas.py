@@ -8229,6 +8229,114 @@ def _copy_first_gridggd_entry_h5(entry_dir: str, ids_name: str, occ: int, *, log
                 pass
 
 
+
+def _collapse_gridggd_to_first_entry_h5(entry_dir: str, ids_name: str, occ: int, *, log=None) -> None:
+    """Collapse persisted ``grid_ggd`` datasets to a single stored entry.
+
+    This implements the intended on-disk semantics of ``--ggd-write-once`` for HDF5-backed
+    IDSs: later slices continue to write time-dependent ``ggd`` values that reference grid 0,
+    but only the first ``grid_ggd`` topology is kept on disk.  Any later placeholder/skeleton
+    ``grid_ggd`` entries emitted by the Access Layer are trimmed away here.
+    """
+    import os
+    import h5py
+    import numpy as np
+
+    if log is None:
+        log = logging.getLogger(__name__)
+
+    h5_path, grp_name = _ids_backend_h5_loc(entry_dir, ids_name, occ)
+    grp_name = str(grp_name).lstrip("/")
+    if not os.path.exists(h5_path):
+        return
+
+    def _rewrite_first(g, name: str) -> bool:
+        if name not in g:
+            return False
+        ds = g[name]
+        if not isinstance(ds, h5py.Dataset):
+            return False
+        if ds.ndim < 1:
+            return False
+        if int(ds.shape[0]) <= 1:
+            return False
+        try:
+            arr = np.asarray(ds[0:1, ...])
+        except Exception:
+            return False
+        dtype = ds.dtype
+        chunks = None
+        try:
+            chunks = ds.chunks
+        except Exception:
+            chunks = None
+        maxshape = (None,) + tuple(ds.shape[1:])
+        try:
+            del g[name]
+        except Exception:
+            return False
+        try:
+            if chunks is not None:
+                new_chunks = (1,) + tuple(int(min(arr.shape[i], chunks[i])) for i in range(1, arr.ndim))
+                g.create_dataset(name, data=arr, dtype=dtype, maxshape=maxshape, chunks=new_chunks)
+            else:
+                g.create_dataset(name, data=arr, dtype=dtype, maxshape=maxshape)
+            return True
+        except Exception:
+            # final fallback without chunk hints
+            try:
+                if name in g:
+                    del g[name]
+            except Exception:
+                pass
+            g.create_dataset(name, data=arr, dtype=dtype, maxshape=maxshape)
+            return True
+
+    with h5py.File(h5_path, "r+") as h5:
+        if grp_name not in h5:
+            return
+        g = h5[grp_name]
+
+        changed = 0
+        for name in list(g.keys()):
+            if not str(name).startswith("grid_ggd[]&"):
+                continue
+            try:
+                if _rewrite_first(g, str(name)):
+                    changed += 1
+            except Exception:
+                continue
+
+        # Force top-level grid AoS bookkeeping to exactly one persisted grid entry.
+        try:
+            arr = np.asarray([1], dtype=np.int32)
+            if "grid_ggd[]&AOS_SHAPE" in g:
+                del g["grid_ggd[]&AOS_SHAPE"]
+            g.create_dataset("grid_ggd[]&AOS_SHAPE", data=arr, dtype=np.int32, maxshape=(None,))
+            changed += 1
+        except Exception:
+            pass
+
+        try:
+            if "grid_ggd[]&time" in g:
+                ds = g["grid_ggd[]&time"]
+                if ds.ndim == 1 and ds.shape[0] > 1:
+                    t0 = np.asarray(ds[0:1], dtype=np.float64)
+                    del g["grid_ggd[]&time"]
+                    g.create_dataset("grid_ggd[]&time", data=t0, dtype=np.float64, maxshape=(None,))
+                    changed += 1
+        except Exception:
+            pass
+
+        if changed > 0:
+            try:
+                log.info(
+                    "%s occ=%d: collapsed persisted grid_ggd datasets to a single stored topology for --ggd-write-once",
+                    str(ids_name), int(occ),
+                )
+            except Exception:
+                pass
+
 def _finalize_gridggd_object_counts_h5(entry_dir: str, ids_name: str, occ: int, *, times, log=None) -> None:
     """Last-write-wins override for the two remaining grid_ggd object-count AoS datasets.
 
@@ -13175,7 +13283,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     try:
                         if bool(getattr(args, 'ggd_unstructured', False)) and _ggd_write_full_objects_enabled(args):
                             _need_seed = False
-                            if hasattr(mhd_s, 'grid_ggd') and _aos_len(mhd_s.grid_ggd) > 0:
+                            if hasattr(mhd_s, 'grid_ggd') and len(mhd_s.grid_ggd) > 0:
                                 _g0 = mhd_s.grid_ggd[0]
                                 try:
                                     if len(_g0.space) != 1:
@@ -13350,14 +13458,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     try:
                         for _s in range(nspec_mhd):
                             _occ_s = occ_base + int(_s)
-                            _copy_first_gridggd_entry_h5(str(entry_dir), "mhd", int(_occ_s), log=log)
-                            if _ggd_write_full_objects_enabled(args):
-                                try:
-                                    _repair_gridggd_full_object_bookkeeping_h5(str(entry_dir), 'mhd', int(_occ_s), log=log)
-                                except Exception as _e2:
-                                    _log(f"[warn] Could not normalize full-object grid_ggd bookkeeping after copy: {_e2}", args.quiet)
+                            if _ggd_should_reuse_first_grid(args):
+                                _collapse_gridggd_to_first_entry_h5(str(entry_dir), "mhd", int(_occ_s), log=log)
+                                if _ggd_write_full_objects_enabled(args):
+                                    try:
+                                        _repair_gridggd_full_object_bookkeeping_h5(str(entry_dir), 'mhd', int(_occ_s), times=[0.0], log=log)
+                                    except Exception as _e2:
+                                        _log(f"[warn] Could not normalize full-object grid_ggd bookkeeping after collapse: {_e2}", args.quiet)
+                            else:
+                                _copy_first_gridggd_entry_h5(str(entry_dir), "mhd", int(_occ_s), log=log)
+                                if _ggd_write_full_objects_enabled(args):
+                                    try:
+                                        _repair_gridggd_full_object_bookkeeping_h5(str(entry_dir), 'mhd', int(_occ_s), log=log)
+                                    except Exception as _e2:
+                                        _log(f"[warn] Could not normalize full-object grid_ggd bookkeeping after copy: {_e2}", args.quiet)
                     except Exception as _e:
-                        _log(f"[warn] Could not copy persisted grid_ggd from first slice: {_e}", args.quiet)
+                        if _ggd_should_reuse_first_grid(args):
+                            _log(f"[warn] Could not collapse persisted grid_ggd to first slice: {_e}", args.quiet)
+                        else:
+                            _log(f"[warn] Could not copy persisted grid_ggd from first slice: {_e}", args.quiet)
 
                 _log("Populated mhd IDS (GGD full-field snapshot)", args.quiet)
                 # Mirror edge_profiles electrons.temperature from mhd GGD ONLY when requested.
@@ -13425,6 +13544,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         db.close()
     except Exception:
         pass
+
+
 
     return 0
 

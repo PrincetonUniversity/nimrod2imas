@@ -242,14 +242,14 @@ For workflows that need explicit node coordinates and explicit connectivity (e.g
   - `fe_wedge`: volumetric wedge (triangular-prism) connectivity obtained by extruding the `fe_tri` connectivity between adjacent toroidal planes. This is the recommended option for a true 3D toroidal mesh in ParaView.
   - `hex`: hexahedral connectivity on the reconstructed `(R,Z,φ)` product grid with periodicity in φ. Use this only for regular-grid workflows; it is not the native FE-preserving representation.
 
-- `--ggd-representation {packed,full,both}`
+- `--ggd-representation {packed,full}`
   - `full` (default): write the DD4-style object-based `grid_ggd.space[].objects_per_dimension[]` representation. This is the recommended mode for ParaView/IMAS-ParaView and for downstream tools that need explicit node/cell objects.
-  - `both`: also request the object-based representation.
   - `packed`: compact representation using packed subsets/elements. Keep this only for specialized legacy consumers.
 
 - `--ggd-write-full-objects`
   - Explicitly request the IMAS-standard object-based unstructured GGD representation under `grid_ggd.space[0].objects_per_dimension`.
   - This is the recommended switch for IMAS-ParaView compatibility.
+  - Use this as an alternative to packed-only output; when changing representation, write to a fresh IMAS entry.
 
 - `--ggd-write-once`
   - Write grid + connectivity only for the first processed dump/time slice.

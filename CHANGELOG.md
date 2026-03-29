@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.5.0...nimrod2imas-v0.5.1) (2026-03-29)
+
+
+### Bug Fixes
+
+* Additing option for multiple python processes ([#48](https://github.com/PrincetonUniversity/nimrod2imas/issues/48)) ([89092d7](https://github.com/PrincetonUniversity/nimrod2imas/commit/89092d73ac917a9e4118fb44ff9a86089d3708a1))
+
 ## [0.5.0](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.4.6...nimrod2imas-v0.5.0) (2026-03-28)
 
 

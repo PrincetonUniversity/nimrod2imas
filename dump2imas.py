@@ -35,6 +35,7 @@ import os
 import re
 import sys
 import logging
+import gc
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -2986,27 +2987,35 @@ def read_and_stitch_dump(fn: Path, args) -> Dict[str, Any]:
         nmodes = int(np.size(keff))
 
         # Equilibrium fields
+        def _place_block(out: np.ndarray, blk: np.ndarray, iblk: int) -> None:
+            ix, iy = _lin_to_ij(iblk, nxbl, nybl, ordering)
+            y0 = iy * (ny_loc - 1)
+            x0 = ix * (nx_loc - 1)
+            out[y0 : y0 + ny_loc, x0 : x0 + nx_loc, ...] = blk
+
         def read_scalar(base: str) -> np.ndarray:
-            blocks = []
-            for bid in bids:
+            out = np.empty((Ny, Nx), dtype=float)
+            out[...] = np.nan
+            for iblk, bid in enumerate(bids):
                 a = _read_block_ds(f, base, bid)
                 a = _squeeze1(a)
                 if a.ndim != 2:
                     _die(f"{base}{bid} expected (ny,nx)[,1], got {a.shape}")
-                blocks.append(a.astype(float, copy=False))
-            return stitch_blocks(blocks, nxbl, nybl, ordering)
+                _place_block(out, a.astype(float, copy=False), iblk)
+            return out
 
         def read_vec3(base: str) -> np.ndarray:
-            blocks = []
-            for bid in bids:
+            out = np.empty((Ny, Nx, 3), dtype=float)
+            out[...] = np.nan
+            for iblk, bid in enumerate(bids):
                 a = _read_block_ds(f, base, bid)
                 a = _squeeze1(a)
                 if a.ndim != 3:
                     _die(f"{base}{bid} expected (ny,nx,3)[,1], got {a.shape}")
                 if a.shape[-1] != 3:
                     _die(f"{base}{bid} expected last dim=3, got {a.shape}")
-                blocks.append(a.astype(float, copy=False))
-            return stitch_blocks(blocks, nxbl, nybl, ordering)
+                _place_block(out, a.astype(float, copy=False), iblk)
+            return out
 
         def try_read_scalar(base: str) -> Optional[np.ndarray]:
             try:
@@ -3056,7 +3065,7 @@ def read_and_stitch_dump(fn: Path, args) -> Dict[str, Any]:
         nspec_eq = 0
         nq: Optional[np.ndarray] = None
         try:
-            for bid in bids:
+            for iblk, bid in enumerate(bids):
                 a = _read_block_ds(f, "nq", bid)
                 a = _squeeze1(a)
                 if a.ndim == 2:
@@ -3065,8 +3074,9 @@ def read_and_stitch_dump(fn: Path, args) -> Dict[str, Any]:
                     _die(f"nq{bid} expected (ny,nx,nspec)[,1] or (ny,nx), got {a.shape}")
                 if nspec_eq == 0:
                     nspec_eq = int(a.shape[-1])
-                nq_blocks.append(a.astype(float, copy=False))
-            nq = stitch_blocks(nq_blocks, nxbl, nybl, ordering)
+                    nq = np.empty((Ny, Nx, nspec_eq), dtype=float)
+                    nq[...] = np.nan
+                _place_block(nq, a.astype(float, copy=False), iblk)
             nspec_eq = int(nq.shape[-1])
         except Exception:
             nq = None
@@ -3077,23 +3087,25 @@ def read_and_stitch_dump(fn: Path, args) -> Dict[str, Any]:
         if nmodes > 0:
             # vector fields with modes
             def read_vec3_modes(base: str) -> np.ndarray:
-                blocks = []
-                for bid in bids:
+                out = np.empty((Ny, Nx, nmodes, 3), dtype=float)
+                out[...] = np.nan
+                for iblk, bid in enumerate(bids):
                     a = _read_block_ds(f, base, bid)
                     a = _squeeze1(a)
                     a = _unpack_vec3_modes(a, nmodes)
-                    blocks.append(a.astype(float, copy=False))
-                return stitch_blocks(blocks, nxbl, nybl, ordering)
+                    _place_block(out, a.astype(float, copy=False), iblk)
+                return out
 
             # scalar fields with modes
             def read_scalar_modes(base: str) -> np.ndarray:
-                blocks = []
-                for bid in bids:
+                out = np.empty((Ny, Nx, nmodes), dtype=float)
+                out[...] = np.nan
+                for iblk, bid in enumerate(bids):
                     a = _read_block_ds(f, base, bid)
                     a = _squeeze1(a)
                     a = _unpack_scalar_modes(a, nmodes)
-                    blocks.append(a.astype(float, copy=False))
-                return stitch_blocks(blocks, nxbl, nybl, ordering)
+                    _place_block(out, a.astype(float, copy=False), iblk)
+                return out
 
             fields["rebe"] = read_vec3_modes("rebe")
             fields["imbe"] = read_vec3_modes("imbe")
@@ -5949,6 +5961,8 @@ def _gridggd_write_tri_connectivity(g: Any, tri_conn: np.ndarray) -> None:
                 o.space = 1
             except Exception:
                 pass
+
+
 def populate_mhd_ggd(mhd: Any, data: Dict[str, Any], args, species_index: int | None = None) -> None:
     """Populate the nonlinear mhd IDS (GGD-based) with reconstructed full fields.
 
@@ -8148,6 +8162,9 @@ def _copy_first_gridggd_entry_h5(entry_dir: str, ids_name: str, occ: int, *, log
     This implements the storage semantics of ``--ggd-reuse-grid``: each time slice keeps its
     own ``grid_ggd`` entry, but the geometry/connectivity payload for later slices is copied
     from slice 0 instead of being treated as a distinct reconstructed topology.
+
+    The copy is performed in slabs so very large full-object datasets (nodes, boundaries,
+    subset references) are not materialized in memory at once.
     """
     import os
     import h5py
@@ -8161,6 +8178,34 @@ def _copy_first_gridggd_entry_h5(entry_dir: str, ids_name: str, occ: int, *, log
     if not os.path.exists(h5_path):
         return
 
+    def _iter_slab_slices(shape_tail: tuple[int, ...], itemsize: int, *, max_bytes: int = 64 * 1024 * 1024):
+        if not shape_tail:
+            yield ()
+            return
+        total = int(itemsize)
+        for s in shape_tail:
+            total *= int(s)
+        if total <= max_bytes:
+            yield tuple(slice(None) for _ in shape_tail)
+            return
+        # Slab along the largest tail axis. This keeps the copy generic and bounded.
+        slab_axis = max(range(len(shape_tail)), key=lambda i: int(shape_tail[i]))
+        other = max(1, total // max(1, int(shape_tail[slab_axis])))
+        step = max(1, int(max_bytes // max(1, other)))
+        step = min(step, int(shape_tail[slab_axis]))
+        for i0 in range(0, int(shape_tail[slab_axis]), step):
+            i1 = min(i0 + step, int(shape_tail[slab_axis]))
+            ss = [slice(None)] * len(shape_tail)
+            ss[slab_axis] = slice(i0, i1)
+            yield tuple(ss)
+
+    def _copy_first_to_last(ds, last: int):
+        tail = tuple(int(x) for x in ds.shape[1:])
+        for sub in _iter_slab_slices(tail, int(ds.dtype.itemsize)):
+            src_sel = (0,) + sub
+            dst_sel = (last,) + sub
+            ds[dst_sel] = ds[src_sel]
+
     with h5py.File(h5_path, "r+") as h5:
         if grp_name not in h5:
             return
@@ -8172,8 +8217,6 @@ def _copy_first_gridggd_entry_h5(entry_dir: str, ids_name: str, occ: int, *, log
                 ds = g["grid_ggd[]&time"]
                 if ds.ndim >= 1:
                     nggd = int(ds.shape[0])
-                    if ds.ndim >= 2:
-                        nggd = int(ds.shape[0])
         except Exception:
             nggd = None
         if (nggd is None) or (nggd < 2):
@@ -8199,22 +8242,16 @@ def _copy_first_gridggd_entry_h5(entry_dir: str, ids_name: str, occ: int, *, log
             if ds.ndim < 1:
                 continue
             try:
-                arr0 = np.asarray(ds[0, ...])
-            except Exception:
-                continue
-            target_shape = (int(nggd),) + tuple(ds.shape[1:])
-            try:
                 if int(ds.shape[0]) != int(nggd):
-                    full = np.empty(target_shape, dtype=ds.dtype)
-                    full[...] = 0
-                    ncopy = min(int(ds.shape[0]), int(nggd))
-                    if ncopy > 0:
-                        full[:ncopy, ...] = ds[...]
-                    full[last, ...] = arr0
-                    del g[name]
-                    g.create_dataset(name, data=full)
-                else:
-                    ds[last, ...] = arr0
+                    # Prefer extending along the leading grid axis without rebuilding the payload.
+                    try:
+                        if ds.maxshape is not None and len(ds.maxshape) >= 1 and (ds.maxshape[0] is None or int(ds.maxshape[0]) >= int(nggd)):
+                            ds.resize((int(nggd),) + tuple(ds.shape[1:]))
+                        else:
+                            continue
+                    except Exception:
+                        continue
+                _copy_first_to_last(ds, last)
                 copied += 1
             except Exception:
                 continue
@@ -8228,114 +8265,6 @@ def _copy_first_gridggd_entry_h5(entry_dir: str, ids_name: str, occ: int, *, log
             except Exception:
                 pass
 
-
-
-def _collapse_gridggd_to_first_entry_h5(entry_dir: str, ids_name: str, occ: int, *, log=None) -> None:
-    """Collapse persisted ``grid_ggd`` datasets to a single stored entry.
-
-    This implements the intended on-disk semantics of ``--ggd-write-once`` for HDF5-backed
-    IDSs: later slices continue to write time-dependent ``ggd`` values that reference grid 0,
-    but only the first ``grid_ggd`` topology is kept on disk.  Any later placeholder/skeleton
-    ``grid_ggd`` entries emitted by the Access Layer are trimmed away here.
-    """
-    import os
-    import h5py
-    import numpy as np
-
-    if log is None:
-        log = logging.getLogger(__name__)
-
-    h5_path, grp_name = _ids_backend_h5_loc(entry_dir, ids_name, occ)
-    grp_name = str(grp_name).lstrip("/")
-    if not os.path.exists(h5_path):
-        return
-
-    def _rewrite_first(g, name: str) -> bool:
-        if name not in g:
-            return False
-        ds = g[name]
-        if not isinstance(ds, h5py.Dataset):
-            return False
-        if ds.ndim < 1:
-            return False
-        if int(ds.shape[0]) <= 1:
-            return False
-        try:
-            arr = np.asarray(ds[0:1, ...])
-        except Exception:
-            return False
-        dtype = ds.dtype
-        chunks = None
-        try:
-            chunks = ds.chunks
-        except Exception:
-            chunks = None
-        maxshape = (None,) + tuple(ds.shape[1:])
-        try:
-            del g[name]
-        except Exception:
-            return False
-        try:
-            if chunks is not None:
-                new_chunks = (1,) + tuple(int(min(arr.shape[i], chunks[i])) for i in range(1, arr.ndim))
-                g.create_dataset(name, data=arr, dtype=dtype, maxshape=maxshape, chunks=new_chunks)
-            else:
-                g.create_dataset(name, data=arr, dtype=dtype, maxshape=maxshape)
-            return True
-        except Exception:
-            # final fallback without chunk hints
-            try:
-                if name in g:
-                    del g[name]
-            except Exception:
-                pass
-            g.create_dataset(name, data=arr, dtype=dtype, maxshape=maxshape)
-            return True
-
-    with h5py.File(h5_path, "r+") as h5:
-        if grp_name not in h5:
-            return
-        g = h5[grp_name]
-
-        changed = 0
-        for name in list(g.keys()):
-            if not str(name).startswith("grid_ggd[]&"):
-                continue
-            try:
-                if _rewrite_first(g, str(name)):
-                    changed += 1
-            except Exception:
-                continue
-
-        # Force top-level grid AoS bookkeeping to exactly one persisted grid entry.
-        try:
-            arr = np.asarray([1], dtype=np.int32)
-            if "grid_ggd[]&AOS_SHAPE" in g:
-                del g["grid_ggd[]&AOS_SHAPE"]
-            g.create_dataset("grid_ggd[]&AOS_SHAPE", data=arr, dtype=np.int32, maxshape=(None,))
-            changed += 1
-        except Exception:
-            pass
-
-        try:
-            if "grid_ggd[]&time" in g:
-                ds = g["grid_ggd[]&time"]
-                if ds.ndim == 1 and ds.shape[0] > 1:
-                    t0 = np.asarray(ds[0:1], dtype=np.float64)
-                    del g["grid_ggd[]&time"]
-                    g.create_dataset("grid_ggd[]&time", data=t0, dtype=np.float64, maxshape=(None,))
-                    changed += 1
-        except Exception:
-            pass
-
-        if changed > 0:
-            try:
-                log.info(
-                    "%s occ=%d: collapsed persisted grid_ggd datasets to a single stored topology for --ggd-write-once",
-                    str(ids_name), int(occ),
-                )
-            except Exception:
-                pass
 
 def _finalize_gridggd_object_counts_h5(entry_dir: str, ids_name: str, occ: int, *, times, log=None) -> None:
     """Last-write-wins override for the two remaining grid_ggd object-count AoS datasets.
@@ -13283,7 +13212,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     try:
                         if bool(getattr(args, 'ggd_unstructured', False)) and _ggd_write_full_objects_enabled(args):
                             _need_seed = False
-                            if hasattr(mhd_s, 'grid_ggd') and len(mhd_s.grid_ggd) > 0:
+                            if hasattr(mhd_s, 'grid_ggd') and _aos_len(mhd_s.grid_ggd) > 0:
                                 _g0 = mhd_s.grid_ggd[0]
                                 try:
                                     if len(_g0.space) != 1:
@@ -13458,25 +13387,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     try:
                         for _s in range(nspec_mhd):
                             _occ_s = occ_base + int(_s)
-                            if _ggd_should_reuse_first_grid(args):
-                                _collapse_gridggd_to_first_entry_h5(str(entry_dir), "mhd", int(_occ_s), log=log)
-                                if _ggd_write_full_objects_enabled(args):
-                                    try:
-                                        _repair_gridggd_full_object_bookkeeping_h5(str(entry_dir), 'mhd', int(_occ_s), times=[0.0], log=log)
-                                    except Exception as _e2:
-                                        _log(f"[warn] Could not normalize full-object grid_ggd bookkeeping after collapse: {_e2}", args.quiet)
-                            else:
-                                _copy_first_gridggd_entry_h5(str(entry_dir), "mhd", int(_occ_s), log=log)
-                                if _ggd_write_full_objects_enabled(args):
-                                    try:
-                                        _repair_gridggd_full_object_bookkeeping_h5(str(entry_dir), 'mhd', int(_occ_s), log=log)
-                                    except Exception as _e2:
-                                        _log(f"[warn] Could not normalize full-object grid_ggd bookkeeping after copy: {_e2}", args.quiet)
+                            _copy_first_gridggd_entry_h5(str(entry_dir), "mhd", int(_occ_s), log=log)
+                            if _ggd_write_full_objects_enabled(args):
+                                try:
+                                    _repair_gridggd_full_object_bookkeeping_h5(str(entry_dir), 'mhd', int(_occ_s), log=log)
+                                except Exception as _e2:
+                                    _log(f"[warn] Could not normalize full-object grid_ggd bookkeeping after copy: {_e2}", args.quiet)
                     except Exception as _e:
-                        if _ggd_should_reuse_first_grid(args):
-                            _log(f"[warn] Could not collapse persisted grid_ggd to first slice: {_e}", args.quiet)
-                        else:
-                            _log(f"[warn] Could not copy persisted grid_ggd from first slice: {_e}", args.quiet)
+                        _log(f"[warn] Could not copy persisted grid_ggd from first slice: {_e}", args.quiet)
 
                 _log("Populated mhd IDS (GGD full-field snapshot)", args.quiet)
                 # Mirror edge_profiles electrons.temperature from mhd GGD ONLY when requested.
@@ -13512,6 +13430,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     _log(f"Copied GGD grid/connectivity from the first dump for this slice (--ggd-reuse-grid, via={_ggd_reuse_grid_copy_mode(args)})", args.quiet)
 
         _log(f"Appended IDS slices for {fn.name}", args.quiet)
+
+        # Release large per-dump arrays aggressively before the next dump is read.
+        try:
+            pending_unstructured_aux.clear()
+        except Exception:
+            pass
+        try:
+            del data, eq, cp, mhd_linear
+        except Exception:
+            pass
+        try:
+            del ep
+        except Exception:
+            pass
+        try:
+            del mhd
+        except Exception:
+            pass
+        gc.collect()
 
     # --- append per-step provenance (workflow + dataset_fair) ---
     try:
@@ -13899,10 +13836,11 @@ def _write_arr(dst_g, name: str, arr, *, dtype=None, overwrite=True, **kwargs):
 
 
 def _repair_gridggd_full_object_bookkeeping_h5(entry_dir: str, ids_name: str, occ: int, *, times=None, log=None) -> None:
-    """Normalize AoS bookkeeping for full-object unstructured grid_ggd trees.
+    """Normalize small AoS bookkeeping datasets for full-object unstructured grid_ggd trees.
 
-    This enforces IMAS-style AoS ranks (no trailing singleton axes on AOS_SHAPE datasets)
-    and derives the logical counts from the persisted value leaves.
+    Keep the expensive full-object payloads (nodes, boundaries, subset object references) intact and
+    only rewrite the lightweight AoS/count leaves. This avoids materializing huge arrays after
+    ``--ggd-reuse-grid`` HDF5 copies.
     """
     import os, h5py, numpy as np
     if log is None:
@@ -13920,140 +13858,125 @@ def _repair_gridggd_full_object_bookkeeping_h5(entry_dir: str, ids_name: str, oc
     K_OPD_AOS='grid_ggd[]&space[]&objects_per_dimension[]&AOS_SHAPE'
     K_OBJ_AOS='grid_ggd[]&space[]&objects_per_dimension[]&object[]&AOS_SHAPE'
     K_GEOM='grid_ggd[]&space[]&objects_per_dimension[]&object[]&geometry'
-    K_GEOM_SH='grid_ggd[]&space[]&objects_per_dimension[]&object[]&geometry_SHAPE'
     K_NODES='grid_ggd[]&space[]&objects_per_dimension[]&object[]&nodes'
-    K_NODES_SH='grid_ggd[]&space[]&objects_per_dimension[]&object[]&nodes_SHAPE'
-    K_BND_AOS='grid_ggd[]&space[]&objects_per_dimension[]&object[]&boundary[]&AOS_SHAPE'
     K_BND_INDEX='grid_ggd[]&space[]&objects_per_dimension[]&object[]&boundary[]&index'
     K_SUB_AOS='grid_ggd[]&grid_subset[]&AOS_SHAPE'
     K_ELEM_AOS='grid_ggd[]&grid_subset[]&element[]&AOS_SHAPE'
-    K_EOBJ_AOS='grid_ggd[]&grid_subset[]&element[]&object[]&AOS_SHAPE'
-    K_EOBJ_SPACE='grid_ggd[]&grid_subset[]&element[]&object[]&space'
-    K_EOBJ_DIM='grid_ggd[]&grid_subset[]&element[]&object[]&dimension'
-    K_EOBJ_INDEX='grid_ggd[]&grid_subset[]&element[]&object[]&index'
-    K_SUB_ID_N='grid_ggd[]&grid_subset[]&identifier&name'
     with h5py.File(h5_path,'r+') as h5:
         if grp_key not in h5:
             return
         g=h5[grp_key]
-        # Only normalize the object-based (space.objects_per_dimension) representation.
-        # Packed grid_subset payloads use different bookkeeping and must not be rewritten here.
         has_full_object_payload = any(k in g for k in (K_GEOM, K_NODES, K_BND_INDEX))
         if not has_full_object_payload:
             return
-        def _rewrite(name, arr, dtype):
+        def _rewrite_small(name, arr, dtype):
             arr = np.asarray(arr, dtype=dtype)
             if name in g:
                 del g[name]
-            maxshape=tuple(None for _ in arr.shape)
+            maxshape = tuple(None for _ in arr.shape)
             g.create_dataset(name, data=arr, dtype=np.dtype(dtype), maxshape=maxshape)
-        nggd=1
+
+        nggd = 1
         try:
             if K_GGD_TIME in g:
-                ds=g[K_GGD_TIME]; nggd=max(nggd, int(ds.shape[1] if ds.ndim==2 else ds.shape[0]))
+                ds = g[K_GGD_TIME]
+                if ds.ndim >= 1:
+                    nggd = max(nggd, int(ds.shape[0]))
         except Exception:
             pass
         try:
             if K_SPACE_AOS in g:
-                ds=g[K_SPACE_AOS]
-                nggd=max(nggd, int(ds.shape[0]))
+                ds = g[K_SPACE_AOS]
+                if ds.ndim >= 1:
+                    nggd = max(nggd, int(ds.shape[0]))
         except Exception:
             pass
         if times is not None:
             try:
-                nggd=max(nggd, len(np.asarray(times).reshape(-1)))
+                nggd = max(nggd, len(np.asarray(times).reshape(-1)))
             except Exception:
                 pass
-        nspace=1
-        n_nodes=0; n_faces=0; n_cells=0
-        # Prefer explicit shape leaves when available.
+
+        nspace = 1
+        n_nodes = 0
+        n_faces = 0
+        n_cells = 0
+        nsub = 1
+
+        # Prefer already-persisted small bookkeeping datasets.
         try:
-            if K_GEOM_SH in g:
-                sh=np.asarray(g[K_GEOM_SH])
-                if sh.ndim>=4 and sh.shape[2] > 0:
-                    n_nodes = int(np.count_nonzero(sh[0,0,0,:]))
-                    if n_nodes == 0:
-                        n_nodes = int(sh.shape[3])
+            if K_OBJ_AOS in g:
+                ds = g[K_OBJ_AOS]
+                if ds.ndim >= 4:
+                    counts = np.asarray(ds[0, 0, :, 0], dtype=np.int64).reshape(-1)
+                    if counts.size > 0:
+                        n_nodes = int(counts[0])
+                    if counts.size > 2:
+                        n_faces = int(counts[2])
+                    if counts.size > 3:
+                        n_cells = int(counts[3])
         except Exception:
             pass
         try:
-            if K_NODES_SH in g:
-                sh=np.asarray(g[K_NODES_SH])
-                if sh.ndim>=4:
-                    if sh.shape[2] > 2:
-                        n_faces = int(np.count_nonzero(sh[0,0,2,:]))
-                    if sh.shape[2] > 3:
-                        n_cells = int(np.count_nonzero(sh[0,0,3,:]))
-        except Exception:
-            pass
-        # Fall back to subset references, which should reflect the logical element counts.
-        if K_EOBJ_INDEX in g:
-            try:
-                idx=np.asarray(g[K_EOBJ_INDEX])
-                if idx.ndim>=4:
-                    if idx.shape[1] > 0:
-                        nn = np.count_nonzero(idx[0,0,:,0])
-                        if nn > 0:
-                            n_nodes = max(n_nodes, int(nn))
-                    if idx.shape[1] > 1:
-                        nc = np.count_nonzero(idx[0,1,:,0])
-                        if nc > 0:
-                            n_cells = max(n_cells, int(nc))
-            except Exception:
-                pass
-        # Final fallbacks from payload extents.
-        try:
-            if n_nodes == 0 and K_GEOM in g:
-                ds=g[K_GEOM]
-                if ds.ndim>=5:
-                    n_nodes=int(ds.shape[3])
+            if K_SUB_AOS in g:
+                ds = g[K_SUB_AOS]
+                if ds.ndim >= 2:
+                    nsub = max(1, int(ds[0, 0]))
+                elif ds.ndim == 1:
+                    nsub = max(1, int(ds[0]))
         except Exception:
             pass
         try:
-            if n_faces == 0 and K_NODES in g:
-                ds=g[K_NODES]
-                if ds.ndim>=5 and ds.shape[2] > 2:
-                    n_faces=int(ds.shape[3])
+            if K_ELEM_AOS in g:
+                ds = g[K_ELEM_AOS]
+                if ds.ndim >= 3:
+                    if n_nodes <= 0:
+                        n_nodes = int(ds[0, 0, 0])
+                    if nsub > 1 and n_cells <= 0 and ds.shape[1] > 1:
+                        n_cells = int(ds[0, 1, 0])
         except Exception:
             pass
-        if n_cells == 0:
-            try:
-                if K_NODES in g:
-                    ds=g[K_NODES]
-                    if ds.ndim>=5 and ds.shape[2] > 3:
-                        # This is only a last resort because the dense object axis is usually sized by max objects.
-                        n_cells=int(ds.shape[3])
-            except Exception:
-                pass
-        _rewrite(K_GGD_AOS, np.asarray([nggd],dtype=np.int32), np.int32)
-        _rewrite(K_SPACE_AOS, np.ones((nggd,nspace),dtype=np.int32), np.int32)
-        _rewrite(K_OPD_AOS, np.full((nggd,nspace),4,dtype=np.int32), np.int32)
-        obj=np.zeros((nggd,nspace,4,1),dtype=np.int32)
-        obj[:,0,0,0]=n_nodes
-        if n_faces>0: obj[:,0,2,0]=n_faces
-        if n_cells>0: obj[:,0,3,0]=n_cells
-        _rewrite(K_OBJ_AOS, obj, np.int32)
-        nsub=2 if n_cells>0 else 1
-        _rewrite(K_SUB_AOS, np.full((nggd,1),nsub,dtype=np.int32), np.int32)
-        elem=np.zeros((nggd,nsub,1),dtype=np.int32)
-        if n_nodes>0: elem[:,0,0]=n_nodes
-        if nsub>1 and n_cells>0: elem[:,1,0]=n_cells
-        _rewrite(K_ELEM_AOS, elem, np.int32)
-        max_elem=max(1,n_nodes,n_cells)
-        # Preserve the subset names if they already exist, otherwise do nothing here.
-        if K_EOBJ_SPACE in g and K_EOBJ_DIM in g and K_EOBJ_INDEX in g:
-            eobj=np.zeros((nggd,nsub,max_elem),dtype=np.int32)
-            if n_nodes>0: eobj[:,0,:n_nodes]=1
-            if nsub>1 and n_cells>0: eobj[:,1,:n_cells]=1
-            _rewrite(K_EOBJ_AOS, eobj, np.int32)
-        if K_BND_INDEX in g:
-            try:
-                idx=np.asarray(g[K_BND_INDEX],dtype=np.int32)
-                if idx.ndim==5:
-                    counts=np.count_nonzero(idx,axis=-1).astype(np.int32)
-                    _rewrite(K_BND_AOS, counts[..., None], np.int32)
-            except Exception:
-                pass
+        # Final fallback to payload extents without loading the payload.
+        try:
+            if n_nodes <= 0 and K_GEOM in g:
+                ds = g[K_GEOM]
+                if ds.ndim >= 5:
+                    n_nodes = int(ds.shape[3])
+        except Exception:
+            pass
+        try:
+            if K_NODES in g:
+                ds = g[K_NODES]
+                if ds.ndim >= 5:
+                    if n_faces <= 0 and ds.shape[2] > 2:
+                        n_faces = int(ds.shape[3])
+                    if n_cells <= 0 and ds.shape[2] > 3:
+                        n_cells = int(ds.shape[3])
+        except Exception:
+            pass
+        if nsub <= 1 and n_cells > 0:
+            nsub = 2
+
+        _rewrite_small(K_GGD_AOS, np.asarray([nggd], dtype=np.int32), np.int32)
+        _rewrite_small(K_SPACE_AOS, np.ones((nggd, nspace), dtype=np.int32), np.int32)
+        _rewrite_small(K_OPD_AOS, np.full((nggd, nspace), 4, dtype=np.int32), np.int32)
+
+        obj = np.zeros((nggd, nspace, 4, 1), dtype=np.int32)
+        obj[:, 0, 0, 0] = max(0, int(n_nodes))
+        if n_faces > 0:
+            obj[:, 0, 2, 0] = int(n_faces)
+        if n_cells > 0:
+            obj[:, 0, 3, 0] = int(n_cells)
+        _rewrite_small(K_OBJ_AOS, obj, np.int32)
+
+        _rewrite_small(K_SUB_AOS, np.full((nggd, 1), int(nsub), dtype=np.int32), np.int32)
+        elem = np.zeros((nggd, int(nsub), 1), dtype=np.int32)
+        if n_nodes > 0:
+            elem[:, 0, 0] = int(n_nodes)
+        if int(nsub) > 1 and n_cells > 0:
+            elem[:, 1, 0] = int(n_cells)
+        _rewrite_small(K_ELEM_AOS, elem, np.int32)
+
         log.info('Normalized full-object grid_ggd AoS bookkeeping in %s (occ=%d; nggd=%d n_nodes=%d n_faces=%d n_cells=%d)', h5_path, occ, nggd, n_nodes, n_faces, n_cells)
 
 

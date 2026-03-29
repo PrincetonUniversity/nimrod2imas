@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.5.1...nimrod2imas-v0.5.2) (2026-03-29)
+
+
+### Bug Fixes
+
+* Fixing memory allocation for large nphi ([#50](https://github.com/PrincetonUniversity/nimrod2imas/issues/50)) ([23c2d7b](https://github.com/PrincetonUniversity/nimrod2imas/commit/23c2d7bb3eb6560e7d7494ccbbb42ad1e1380fcf))
+
 ## [0.5.1](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.5.0...nimrod2imas-v0.5.1) (2026-03-29)
 
 

@@ -253,11 +253,13 @@ For workflows that need explicit node coordinates and explicit connectivity (e.g
 
 - `--ggd-write-once`
   - Write grid + connectivity only for the first processed dump/time slice.
-  - Later GGD field slices are still written, but they reuse/reference the first grid instead of storing another copy.
+  - Later GGD field slices are still written, but they reference the first stored grid instead of persisting another heavy `grid_ggd` topology tree.
+  - In current HDF5 output, this is the most storage-efficient option when topology is unchanged over time.
 
 - `--ggd-reuse-grid`
   - Assume grid and connectivity are invariant over time.
-  - For each later processed dump/time slice, copy the first `grid_ggd` grid/connectivity into the new slice instead of reconstructing it.
+  - For each later processed dump/time slice, reuse the first `grid_ggd` grid/connectivity instead of reconstructing it.
+  - Depending on writer/backend, later slices may still expose multiple logical `grid_ggd` entries, but the largest invariant topology payloads (`nodes` and `boundary` reference arrays) are stored compactly when topology is unchanged.
 
 - `--ggd-reuse-grid-via {auto,h5py,imas}`
   - Select how `--ggd-reuse-grid` performs the copy.
@@ -481,6 +483,9 @@ Some environments require setting `IMAS_VERSION` or passing `dd_version` directl
 
 - **`ALBackendException = Unable to extend the existing dataset` on later `mhd` slices**  
   This usually indicates that the entry already contains an incompatible `grid_ggd` layout from an earlier run, or that the GGD policy changed between runs. Write to a fresh IMAS run/entry when switching among reconstruction, `--ggd-write-once`, and `--ggd-reuse-grid` workflows.
+
+- **`h5dump` shows `/ ( H5S_UNLIMITED, ... )` max extents on `grid_ggd` datasets**  
+  This does not by itself mean that extra topology data are stored. The important part is the current extent before the slash. Large file-size growth is driven by duplicated current extents of heavy datasets such as `nodes` and `boundary`, not by `H5S_UNLIMITED` maxshape metadata alone.
 
 - **`plot_mhd.py` shows distorted contours after switching to full-object GGD**  
   Update to the current plotting script so that it correctly interprets cylindrical node geometry ordering and resolves `grid_subset_index` against the actual `grid_subset[].identifier.index` values.

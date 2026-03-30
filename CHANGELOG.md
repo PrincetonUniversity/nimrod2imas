@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.3](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.5.2...nimrod2imas-v0.5.3) (2026-03-30)
+
+
+### Bug Fixes
+
+* Updated documentation related to memory fix ([#53](https://github.com/PrincetonUniversity/nimrod2imas/issues/53)) ([0c1f848](https://github.com/PrincetonUniversity/nimrod2imas/commit/0c1f848c31cc11a499e770e8c849247ce65dd55b))
+
 ## [0.5.2](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.5.1...nimrod2imas-v0.5.2) (2026-03-29)
 
 

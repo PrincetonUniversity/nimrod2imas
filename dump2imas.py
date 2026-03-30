@@ -4967,13 +4967,17 @@ def _ggd_should_copy_first_grid(args: Any) -> bool:
 def _mhd_should_defer_grid_to_postwrite(args: Any) -> bool:
     """Return True when later nonlinear MHD slices must not materialize ``grid_ggd`` via put_slice().
 
-    For full-object unstructured MHD export we now prefer to keep a native in-memory ``grid_ggd``
-    present on every slice so that IMAS-Python can see realistic ``grid_subset``/AoS lengths.
-    Heavy geometry/connectivity payload is still written via h5py, but the in-memory tree should
-    not collapse to an empty/skeletal structure on later slices.
+    For full-object unstructured MHD export we generally prefer to keep a native in-memory
+    ``grid_ggd`` present on every slice so that IMAS-Python can see realistic
+    ``grid_subset``/AoS lengths. However, ``--ggd-write-once`` is a true *single persisted
+    topology* mode: later slices must reference grid 0 without materializing another heavy
+    ``grid_ggd`` payload in the HDF5 file.
     """
     if bool(getattr(args, "_ggd_write_grid", False)):
         return False
+    # In write-once mode, later slices should never persist another full grid/topology.
+    if _ggd_grid_write_once_mode(args):
+        return True
     conn_kind = str(getattr(args, "ggd_connectivity", "none") or "none").strip().lower()
     fullobj_native = (
         bool(getattr(args, "ggd_unstructured", False))
@@ -4983,8 +4987,6 @@ def _mhd_should_defer_grid_to_postwrite(args: Any) -> bool:
     )
     if fullobj_native:
         return False
-    if _ggd_grid_write_once_mode(args):
-        return True
     if _ggd_should_copy_first_grid(args) and (_ggd_reuse_grid_copy_mode(args) == "h5py"):
         return True
     return False
@@ -8230,8 +8232,69 @@ def _copy_first_gridggd_entry_h5(entry_dir: str, ids_name: str, occ: int, *, log
         if (nggd is None) or (nggd < 2):
             return
 
+        # These very large datasets are topology-invariant and were historically stored only once
+        # on disk even when multiple logical grid_ggd entries existed. Preserve that compact layout.
+        singleton_payload_names = {
+            "grid_ggd[]&space[]&objects_per_dimension[]&object[]&nodes",
+            "grid_ggd[]&space[]&objects_per_dimension[]&object[]&boundary[]&dimension",
+            "grid_ggd[]&space[]&objects_per_dimension[]&object[]&boundary[]&index",
+            "grid_ggd[]&space[]&objects_per_dimension[]&object[]&boundary[]&space",
+        }
+
+        def _collapse_leading_axis_to_first(parent, name):
+            ds = parent[name]
+            if ds.ndim < 1 or int(ds.shape[0]) <= 1:
+                return False
+            new_shape = (1,) + tuple(int(x) for x in ds.shape[1:])
+            old_maxshape = ds.maxshape
+            if old_maxshape is None:
+                new_maxshape = None
+            else:
+                new_maxshape = list(old_maxshape)
+                if len(new_maxshape) >= 1:
+                    new_maxshape[0] = 1
+                new_maxshape = tuple(new_maxshape)
+            chunks = ds.chunks
+            if chunks is not None:
+                chunks = (1,) + tuple(int(c) for c in chunks[1:])
+            tmp_name = f"{name}__singleton_tmp__"
+            if tmp_name in parent:
+                del parent[tmp_name]
+            kwargs = {}
+            if chunks is not None:
+                kwargs["chunks"] = chunks
+            if new_maxshape is not None:
+                kwargs["maxshape"] = new_maxshape
+            if ds.compression is not None:
+                kwargs["compression"] = ds.compression
+                if ds.compression_opts is not None:
+                    kwargs["compression_opts"] = ds.compression_opts
+            if ds.shuffle:
+                kwargs["shuffle"] = True
+            if ds.fletcher32:
+                kwargs["fletcher32"] = True
+            tmp = parent.create_dataset(tmp_name, shape=new_shape, dtype=ds.dtype, **kwargs)
+            str_info = h5py.check_string_dtype(ds.dtype)
+            if str_info is not None or ds.dtype.kind == "O":
+                tmp[...] = ds[0:1, ...]
+            else:
+                tail = tuple(int(x) for x in ds.shape[1:])
+                for sub in _iter_slab_slices(tail, int(ds.dtype.itemsize)):
+                    src_sel = (0,) + sub
+                    dst_sel = (0,) + sub
+                    tmp[dst_sel] = ds[src_sel]
+            try:
+                for ak, av in ds.attrs.items():
+                    tmp.attrs[ak] = av
+            except Exception:
+                pass
+            del parent[name]
+            parent.move(tmp_name, name)
+            return True
+
         last = int(nggd - 1)
         copied = 0
+        singleton_preserved = 0
         for name, ds in list(g.items()):
             if not isinstance(ds, h5py.Dataset):
                 continue
@@ -8242,6 +8305,12 @@ def _copy_first_gridggd_entry_h5(entry_dir: str, ids_name: str, occ: int, *, log
             if ds.ndim < 1:
                 continue
             try:
+                if str(name) in singleton_payload_names:
+                    # Keep exactly one physical copy of these invariant heavy payloads.
+                    if int(ds.shape[0]) > 1:
+                        if _collapse_leading_axis_to_first(g, str(name)):
+                            singleton_preserved += 1
+                    continue
                 if int(ds.shape[0]) != int(nggd):
                     # Prefer extending along the leading grid axis without rebuilding the payload.
                     try:
@@ -8256,11 +8325,11 @@ def _copy_first_gridggd_entry_h5(entry_dir: str, ids_name: str, occ: int, *, log
             except Exception:
                 continue
 
-        if copied > 0:
+        if copied > 0 or singleton_preserved > 0:
             try:
                 log.info(
-                    "%s occ=%d: copied persisted grid_ggd geometry/connectivity from first slice to slice %d",
-                    str(ids_name), int(occ), int(last),
+                    "%s occ=%d: copied persisted grid_ggd geometry/connectivity from first slice to slice %d (singleton heavy payloads preserved=%d)",
+                    str(ids_name), int(occ), int(last), int(singleton_preserved),
                 )
             except Exception:
                 pass
@@ -11000,6 +11069,145 @@ def _write_unstructured_gridggd_full_objects_h5(
         else:
             log.info("Wrote object-based grid_ggd geometry/nodes for %d grid indices into %s (occ=%d)", nggd, h5_path, occ)
 
+
+def _collapse_gridggd_to_first_h5(entry_dir: str, ids_name: str, occ: int, *, log=None) -> None:
+    """Physically collapse persisted ``grid_ggd`` datasets to a single stored grid entry.
+
+    This is the on-disk semantics of ``--ggd-write-once`` for HDF5-backed IDS files:
+    later slices may still carry time-dependent ``ggd`` values, but the heavy
+    ``grid_ggd`` topology payload must remain stored only once.
+
+    The collapse is performed in slabs so very large full-object datasets are not
+    materialized in memory at once.
+    """
+    import os
+    import h5py
+    import numpy as np
+
+    if log is None:
+        log = logging.getLogger(__name__)
+
+    h5_path, grp_name = _ids_backend_h5_loc(entry_dir, ids_name, occ)
+    grp_name = str(grp_name).lstrip("/")
+    if not os.path.exists(h5_path):
+        return
+
+    def _iter_slab_slices(shape_tail: tuple[int, ...], itemsize: int, *, max_bytes: int = 64 * 1024 * 1024):
+        if not shape_tail:
+            yield ()
+            return
+        total = int(itemsize)
+        for s in shape_tail:
+            total *= int(s)
+        if total <= max_bytes:
+            yield tuple(slice(None) for _ in shape_tail)
+            return
+        slab_axis = max(range(len(shape_tail)), key=lambda i: int(shape_tail[i]))
+        other = max(1, total // max(1, int(shape_tail[slab_axis])))
+        step = max(1, int(max_bytes // max(1, other)))
+        step = min(step, int(shape_tail[slab_axis]))
+        for i0 in range(0, int(shape_tail[slab_axis]), step):
+            i1 = min(i0 + step, int(shape_tail[slab_axis]))
+            ss = [slice(None)] * len(shape_tail)
+            ss[slab_axis] = slice(i0, i1)
+            yield tuple(ss)
+
+    with h5py.File(h5_path, "r+") as h5:
+        if grp_name not in h5:
+            return
+        g = h5[grp_name]
+
+        # Determine whether there is more than one persisted grid slot at all.
+        nggd = None
+        for probe in ("grid_ggd[]&time", "grid_ggd[]&space[]&AOS_SHAPE", "grid_ggd[]&grid_subset[]&AOS_SHAPE"):
+            try:
+                if probe in g:
+                    ds = g[probe]
+                    if ds.ndim >= 1:
+                        nggd = int(ds.shape[0])
+                        break
+            except Exception:
+                pass
+        if (nggd is None) or (nggd <= 1):
+            return
+
+        collapsed = 0
+        for name, ds in list(g.items()):
+            if not isinstance(ds, h5py.Dataset):
+                continue
+            if not str(name).startswith("grid_ggd[]&"):
+                continue
+            if ds.ndim < 1:
+                continue
+            if int(ds.shape[0]) <= 1:
+                continue
+
+            new_shape = (1,) + tuple(int(x) for x in ds.shape[1:])
+            old_maxshape = ds.maxshape
+            if old_maxshape is None:
+                new_maxshape = None
+            else:
+                new_maxshape = list(old_maxshape)
+                if len(new_maxshape) >= 1:
+                    # Preserve an unlimited leading dimension when present, but store only one slice.
+                    new_maxshape[0] = None if old_maxshape[0] is None else 1
+                new_maxshape = tuple(new_maxshape)
+
+            chunks = ds.chunks
+            if chunks is not None:
+                chunks = (1,) + tuple(int(c) for c in chunks[1:])
+
+            tmp_name = f"{name}__collapse_tmp__"
+            if tmp_name in g:
+                del g[tmp_name]
+
+            kwargs = {}
+            if chunks is not None:
+                kwargs["chunks"] = chunks
+            if new_maxshape is not None:
+                kwargs["maxshape"] = new_maxshape
+            if ds.compression is not None:
+                kwargs["compression"] = ds.compression
+                if ds.compression_opts is not None:
+                    kwargs["compression_opts"] = ds.compression_opts
+            if ds.shuffle:
+                kwargs["shuffle"] = True
+            if ds.fletcher32:
+                kwargs["fletcher32"] = True
+
+            tmp = g.create_dataset(tmp_name, shape=new_shape, dtype=ds.dtype, **kwargs)
+
+            str_info = h5py.check_string_dtype(ds.dtype)
+            if str_info is not None or ds.dtype.kind == "O":
+                tmp[...] = ds[0:1, ...]
+            else:
+                tail = tuple(int(x) for x in ds.shape[1:])
+                for sub in _iter_slab_slices(tail, int(ds.dtype.itemsize)):
+                    src_sel = (0,) + sub
+                    dst_sel = (0,) + sub
+                    tmp[dst_sel] = ds[src_sel]
+
+            # Preserve dataset attributes, if any.
+            try:
+                for ak, av in ds.attrs.items():
+                    tmp.attrs[ak] = av
+            except Exception:
+                pass
+
+            del g[name]
+            g.move(tmp_name, name)
+            collapsed += 1
+
+        if collapsed > 0:
+            try:
+                log.info(
+                    "%s occ=%d: collapsed persisted grid_ggd payload to a single stored topology",
+                    str(ids_name), int(occ),
+                )
+            except Exception:
+                pass
+
+
 def _write_unstructured_gridggd_subset_refs_h5(
     entry_dir: str,
     ids_name: str,
@@ -13383,18 +13591,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                 _debug_dump_h5_gridggd(str(entry_dir), 'mhd', int(_occ_s), stage='post-h5-write', quiet=args.quiet, log=log)
                     except Exception as _e:
                         _log(f"[warn] Could not write unstructured grid_ggd nodes/connectivity: {_e}", args.quiet)
-                if (str(getattr(args, "backend", "hdf5") or "hdf5").strip().lower() == "hdf5") and (_ggd_should_copy_first_grid(args) or _ggd_should_reuse_first_grid(args)) and (_ggd_reuse_grid_copy_mode(args) == "h5py") and (not bool(getattr(args, "_ggd_native_grid_copy_ok", False))):
+                if (str(getattr(args, "backend", "hdf5") or "hdf5").strip().lower() == "hdf5") and (_ggd_reuse_grid_copy_mode(args) == "h5py") and (not bool(getattr(args, "_ggd_native_grid_copy_ok", False))):
                     try:
                         for _s in range(nspec_mhd):
                             _occ_s = occ_base + int(_s)
-                            _copy_first_gridggd_entry_h5(str(entry_dir), "mhd", int(_occ_s), log=log)
-                            if _ggd_write_full_objects_enabled(args):
-                                try:
-                                    _repair_gridggd_full_object_bookkeeping_h5(str(entry_dir), 'mhd', int(_occ_s), log=log)
-                                except Exception as _e2:
-                                    _log(f"[warn] Could not normalize full-object grid_ggd bookkeeping after copy: {_e2}", args.quiet)
+                            if _ggd_should_copy_first_grid(args):
+                                _copy_first_gridggd_entry_h5(str(entry_dir), "mhd", int(_occ_s), log=log)
+                                if _ggd_write_full_objects_enabled(args):
+                                    try:
+                                        _repair_gridggd_full_object_bookkeeping_h5(str(entry_dir), 'mhd', int(_occ_s), log=log)
+                                    except Exception as _e2:
+                                        _log(f"[warn] Could not normalize full-object grid_ggd bookkeeping after copy: {_e2}", args.quiet)
+                            elif _ggd_should_reuse_first_grid(args):
+                                # True write-once semantics: later slices reference grid 0 and must not
+                                # leave a second persisted grid_ggd payload on disk.
+                                _collapse_gridggd_to_first_h5(str(entry_dir), "mhd", int(_occ_s), log=log)
+                                if _ggd_write_full_objects_enabled(args):
+                                    try:
+                                        _repair_gridggd_full_object_bookkeeping_h5(str(entry_dir), 'mhd', int(_occ_s), log=log)
+                                    except Exception as _e2:
+                                        _log(f"[warn] Could not normalize full-object grid_ggd bookkeeping after collapse: {_e2}", args.quiet)
                     except Exception as _e:
-                        _log(f"[warn] Could not copy persisted grid_ggd from first slice: {_e}", args.quiet)
+                        _log(f"[warn] Could not finalize persisted grid_ggd policy: {_e}", args.quiet)
 
                 _log("Populated mhd IDS (GGD full-field snapshot)", args.quiet)
                 # Mirror edge_profiles electrons.temperature from mhd GGD ONLY when requested.

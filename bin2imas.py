@@ -179,8 +179,33 @@ def load_discharge(files: Sequence[Path], endian: str = ">") -> np.ndarray:
     return out if out.size else np.zeros((0, 20), dtype=np.float64)
 
 
+def _rows_from_kpraden_file(path: Path, endian: str) -> np.ndarray:
+    """
+    Read kpraden rows accepting both:
+      - 19 columns: legacy format (istep, time, qlosd, qloso, qlosb, qlosr, qlosl, qlosi, Nz, Ne, Nz+zi, qlost, elosd, eloso, elosb, elosr, elosl, elosi, elost)
+      - 22 columns: extended format with 3 additional fields
+    Extra columns beyond 19 are truncated.
+    """
+    rows: List[np.ndarray] = []
+    for rec in _read_fortran_records_f32(path, endian=endian):
+        if rec.size == 0:
+            continue
+        if rec.size == 19:
+            rows.append(rec)
+            continue
+        if rec.size == 22:
+            rows.append(rec[:19])  # truncate to legacy 19-column format
+            continue
+        raise ValueError(
+            f"{path}: expected 19 or 22 float32 values per kpraden record, got {rec.size}"
+        )
+    if not rows:
+        return np.zeros((0, 19), dtype=np.float64)
+    return np.vstack(rows)
+
+
 def load_kpraden(files: Sequence[Path], endian: str = ">") -> np.ndarray:
-    parts = [_rows_from_file(fp, ncols=19, endian=endian) for fp in files]
+    parts = [_rows_from_kpraden_file(fp, endian=endian) for fp in files]
     out = _concat_sorted(parts, sort_cols=(0, 1), key_cols=(0, 1))
     return out if out.size else np.zeros((0, 19), dtype=np.float64)
 

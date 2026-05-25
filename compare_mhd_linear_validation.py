@@ -38,8 +38,12 @@ from typing import Any, Optional, Tuple
 import numpy as np
 import matplotlib.pyplot as plt
 
-from dump2imas import read_and_stitch_dump
-from nimrod2imas import open_dbentry, ids_factory, get_ids, resolve_entry_path, add_entry_args
+try:
+    from dump2imas import read_and_stitch_dump, _nimrod_species_info
+except ImportError:
+    from dump2imas import read_and_stitch_dump
+    _nimrod_species_info = None
+from nimrod2imas import open_dbentry, ids_factory, get_ids
 
 AMU = 1.66053906660e-27
 ECHARGE = 1.602176634e-19
@@ -313,75 +317,202 @@ def dump_temperature_fields(data: dict, species_index: int, mode_index: int, ele
     return fields["reti"][:, :, mode_index], fields["imti"][:, :, mode_index]
 
 
-def dump_pressure_fields(data: dict, species_index: int, mode_index: int, electrons_index: int) -> Tuple[np.ndarray, np.ndarray]:
-    fields = data["fields"]
-    nq2d = data.get("nq", None)
-    teq2d = data.get("teq", None)
-    tiq2d = data.get("tiq", None)
-    prq2d = data.get("prq", None)
-    peq2d = data.get("peq", None)
-    is_electron = int(species_index) == int(electrons_index)
-
-    n0 = None
-    if nq2d is not None:
-        A = np.asarray(nq2d)
-        if A.ndim == 3:
-            ssel = int(species_index)
-            if ssel >= A.shape[2]:
-                ssel = 0
-            n0 = A[:, :, ssel]
-        else:
-            n0 = A
-
-    T0 = None
-    if is_electron:
-        if teq2d is not None:
-            A = np.asarray(teq2d)
-            T0 = A[:, :, 0] if A.ndim == 3 else A
-        elif peq2d is not None and n0 is not None:
-            A = np.asarray(peq2d)
-            pe = A[:, :, 0] if A.ndim == 3 else A
-            T0 = pe / (np.maximum(n0, 1e-60) * ECHARGE)
-    else:
-        if tiq2d is not None:
-            A = np.asarray(tiq2d)
-            T0 = A[:, :, 0] if A.ndim == 3 else A
-        elif prq2d is not None and n0 is not None:
-            p_tot = np.asarray(prq2d)
-            p_tot = p_tot[:, :, 0] if p_tot.ndim == 3 else p_tot
-            if peq2d is not None and int(data.get("nspec_eq", 0) or 0) <= 1:
-                p_e = np.asarray(peq2d)
-                p_e = p_e[:, :, 0] if p_e.ndim == 3 else p_e
-                T0 = (p_tot - p_e) / (np.maximum(n0, 1e-60) * ECHARGE)
-            else:
-                T0 = p_tot / (np.maximum(n0, 1e-60) * ECHARGE)
-
-    # explicit pressure perturbation preferred
-    if is_electron and ("repe" in fields) and ("impe" in fields):
-        return fields["repe"][:, :, mode_index], fields["impe"][:, :, mode_index]
-    if ("repr" in fields) and ("impr" in fields) and np.asarray(fields["repr"]).ndim == 4:
+def _species_slice_2d(A: Any, species_index: int) -> np.ndarray:
+    """Return a 2D equilibrium array, selecting a species axis when present."""
+    arr = np.asarray(A)
+    if arr.ndim == 3:
         ssel = int(species_index)
-        if ssel >= fields["repr"].shape[2]:
+        if ssel < 0 or ssel >= arr.shape[2]:
             ssel = 0
-        return fields["repr"][:, :, ssel, mode_index], fields["impr"][:, :, ssel, mode_index]
-    if ("repr" in fields) and ("impr" in fields):
-        dp_tot_re = fields["repr"][:, :, mode_index]
-        dp_tot_im = fields["impr"][:, :, mode_index]
-        if (not is_electron) and ("repe" in fields) and ("impe" in fields) and int(data.get("nspec_eq", 0) or 0) <= 1:
-            return dp_tot_re - fields["repe"][:, :, mode_index], dp_tot_im - fields["impe"][:, :, mode_index]
+        return arr[:, :, ssel]
+    if arr.ndim == 2:
+        return arr
+    raise RuntimeError(f"expected 2D or 3D equilibrium array, got shape {arr.shape}")
+
+
+def _mode_slice_2d(A: Any, mode_index: int, species_index: Optional[int] = None) -> np.ndarray:
+    """Return a 2D perturbation array from either (R,Z,mode) or (R,Z,species,mode)."""
+    arr = np.asarray(A)
+    if arr.ndim == 4:
+        if species_index is None:
+            ssel = 0
+        else:
+            ssel = int(species_index)
+            if ssel < 0 or ssel >= arr.shape[2]:
+                ssel = 0
+        return arr[:, :, ssel, mode_index]
+    if arr.ndim == 3:
+        return arr[:, :, mode_index]
+    raise RuntimeError(f"expected 3D or 4D perturbation array, got shape {arr.shape}")
+
+
+def dump_pressure_fields(
+    data: dict,
+    species_index: int,
+    mode_index: int,
+    electrons_index: int,
+    pressure_source: str = "auto",
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return the native reference pressure perturbation using dump2imas logic.
+
+    The default ``pressure_source='auto'`` intentionally mirrors the pressure-writing
+    branch in ``populate_mhd_linear`` from dump2imasA.py:
+
+      1. electron occurrence: use ``repe/impe`` when present;
+      2. if ``repr/impr`` is species-resolved (4D), use the selected species slice;
+      3. if ``repr/impr`` is total pressure (3D), use ``repr-repe`` for ions only when
+         ``data['nspec_eq'] <= 1``; otherwise use total pressure only for electrons;
+      4. if no explicit branch applies, reconstruct
+         ``dp = e * (dn*T0 + n0*dT)``.
+
+    This is deliberately different from a purely physical ion-pressure reference. It is
+    the reference needed to verify that the deposited IMAS field matches what the current
+    converter actually writes.
+    """
+    fields = data["fields"]
+    source = str(pressure_source or "auto").lower()
+    valid_sources = {
+        "auto", "dump2imas", "explicit", "total", "total_minus_electron",
+        "reconstruct", "thermal_only", "density_only",
+    }
+    if source not in valid_sources:
+        raise RuntimeError(f"unknown pressure_source={pressure_source!r}; expected one of {sorted(valid_sources)}")
+    if source == "dump2imas":
+        source = "auto"
+
+    is_electron = int(species_index) == int(electrons_index)
+    have_repe = ("repe" in fields) and ("impe" in fields)
+    have_repr = ("repr" in fields) and ("impr" in fields)
+    repr_is_species_resolved = have_repr and np.asarray(fields["repr"]).ndim == 4
+    nspec_eq = int(data.get("nspec_eq", 0) or 0)
+
+    def electron_pressure() -> Tuple[np.ndarray, np.ndarray]:
+        if not have_repe:
+            raise RuntimeError("electron pressure perturbation repe/impe is not available")
+        return _mode_slice_2d(fields["repe"], mode_index), _mode_slice_2d(fields["impe"], mode_index)
+
+    def total_pressure() -> Tuple[np.ndarray, np.ndarray]:
+        if not have_repr:
+            raise RuntimeError("total pressure perturbation repr/impr is not available")
+        return _mode_slice_2d(fields["repr"], mode_index), _mode_slice_2d(fields["impr"], mode_index)
+
+    def species_pressure_from_repr() -> Tuple[np.ndarray, np.ndarray]:
+        if not repr_is_species_resolved:
+            raise RuntimeError("repr/impr is not species resolved")
+        return (
+            _mode_slice_2d(fields["repr"], mode_index, species_index),
+            _mode_slice_2d(fields["impr"], mode_index, species_index),
+        )
+
+    def ion_pressure_total_minus_electron() -> Tuple[np.ndarray, np.ndarray]:
+        dp_tot_re, dp_tot_im = total_pressure()
+        dp_e_re, dp_e_im = electron_pressure()
+        return dp_tot_re - dp_e_re, dp_tot_im - dp_e_im
+
+    def pressure_linearized_terms() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return thermal and density contributions exactly as dump2imas computes them."""
+        nq2d = data.get("nq", None)
+        teq2d = data.get("teq", None)
+        tiq2d = data.get("tiq", None)
+        prq2d = data.get("prq", None)
+        peq2d = data.get("peq", None)
+
+        n0 = None
+        if nq2d is not None:
+            n0 = _species_slice_2d(nq2d, species_index)
+
+        T0 = None
         if is_electron:
-            return dp_tot_re, dp_tot_im
+            if teq2d is not None:
+                T0 = _species_slice_2d(teq2d, 0)
+            elif peq2d is not None and n0 is not None:
+                pe = _species_slice_2d(peq2d, 0)
+                T0 = pe / (np.maximum(n0, 1e-60) * ECHARGE)
+        else:
+            if tiq2d is not None:
+                # dump2imas uses tiq[:,:,0] for a 3D tiq array, not the IMAS occurrence index.
+                T0 = _species_slice_2d(tiq2d, 0)
+            elif prq2d is not None and n0 is not None:
+                # Mirror dump2imas: subtract p_e only when nspec_eq <= 1.  In the
+                # single-channel compatibility path, read_and_stitch_dump expands
+                # nspec_eq to 2, so the converter uses p_total/n0 here.
+                p_tot = _species_slice_2d(prq2d, 0)
+                if peq2d is not None and nspec_eq <= 1:
+                    p_e = _species_slice_2d(peq2d, 0)
+                    T0 = (p_tot - p_e) / (np.maximum(n0, 1e-60) * ECHARGE)
+                else:
+                    T0 = p_tot / (np.maximum(n0, 1e-60) * ECHARGE)
 
-    # fallback: dp = e * (dn*T0 + n0*dT)
-    dn_re, dn_im = dump_density_fields(data, species_index, mode_index, ion_mass_amu=1.0 / AMU)  # returns number density if mpart=1
-    # undo mass-density scaling trick above: mpart = (1/AMU)*AMU = 1
-    dT_re, dT_im = dump_temperature_fields(data, species_index, mode_index, electrons_index)
-    if n0 is None or T0 is None:
-        raise RuntimeError("cannot reconstruct pressure perturbation: missing equilibrium density/temperature")
-    dp_re = (dn_re * T0 + n0 * dT_re) * ECHARGE
-    dp_im = (dn_im * T0 + n0 * dT_im) * ECHARGE
+        # dump2imas uses the same species_index for rend/imnd as for the IMAS occurrence,
+        # falling back to 0 only if the requested index is out of range.  Use mpart=1 to
+        # recover number-density perturbations from dump_density_fields.
+        dn_re, dn_im = dump_density_fields(
+            data,
+            species_index,
+            mode_index,
+            ion_mass_amu=1.0 / AMU,
+        )
+        dT_re, dT_im = dump_temperature_fields(data, species_index, mode_index, electrons_index)
+        if n0 is None or T0 is None:
+            raise RuntimeError("cannot reconstruct pressure perturbation: missing equilibrium density/temperature")
+        thermal_re = n0 * dT_re * ECHARGE
+        thermal_im = n0 * dT_im * ECHARGE
+        density_re = dn_re * T0 * ECHARGE
+        density_im = dn_im * T0 * ECHARGE
+        return thermal_re, thermal_im, density_re, density_im
+
+    def reconstruct_species_pressure() -> Tuple[np.ndarray, np.ndarray]:
+        th_re, th_im, dn_re, dn_im = pressure_linearized_terms()
+        return th_re + dn_re, th_im + dn_im
+
+    def thermal_only_pressure() -> Tuple[np.ndarray, np.ndarray]:
+        th_re, th_im, _, _ = pressure_linearized_terms()
+        return th_re, th_im
+
+    def density_only_pressure() -> Tuple[np.ndarray, np.ndarray]:
+        _, _, dn_re, dn_im = pressure_linearized_terms()
+        return dn_re, dn_im
+
+    if source == "total":
+        return total_pressure()
+    if source == "total_minus_electron":
+        return ion_pressure_total_minus_electron()
+    if source == "reconstruct":
+        return reconstruct_species_pressure()
+    if source == "thermal_only":
+        return thermal_only_pressure()
+    if source == "density_only":
+        return density_only_pressure()
+    if source == "explicit":
+        # Debug helper, not dump2imas exact behavior.
+        if is_electron and have_repe:
+            return electron_pressure()
+        if repr_is_species_resolved:
+            return species_pressure_from_repr()
+        if have_repr:
+            return total_pressure()
+        return reconstruct_species_pressure()
+
+    # source == "auto": exact populate_mhd_linear branch order.
+    dp_re = None
+    dp_im = None
+
+    if is_electron and have_repe:
+        dp_re, dp_im = electron_pressure()
+    elif repr_is_species_resolved:
+        dp_re, dp_im = species_pressure_from_repr()
+    elif have_repr:
+        dp_tot_re, dp_tot_im = total_pressure()
+        if (not is_electron) and have_repe and nspec_eq <= 1:
+            dp_e_re, dp_e_im = electron_pressure()
+            dp_re = dp_tot_re - dp_e_re
+            dp_im = dp_tot_im - dp_e_im
+        elif is_electron:
+            dp_re, dp_im = dp_tot_re, dp_tot_im
+
+    if dp_re is None or dp_im is None:
+        dp_re, dp_im = reconstruct_species_pressure()
     return dp_re, dp_im
-
 
 def dump_vector_fields(data: dict, quantity: str, component: str, mode_index: int) -> Tuple[np.ndarray, np.ndarray]:
     fields = data["fields"]
@@ -393,7 +524,17 @@ def dump_vector_fields(data: dict, quantity: str, component: str, mode_index: in
     raise RuntimeError(quantity)
 
 
-def extract_dump_field(data: dict, quantity: str, species_index: int, mode_index: int, part: str, component: Optional[str], ion_mass_amu: float, electrons_index: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def extract_dump_field(
+    data: dict,
+    quantity: str,
+    species_index: int,
+    mode_index: int,
+    part: str,
+    component: Optional[str],
+    ion_mass_amu: float,
+    electrons_index: int,
+    pressure_source: str = "auto",
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     q = quantity.lower()
     R = np.asarray(data["R"], dtype=float)
     Z = np.asarray(data["Z"], dtype=float)
@@ -403,7 +544,7 @@ def extract_dump_field(data: dict, quantity: str, species_index: int, mode_index
     elif q == "t":
         re, im = dump_temperature_fields(data, species_index, mode_index, electrons_index)
     elif q == "p":
-        re, im = dump_pressure_fields(data, species_index, mode_index, electrons_index)
+        re, im = dump_pressure_fields(data, species_index, mode_index, electrons_index, pressure_source=pressure_source)
     elif q in ("b", "v"):
         if component is None:
             raise RuntimeError(f"quantity {quantity} requires --component r|z|phi")
@@ -420,6 +561,165 @@ def extract_dump_field(data: dict, quantity: str, species_index: int, mode_index
     else:
         raise ValueError(part)
     return R, Z, F
+
+
+
+
+# ----------------------------- pressure diagnostics -----------------------------
+
+def _complex_part_from_pair(re: np.ndarray, im: np.ndarray, part: str) -> np.ndarray:
+    re = np.asarray(re, dtype=float)
+    im = np.asarray(im, dtype=float)
+    if part == "real":
+        return re
+    if part == "imag":
+        return im
+    if part == "amp":
+        return np.sqrt(re * re + im * im)
+    raise ValueError(part)
+
+
+def _safe_add_candidate(cands: dict[str, np.ndarray], name: str, func, part: str) -> None:
+    try:
+        re, im = func()
+        cands[name] = _complex_part_from_pair(re, im, part)
+    except Exception as exc:
+        cands[name + " [unavailable: " + str(exc).splitlines()[0] + "]"] = None  # type: ignore[assignment]
+
+
+def pressure_candidate_fields(
+    data: dict,
+    mode_index: int,
+    part: str,
+    ids_species_index: int,
+    native_species_index: int,
+    electrons_index: int,
+) -> dict[str, np.ndarray]:
+    """Build several plausible native pressure references for debugging.
+
+    This intentionally separates the IMAS occurrence index from the NIMROD native
+    species index.  In NIMROD dump files, electrons are usually stored in separate
+    arrays such as rete/imte and repe/impe, while ion density arrays such as
+    rend/imnd and nq usually start with main ion species index 0.  Therefore,
+    occ=2 in IMAS does not automatically mean native species index 1.
+    """
+    cands: dict[str, np.ndarray] = {}
+
+    def add(name: str, func) -> None:
+        _safe_add_candidate(cands, name, func, part)
+
+    # The reference used by the main validation when --pressure-source=auto.
+    add(f"dump2imas_auto_ids_species_s{ids_species_index}", lambda: dump_pressure_fields(data, ids_species_index, mode_index, electrons_index=electrons_index, pressure_source="auto"))
+
+    add("repr_total", lambda: dump_pressure_fields(data, native_species_index, mode_index, electrons_index=-999999, pressure_source="total"))
+    add("repr_minus_repe", lambda: dump_pressure_fields(data, native_species_index, mode_index, electrons_index=-999999, pressure_source="total_minus_electron"))
+    add(f"ion_reconstruct_native_s{native_species_index}", lambda: dump_pressure_fields(data, native_species_index, mode_index, electrons_index=-999999, pressure_source="reconstruct"))
+    add(f"ion_thermal_only_native_s{native_species_index}", lambda: dump_pressure_fields(data, native_species_index, mode_index, electrons_index=-999999, pressure_source="thermal_only"))
+    add(f"ion_density_only_native_s{native_species_index}", lambda: dump_pressure_fields(data, native_species_index, mode_index, electrons_index=-999999, pressure_source="density_only"))
+    add(f"old_reconstruct_ids_species_s{ids_species_index}", lambda: dump_pressure_fields(data, ids_species_index, mode_index, electrons_index=electrons_index, pressure_source="reconstruct"))
+
+    # Also try species 0 and 1 explicitly when possible.
+    for s in (0, 1, 2):
+        add(f"ion_reconstruct_s{s}", lambda s=s: dump_pressure_fields(data, s, mode_index, electrons_index=-999999, pressure_source="reconstruct"))
+        add(f"ion_thermal_only_s{s}", lambda s=s: dump_pressure_fields(data, s, mode_index, electrons_index=-999999, pressure_source="thermal_only"))
+        add(f"ion_density_only_s{s}", lambda s=s: dump_pressure_fields(data, s, mode_index, electrons_index=-999999, pressure_source="density_only"))
+
+    # Electron pressure and reconstructed total pressure from electron+main-ion terms.
+    add("repe_electron", lambda: dump_pressure_fields(data, 0, mode_index, electrons_index=0, pressure_source="explicit"))
+    add("electron_reconstruct", lambda: dump_pressure_fields(data, 0, mode_index, electrons_index=0, pressure_source="reconstruct"))
+    add("electron_thermal_only", lambda: dump_pressure_fields(data, 0, mode_index, electrons_index=0, pressure_source="thermal_only"))
+    add("electron_density_only", lambda: dump_pressure_fields(data, 0, mode_index, electrons_index=0, pressure_source="density_only"))
+    try:
+        e_re, e_im = dump_pressure_fields(data, 0, mode_index, electrons_index=0, pressure_source="reconstruct")
+        i_re, i_im = dump_pressure_fields(data, native_species_index, mode_index, electrons_index=-999999, pressure_source="reconstruct")
+        cands[f"reconstruct_electron_plus_ion_s{native_species_index}"] = _complex_part_from_pair(e_re + i_re, e_im + i_im, part)
+    except Exception as exc:
+        cands[f"reconstruct_electron_plus_ion_s{native_species_index} [unavailable: {str(exc).splitlines()[0]}]"] = None  # type: ignore[assignment]
+
+    try:
+        t_re, t_im = dump_pressure_fields(data, native_species_index, mode_index, electrons_index=-999999, pressure_source="total")
+        e_re, e_im = dump_pressure_fields(data, 0, mode_index, electrons_index=0, pressure_source="explicit")
+        cands["repr_plus_repe"] = _complex_part_from_pair(t_re + e_re, t_im + e_im, part)
+    except Exception as exc:
+        cands[f"repr_plus_repe [unavailable: {str(exc).splitlines()[0]}]"] = None  # type: ignore[assignment]
+
+    return cands
+
+
+def print_pressure_diagnostics(
+    R_dump: np.ndarray,
+    Z_dump: np.ndarray,
+    R_ids: np.ndarray,
+    Z_ids: np.ndarray,
+    F_ids: np.ndarray,
+    data: dict,
+    mode_index: int,
+    part: str,
+    ids_species_index: int,
+    native_species_index: int,
+    electrons_index: int,
+) -> None:
+    print("pressure_diagnostics_begin=1")
+    print(f"ids_species_index={ids_species_index}")
+    print(f"native_species_index={native_species_index}")
+    candidates = pressure_candidate_fields(
+        data=data,
+        mode_index=mode_index,
+        part=part,
+        ids_species_index=ids_species_index,
+        native_species_index=native_species_index,
+        electrons_index=electrons_index,
+    )
+    valid_for_ls: list[tuple[str, np.ndarray]] = []
+    for name, arr in candidates.items():
+        if arr is None:
+            print(f"candidate={name}")
+            continue
+        try:
+            _Rd, _Zd, Fc, _Ri, Fi = align_fields(R_dump, Z_dump, arr, R_ids, Z_ids, F_ids)
+            met = compute_metrics(Fc, Fi)
+            print(
+                "candidate={name} l2_rel={l2:.16e} rmse={rmse:.16e} max_abs={max_abs:.16e} corr={corr:.16e} "
+                "cand_l2={cl2:.16e} ids_l2={il2:.16e} cand_min={cmin:.16e} cand_max={cmax:.16e}".format(
+                    name=name,
+                    l2=met.get("l2_rel", float("nan")),
+                    rmse=met.get("rmse", float("nan")),
+                    max_abs=met.get("max_abs", float("nan")),
+                    corr=met.get("corr", float("nan")),
+                    cl2=float(np.linalg.norm(np.asarray(Fc, dtype=float))),
+                    il2=float(np.linalg.norm(np.asarray(Fi, dtype=float))),
+                    cmin=float(np.nanmin(Fc)),
+                    cmax=float(np.nanmax(Fc)),
+                )
+            )
+            if name in ("repr_total", "repr_minus_repe", f"ion_reconstruct_native_s{native_species_index}", "repe_electron"):
+                valid_for_ls.append((name, np.asarray(Fc, dtype=float)))
+        except Exception as exc:
+            print(f"candidate={name} [diagnostic_failed: {str(exc).splitlines()[0]}]")
+
+    # Least-squares fingerprint: if IMAS is a simple linear combination of the common
+    # candidate arrays, this often exposes the coefficients immediately.
+    if len(valid_for_ls) >= 2:
+        mask = np.isfinite(F_ids)
+        cols = []
+        names = []
+        for name, arr in valid_for_ls:
+            if arr.shape == F_ids.shape:
+                mask &= np.isfinite(arr)
+                cols.append(arr)
+                names.append(name)
+        if cols and np.any(mask):
+            A = np.vstack([arr[mask].ravel() for arr in cols]).T
+            y = np.asarray(F_ids, dtype=float)[mask].ravel()
+            try:
+                coef, *_ = np.linalg.lstsq(A, y, rcond=None)
+                yhat = A @ coef
+                rel = float(np.linalg.norm(yhat - y) / np.linalg.norm(y)) if np.linalg.norm(y) > 0 else float("nan")
+                coef_s = ",".join(f"{n}:{c:.16e}" for n, c in zip(names, coef))
+                print(f"least_squares_to_ids={coef_s} rel_residual={rel:.16e}")
+            except Exception as exc:
+                print(f"least_squares_to_ids_failed={str(exc).splitlines()[0]}")
+    print("pressure_diagnostics_end=1")
 
 
 # ----------------------------- metrics / plotting -----------------------------
@@ -526,6 +826,43 @@ def make_plot(R: np.ndarray, Z: np.ndarray, dump_F: np.ndarray, ids_F: np.ndarra
     plt.close(fig)
 
 
+# ----------------------------- entry-path helper -----------------------------
+
+def resolve_validator_entry_path(args: argparse.Namespace) -> Path:
+    """Resolve the IMAS entry directory from either --entry or standard IMAS options.
+
+    This mirrors the directory convention used by dump2imas/input2imas for the
+    HDF5 backend: <dbpath>/<dd>/<major-version>/<pulse>/<run>.  It intentionally
+    does not depend on nimrod2imas.add_entry_args so the validator remains stable
+    if that helper changes.
+    """
+    if getattr(args, "entry", None):
+        return Path(str(args.entry)).expanduser()
+
+    missing = []
+    for name in ("dd", "pulse", "run"):
+        if getattr(args, name, None) in (None, ""):
+            missing.append("--" + name.replace("_", "-"))
+    if missing:
+        raise RuntimeError(
+            "provide either --entry, or standard IMAS entry options "
+            "--dbpath --dd --pulse --run; missing " + ", ".join(missing)
+        )
+
+    dd_version_dir = getattr(args, "dd_version_dir", None)
+    if dd_version_dir in (None, ""):
+        ddv = str(getattr(args, "dd_version", "4.1.1") or "4.1.1")
+        dd_version_dir = ddv.split(".", 1)[0] if ddv else "4"
+
+    return (
+        Path(str(getattr(args, "dbpath", ".") or ".")).expanduser()
+        / str(args.dd)
+        / str(dd_version_dir)
+        / str(int(args.pulse))
+        / str(int(args.run))
+    )
+
+
 # ----------------------------- CLI -----------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -535,16 +872,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("dumpgll", help="Input dumpgll HDF5 file")
 
-    # Use the same entry-location options shared by nimrod2imas utilities:
-    # either --entry, or --dbpath --dd --dd-version --pulse --run.
-    add_entry_args(
-        p,
-        include_backend=True,
-        backend_default="hdf5",
-        include_ids=False,
-        include_occ=True,
-        occ_default=1,
-    )
+    # Entry-location options.  These are intentionally defined locally rather than
+    # through nimrod2imas.add_entry_args so this validator keeps the standard
+    # dump2imas-style CLI even when the shared helper changes.
+    # Use either:
+    #   --entry ./d3d/4/163518/5
+    # or:
+    #   --backend hdf5 --dbpath . --dd d3d --dd-version 4.1.1 --pulse 163518 --run 5
+    p.add_argument("--entry", default=None,
+                   help="IMAS HDF5 entry directory, e.g. ./d3d/4/163518/5. If omitted, construct it from --dbpath/--dd/--pulse/--run.")
+    p.add_argument("--backend", default="hdf5",
+                   help="IMAS backend passed to nimrod2imas.open_dbentry")
+    p.add_argument("--dbpath", default=".",
+                   help="Base IMAS database path used when --entry is omitted")
+    p.add_argument("--dd", default=None,
+                   help="IMAS database/device name used when --entry is omitted, e.g. d3d")
+    p.add_argument("--dd-version", default="4.1.1",
+                   help="IMAS Data Dictionary version")
+    p.add_argument("--dd-version-dir", default=None,
+                   help="Optional IMAS major-version directory override, e.g. 4")
+    p.add_argument("--pulse", type=int, default=None,
+                   help="IMAS pulse/shot number used when --entry is omitted")
+    p.add_argument("--run", type=int, default=None,
+                   help="IMAS run number used when --entry is omitted")
+    p.add_argument("--occ", type=int, default=1,
+                   help="mhd_linear occurrence to compare")
 
     p.add_argument("--occ-base", type=int, default=1,
                    help="base occurrence used by dump2imas; default matches dump2imas")
@@ -569,9 +921,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mode-index", type=int, default=None)
     p.add_argument("--n-tor", type=int, default=None)
     p.add_argument("--dens-pert-order", default="species_major", choices=["species_major", "mode_major"])
-    p.add_argument("--ion-mass-amu", type=float, default=2.0141017781,
-                   help="used for mass_density_perturbed conversion")
-    p.add_argument("--electrons-index", type=int, default=0)
+    p.add_argument("--ion-mass-amu", type=float, default=2.0,
+                   help="ion mass used by dump2imas for mass_density_perturbed conversion")
+    p.add_argument("--electrons-index", type=int, default=0,
+                   help="legacy index used to identify electron occurrence when --species-role=auto")
+    p.add_argument("--species-role", default="auto", choices=["auto", "electron", "ion"],
+                   help=("physical role of this IMAS occurrence. In auto mode, occ-occ-base equal to "
+                         "--electrons-index is treated as electron; all other occurrences are treated as ion."))
+    p.add_argument("--native-species-index", type=int, default=None,
+                   help=("diagnostic override for the species index used in native density/pressure references. "
+                         "For converter-consistent validation, omit this option; the script then uses occ-occ-base, "
+                         "matching dump2imas populate_mhd_linear."))
+    p.add_argument("--diagnose-pressure", action="store_true",
+                   help="print metrics for several possible native pressure definitions against the IMAS pressure leaf")
+    p.add_argument("--pressure-source", default="auto",
+                   choices=["auto", "dump2imas", "explicit", "total", "total_minus_electron", "reconstruct", "thermal_only", "density_only"],
+                   help=("native-dump pressure reference. 'auto'/'dump2imas' mirrors dump2imas populate_mhd_linear; "
+                         "other choices are diagnostic alternatives."))
+    p.add_argument("--nimrod-in", default=None,
+                   help="optional nimrod.in path; when supplied, read_and_stitch_dump uses the same species metadata as dump2imas")
+    p.add_argument("--no-nimrod-in-auto", action="store_true",
+                   help="do not automatically look for nimrod.in in the current directory or dump directory")
     p.add_argument("--plot", default=None, help="optional path for a 3-panel contour comparison plot")
     p.add_argument("--scale-mode", default="shared", choices=["shared", "dump", "independent"],
                    help="color scaling for the first two panels: shared, dump, or independent")
@@ -582,12 +952,37 @@ def main() -> None:
     args = build_parser().parse_args()
     if not args.dd_version:
         args.dd_version = "4.1.1"
-    species_index = int(args.occ) - int(args.occ_base)
-    if species_index < 0:
+    ids_species_index = int(args.occ) - int(args.occ_base)
+    if ids_species_index < 0:
         raise SystemExit(f"occ={args.occ} is smaller than occ-base={args.occ_base}")
+    if args.species_role == "auto":
+        species_role = "electron" if ids_species_index == int(args.electrons_index) else "ion"
+    else:
+        species_role = args.species_role
 
-    # Read and stitch the native dump.
+    # For verification of the current converter, the default species used on the native side
+    # must be the same integer that dump2imas used while writing this occurrence.  The older
+    # --native-species-index option is retained as an explicit override for diagnostics only.
+    converter_species_index = ids_species_index
+    compare_species_index = int(args.native_species_index) if args.native_species_index is not None else converter_species_index
+    effective_electrons_index = int(args.electrons_index) if species_role == "electron" else -999999
+
+    # Read and stitch the native dump using as much of the same dump2imas context as possible.
     dump_args = SimpleNamespace(time=None, dens_pert_order=args.dens_pert_order, ion_mass_amu=args.ion_mass_amu)
+    nimrod_in_path = args.nimrod_in
+    if nimrod_in_path is None and not args.no_nimrod_in_auto:
+        candidates = [Path("nimrod.in"), Path(args.dumpgll).resolve().parent / "nimrod.in"]
+        for c in candidates:
+            if c.is_file():
+                nimrod_in_path = str(c)
+                break
+    if nimrod_in_path:
+        setattr(dump_args, "_series_nimrod_in_path", str(nimrod_in_path))
+        if _nimrod_species_info is not None:
+            try:
+                setattr(dump_args, "_nimrod_species", _nimrod_species_info(str(nimrod_in_path)))
+            except Exception:
+                pass
     data = read_and_stitch_dump(Path(args.dumpgll), dump_args)
 
     # Determine dump mode index using keff/n_tor if possible.
@@ -610,16 +1005,17 @@ def main() -> None:
     R_dump, Z_dump, F_dump = extract_dump_field(
         data,
         quantity=args.quantity,
-        species_index=species_index,
+        species_index=compare_species_index,
         mode_index=dump_mode,
         part=args.part,
         component=args.component,
         ion_mass_amu=args.ion_mass_amu,
-        electrons_index=args.electrons_index,
+        electrons_index=effective_electrons_index,
+        pressure_source=args.pressure_source,
     )
 
     # Open IMAS mhd_linear.
-    entry = resolve_entry_path(args)
+    entry = resolve_validator_entry_path(args)
     db, _uri, imas = open_dbentry(args.backend, str(entry), mode="r", dd_version=args.dd_version)
     try:
         factory = ids_factory(imas, args.dd_version or "")
@@ -655,22 +1051,46 @@ def main() -> None:
     R_dump, Z_dump, F_dump, R_ids, F_ids = align_fields(R_dump, Z_dump, F_dump, R_ids, Z_ids, F_ids)
     metrics = compute_metrics(F_dump, F_ids)
 
-    print(f"quantity={args.quantity} part={args.part} component={args.component} occ={args.occ} species_index={species_index}")
+    print(f"quantity={args.quantity} part={args.part} component={args.component} occ={args.occ} ids_species_index={ids_species_index}")
+    print(f"species_role={species_role}")
+    print(f"compare_species_index={compare_species_index}")
+    print(f"converter_species_index={converter_species_index}")
+    print(f"entry={entry}")
+    print(f"backend={args.backend}")
+    print(f"dd_version={args.dd_version}")
+    print(f"nimrod_in={nimrod_in_path if nimrod_in_path else 'None'}")
+    if args.quantity == "p":
+        print(f"pressure_source={args.pressure_source}")
     print(f"dump_time={float(data.get('time', np.nan)):.12g}")
     print(f"ids_time={ids_time:.12g}  ids_time_slice_raw_index={ti_raw}  ids_mode_index={mi}")
     print(f"dump_mode_index={dump_mode}")
     print(f"dump_shape={F_dump.shape} ids_shape={F_ids.shape}")
-    print(f"dump_min={float(np.nanmin(F_dump)):.8e} dump_max={float(np.nanmax(F_dump)):.8e}")
-    print(f"ids_min={float(np.nanmin(F_ids)):.8e} ids_max={float(np.nanmax(F_ids)):.8e}")
-    print(f"dump_l2={float(np.linalg.norm(np.asarray(F_dump, dtype=float))):.8e}")
-    print(f"ids_l2={float(np.linalg.norm(np.asarray(F_ids, dtype=float))):.8e}")
+    print(f"dump_min={float(np.nanmin(F_dump)):.16e} dump_max={float(np.nanmax(F_dump)):.16e}")
+    print(f"ids_min={float(np.nanmin(F_ids)):.16e} ids_max={float(np.nanmax(F_ids)):.16e}")
+    print(f"dump_l2={float(np.linalg.norm(np.asarray(F_dump, dtype=float))):.16e}")
+    print(f"ids_l2={float(np.linalg.norm(np.asarray(F_ids, dtype=float))):.16e}")
     print(f"dump_sha16={array_signature(F_dump)}")
     print(f"ids_sha16={array_signature(F_ids)}")
     for k, v in metrics.items():
         if isinstance(v, float):
-            print(f"{k}={v:.8e}")
+            print(f"{k}={v:.16e}")
         else:
             print(f"{k}={v}")
+
+    if args.quantity == "p" and args.diagnose_pressure:
+        print_pressure_diagnostics(
+            R_dump=R_dump,
+            Z_dump=Z_dump,
+            R_ids=R_ids,
+            Z_ids=Z_ids,
+            F_ids=F_ids,
+            data=data,
+            mode_index=dump_mode,
+            part=args.part,
+            ids_species_index=ids_species_index,
+            native_species_index=compare_species_index,
+            electrons_index=args.electrons_index,
+        )
 
     if args.plot:
         title = f"{args.quantity} {args.part} occ={args.occ} mode={args.n_tor if args.n_tor is not None else dump_mode}"

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.5](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.5.4...nimrod2imas-v0.5.5) (2026-06-01)
+
+
+### Bug Fixes
+
+* Small fix in Makefile ([#60](https://github.com/PrincetonUniversity/nimrod2imas/issues/60)) ([e79b295](https://github.com/PrincetonUniversity/nimrod2imas/commit/e79b2959b04bc64a5138e55dd231e43e4f4693ac))
+
 ## [0.5.4](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.5.3...nimrod2imas-v0.5.4) (2026-06-01)
 
 

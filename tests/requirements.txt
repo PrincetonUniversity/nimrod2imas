@@ -1,0 +1,16 @@
+numpy
+scipy
+h5py
+f90nml
+matplotlib
+cmasher
+omfit-classes
+PyYAML
+imas-python
+pexpect
+uncertainties
+netcdf4
+omas
+tqdm
+fortranformat
+setuptools

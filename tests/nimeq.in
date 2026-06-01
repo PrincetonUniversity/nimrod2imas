@@ -1,0 +1,20 @@
+  &nimeq_input
+    gscenter=0.65
+    eq_iters=80
+    short_eq_iters=20
+    fgnimeq_maxits=1
+    drz_2norm_tol=1.e-6
+    dpsi_2norm_tol=1.e-6
+    use_fluxgrid_bicube=T
+
+    fl_rtol=1.e-12
+    con_lsode_max=0.0005
+
+    use_oculus_xpt=T
+    oculus_sep_delta=1.e-4
+    max_oculus_traces=50
+
+    ! From the kfile
+    ! target_current=1106291.235490571 ! 1087598.5 
+    target_current=1087598.5 
+  /

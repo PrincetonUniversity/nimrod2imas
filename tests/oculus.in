@@ -1,0 +1,9 @@
+&oculus_input
+ raxis=1.30252
+ zaxis=-1.14948
+
+ tol=1e-14
+ odetol=1e-14
+
+ !oculus_ifail=-1
+ /

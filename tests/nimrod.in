@@ -1,0 +1,129 @@
+ &grid_input
+    gridshape='flux'
+    eqfile='fluxgrid.dat'
+    geom='tor'
+    !mx=72
+    !my=512
+    mx=32
+    my=64
+    mm_imap_use_int=F
+    mm_mdmap=215
+    !nxbl=24
+    !nybl=32 !128
+    nxbl=4
+    nybl=8
+    nlayers=1
+    lin_nmodes=1
+    lin_nmax=1
+    pieflag='rblock'
+    poly_degree=5
+    poly_distribution='gll'
+ /
+ &const_input
+    zeff_input=3.2 !1.35
+    me_input=9.107e-31
+    chrg_input=1.602e-19
+ /
+ &init_input
+    init_type='shear alf   mult' 
+    nx=1
+    ny=4
+    bamp=1.E-10
+    rescale_factor=-1
+    reset_file='none'
+    eq_dump_file='none'
+ /
+ &equil_input
+    ndens=4.40081e19
+    n_profile='pfile'
+    pe_profile='pfile'
+    p_profile='gfile'          ! Use gfile pressure
+    beta=1                     ! Pressure is specified by eqfile
+    eq_flow='pfile'
+    ds_use='elecd'
+    ds_function='spitzer'
+    !mvac_nim=18
+    mvac_nim=10
+    eq_loop_voltage=0.158008   ! flip sign rel kfile
+ /
+ &physics_input
+    nonlinear=.false.
+    ohms='mhd'
+    ! From fluxgrid, S=9.35e7, tau_a=3.13e-7s, tau_r=29.2s
+    elecd=1.561E-02
+    elecd_max=1.e10
+    eta_ref_t=4280             ! Core temp (eV)
+    eta_model='fixed'          ! full_NL='eta n=0 only'
+    iso_visc=1.
+    gyr_visc=0.
+    par_visc=1.e5
+    continuity='full'
+    pe_frac=0.5
+    nd_diff=1.
+    nd_hypd=0.
+    nd_bc="dirichlet"
+    advect='V only'
+    separate_pe=T
+ /
+ &closure_input
+    p_model='aniso1'
+    ohm_heat=.false.
+    visc_heat=.false.
+    k_perpi=1.
+    k_perpe=1.
+    k_cross=0.
+    k_plli=1.e7
+    k_plle=1.e7
+ /
+ &numerical_input
+    nstep=5
+    dtm=2.5e-09
+    !dt_initial=4e-09
+    dt_incr=1.067
+    dt_change_frac=0.07
+    ave_change_limit=1e-2
+    n_dt_release=100
+    n_mat_update=200
+    tmax=12.
+    cpu_tmax=1000000
+    v_cfl=0.5
+    nl_cfl_lim=500
+    mhdadv_alg='centered'
+    ngr=4
+    met_spl='iso'
+    si_fac_mhd=1.2
+    si_fac_pres=1.2
+    si_fac_j0=1.0
+    si_fac_nl=1.5
+    si_fac_hall=10
+    divbd=100.
+    kdivb_2_limit=10000.
+    poly_divv_auto=.false.
+    ddivv=0.
+    dpvrt=0.
+    disc_dbd=0.0
+    poly_divb=-1
+    poly_divb_min=-1
+    p_computation='at nodes'
+ /
+ &solver_input
+    solver='slu_dsta'
+    extrap_order=0
+    maxit=50
+    tol=1.E-9
+    maxit_nl=3
+ /
+ &output_input
+    dump_file='dumpgll.00000.h5'
+    h5dump=T
+    dump_ja=T
+    dump_eexp=T
+    ndump=5000000
+    nhist=2
+    hist_binary=T
+    ihist=40            ! Should be just inside the separatrix
+    jhist=1
+    detflag=F
+    itflag=F
+ /
+

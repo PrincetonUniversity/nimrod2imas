@@ -508,7 +508,41 @@ def core_profiles_to_peqdsk(cp_ids, geqdsk_path, out_path):
 # p-file comparison
 # ----------------------------------------------------------------------
 
-def compare_pfiles(orig_path, new_path):
+def compare_pfiles(orig_path, new_path, strict_profiles=None, diagnostic_profiles=None):
+    """Compare original and reconstructed p-files.
+
+    The PEQDSK contains both profiles that are stored directly in IMAS
+    (densities and temperatures) and profiles that are reconstructed from
+    several IMAS quantities plus GEQDSK geometry (flow/omega/kpol profiles).
+    The latter are useful diagnostics, but they should not be used as the
+    pass/fail criterion for a compact CPC regression test because they are
+    sensitive to interpolation, midplane-geometry reconstruction, and finite
+    differencing conventions.
+    """
+    if strict_profiles is None:
+        strict_profiles = {"ne", "ni", "te", "ti"}
+    else:
+        strict_profiles = {str(k).lower() for k in strict_profiles}
+
+    if diagnostic_profiles is None:
+        diagnostic_profiles = {
+            "kpol", "omeg", "omegp", "omgeb", "omgvb",
+            "vpol1", "vtor1", "nz1",
+        }
+    else:
+        diagnostic_profiles = {str(k).lower() for k in diagnostic_profiles}
+
+    # Conservative absolute tolerances in p-file units for the directly stored
+    # regression quantities. These are intentionally loose enough for ASCII
+    # p-file formatting and IMAS round-trip interpolation, but strict enough to
+    # catch missing or badly scaled profiles.
+    strict_abs_tol = {
+        "ne": 1.0e-8,
+        "ni": 1.0e-8,
+        "te": 1.0e-6,
+        "ti": 5.0e-6,
+    }
+
     p_orig = OMFITpFile(orig_path)
     p_orig.load()
     p_new = OMFITpFile(new_path)
@@ -516,9 +550,11 @@ def compare_pfiles(orig_path, new_path):
 
     keys = sorted(set(p_orig.keys()) & set(p_new.keys()))
 
+    results = {}
     print("\nProfile comparison (original vs reconstructed):")
     for key in keys:
-        if key.strip().lower() == "n z a":
+        key_l = key.strip().lower()
+        if key_l == "n z a":
             continue
         try:
             o = p_orig[key]
@@ -543,13 +579,57 @@ def compare_pfiles(orig_path, new_path):
         dv = vo - vn_i
         dd = do - dn_i
 
-        max_dv = np.max(np.abs(dv))
-        rms_dv = np.sqrt(np.mean(dv**2))
-        max_dd = np.max(np.abs(dd))
-        rms_dd = np.sqrt(np.mean(dd**2))
+        max_dv = float(np.max(np.abs(dv)))
+        rms_dv = float(np.sqrt(np.mean(dv**2)))
+        max_dd = float(np.max(np.abs(dd)))
+        rms_dd = float(np.sqrt(np.mean(dd**2)))
+        scale = float(max(np.max(np.abs(vo)), np.max(np.abs(vn_i)), 1.0e-30))
+        rel_dv = max_dv / scale
 
-        print(f"  {key:<10s} max|Δval|={max_dv: .3e}, rms|Δval|={rms_dv: .3e};  "
-              f"max|Δder|={max_dd: .3e}, rms|Δder|={rms_dd: .3e}")
+        role = "diagnostic"
+        passed = None
+        if key_l in strict_profiles:
+            role = "strict"
+            tol = strict_abs_tol.get(key_l, 1.0e-6)
+            passed = max_dv <= tol
+        elif key_l not in diagnostic_profiles:
+            role = "informational"
+
+        results[key_l] = {
+            "role": role,
+            "passed": passed,
+            "max_value_error": max_dv,
+            "rms_value_error": rms_dv,
+            "max_derivative_error": max_dd,
+            "rms_derivative_error": rms_dd,
+            "relative_value_error": rel_dv,
+        }
+
+        if passed is True:
+            status = "PASS"
+        elif passed is False:
+            status = "FAIL"
+        elif role == "diagnostic":
+            status = "DIAGNOSTIC"
+        else:
+            status = "INFO"
+
+        print(f"  {key:<10s} role={role:<13s} "
+              f"max|Δval|={max_dv: .3e}, rms|Δval|={rms_dv: .3e}, rel|max|={rel_dv: .3e};  "
+              f"max|Δder|={max_dd: .3e}, rms|Δder|={rms_dd: .3e};  "
+              f"status={status}")
+
+    failed = [k for k, v in results.items() if v["passed"] is False]
+    if failed:
+        raise RuntimeError(
+            "Strict PEQDSK round-trip comparison failed for profiles: "
+            + ", ".join(failed)
+        )
+
+    strict_seen = [k for k, v in results.items() if v["role"] == "strict"]
+    print("\nStrict regression profiles checked: " + ", ".join(strict_seen))
+    print("Diagnostic flow/omega profiles were reported but not used as pass/fail criteria.")
+    return results
 
 
 # ----------------------------------------------------------------------
@@ -621,6 +701,8 @@ def main():
 
     print("Comparing original and reconstructed PEQDSK profiles:")
     compare_pfiles(args.peqdsk, args.out_peqdsk)
+
+    print("\nPASS: filesystem-backed IMAS entry opened successfully, GEQDSK/PEQDSK were reconstructed, and strict regression profiles passed.")
 
 
 if __name__ == "__main__":

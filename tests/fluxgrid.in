@@ -1,0 +1,92 @@
+ &global_input
+   eq_type="efit"
+   filename="g163518.01900"
+   aux_file="p163518.1900"
+   !aux_type="pfile"
+   
+   ! Factors to tweak the eq. flows
+   ! Set to unity to enable flows
+   omegeb_fac=0.
+   omegp_fac=0.
+   kpol_fac=0.
+   calc_omegp=T
+
+   ! tweak diffusivity on SOL strikepoints
+   ds_diff0=0.2
+   ds_diff1=0.3 
+ 
+   ! reversed Ip case (J.B>0)
+   psi_fac=-1
+ 
+   mtheta=250
+   mpsi=250
+   
+   pack_method = 'gauss' 
+   vac_pack=.false.
+   amp=2.2
+   wpack=0.1
+   qsmin=6.9
+   qsmax=10.1
+   
+   ! x-point packing
+   mstretch=12
+   mxptpack=3
+   frac_stretch_bndry=0.65
+   xpt_maxexp=2.
+   !xpt_ray=T          ! upper null fails
+   
+   angle_method='geom'
+   angle_pack=.true. 
+   ipb=0
+   ipr=0
+   jpb=0.9   
+   jpr=0.    
+   jpz=0.
+  
+   ! SOL --
+   psi_vac=1.1
+   psi_pfsol=0.96
+   dbtr=0.0, 0.0 !1.e-4, 1.e-4
+   dpr=0.0, 0.0 !-0.05
+   dpe=0.0, 0.0 !-0.5
+   dnd=0.0, 0.0 !-0.1
+   sq_vac=3.4055108, 7e-5, 0., 0., -200, -200, 0., 0., 0., 0., 0.
+   sq_vac=3.4058, -200, 0., 0., -200, -200, 0., 0., 0., 0., 0.
+   ! equal values at edge of SOL and PF regions
+   sq_pf=3.40679, 2.0476e-5, 0., 0., 3.672e18, 9.66944e-6, 0., 0., 0., 0., 0.
+   ! better values for diff_shape (Te) near PF regions
+   sq_pf=3.40676, 4.1e-5, 0., 0., 1.50672e18, 1.92e-5, 0., 0., 0., 0., 0.
+   ! large values to avoid large diamagnetic flows 
+   sq_pf=3.4054, 5.7e-4, 0., 0., 5e18, 1.8e-4, 0., 0., 0., 0., 0.
+   sq_filefit=1., 1.099, 1., 1., 1.099, 1.099, 1., 1., 1., 1., 1.
+   ion_temperature_gauge=1.71e3    ! eV
+   electron_temperature_gauge=199.
+
+   ! Use a DIII-D annulus
+   !annulus_grid=T
+   !psilow=0.05
+   psilow=1.0e-03            ! annulus
+   psihigh=0.9999            ! use mpsi at separatrix
+   wall_file='use_d3d'
+   extr_type='wall'   
+   newq0=0                   ! Do not re-adjust profiles
+   
+   j_t='use_gs'        
+   rjac=0.5     
+   tol0=1.0e-9
+   calc_direct=.false.
+   
+   n_profile_fg="pfile"
+   pe_profile_fg="pfile"
+   
+   sfac=1.1e8  ! Based on Spitzer resistivity in the core
+   
+   bin_1d=.true.
+   out_1d=.true.
+   bin_2d=.true.
+   out_2d=.false.
+   
+   stability=.false. 
+   out_neoclassical=.false. 
+   out_nimrod=.true.
+ /

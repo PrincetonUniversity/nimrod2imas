@@ -83,6 +83,86 @@ def build_uri(backend: str, entry_dir_path: str | Path) -> str:
     return f"imas:{backend}?path={str(entry_dir_path)}"
 
 
+class IMASContext:
+    """Small container for locating and opening a filesystem-backed IMAS entry.
+
+    This mirrors the command-line convention used by the converter scripts:
+      <dbpath>/<dd>/<major-dd-version>/<pulse>/<run>
+
+    Parameters
+    ----------
+    backend:
+        IMAS backend name, normally ``hdf5``.
+    dbpath:
+        Root directory containing the database directory.
+    dd:
+        Database/device directory name, for example ``d3d``.
+    dd_version:
+        Full IMAS DD version, for example ``4.1.1``.
+    pulse, run:
+        IMAS pulse and run numbers.
+    dd_version_dir:
+        ``major`` uses only the major DD version as the directory name, e.g.
+        ``4`` for ``4.1.1``.  ``full`` uses the full version string.
+    """
+
+    def __init__(
+        self,
+        *,
+        backend: str = "hdf5",
+        dbpath: str | Path = ".",
+        dd: str = "",
+        dd_version: str = "",
+        pulse: int = 0,
+        run: int = 0,
+        dd_version_dir: str = "major",
+    ) -> None:
+        self.backend = str(backend or "hdf5")
+        self.dbpath = Path(dbpath)
+        self.dd = str(dd or "")
+        self.dd_version = str(dd_version or "")
+        self.pulse = int(pulse)
+        self.run = int(run)
+        self.dd_version_dir = str(dd_version_dir or "major")
+
+    def _dd_version_dir_component(self) -> str:
+        mode = str(self.dd_version_dir or "major").lower()
+        if mode == "full":
+            return self.dd_version
+        if mode == "major":
+            return dd_version_dirname(self.dd_version)
+        # Backward-compatible fallback: allow callers to pass an explicit
+        # directory component such as "4" or "4.1.1".
+        return str(self.dd_version_dir)
+
+    def entry_dir(self) -> Path:
+        return entry_dir(
+            self.dbpath,
+            self.dd,
+            self.dd_version,
+            self.pulse,
+            self.run,
+            dd_version_dir=self._dd_version_dir_component(),
+        )
+
+    def open(self, mode: str = "r"):
+        """Open the IMAS entry and return (db, uri, imas_module, ids_factory).
+
+        open_dbentry() intentionally returns only (db, uri, imas_module) because
+        that is what the conversion scripts historically expect. IMASContext is
+        used by validation helpers, which also need an IDSFactory instance.
+        """
+        ed = self.entry_dir()
+        db, uri, imas_module = open_dbentry(
+            self.backend,
+            ed,
+            mode=mode,
+            dd_version=(self.dd_version or None),
+        )
+        factory = ids_factory(imas_module, self.dd_version)
+        return db, uri, imas_module, factory
+
+
 # --------------------------- IMAS open / factory / put ---------------------------
 
 def open_dbentry(

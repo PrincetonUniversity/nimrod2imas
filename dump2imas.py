@@ -1238,8 +1238,8 @@ def _unpack_multispecies_scalar_modes(
     if a.ndim == 3:
         ny, nx, k = a.shape
         if k == nspec * nmodes:
-            # This assumes species_major packing for simplicity
-            return a.reshape(ny, nx, nspec, nmodes)
+            # This assumes nmodes,nspec  packing for simplicity
+            return a.reshape(ny, nx, nmodes, nspec).transpose(0, 1, 3, 2)
 
     raise ValueError(f"Unexpected multispecies scalar shape {a.shape} for nmodes={nmodes}, nspec={nspec}")
 
@@ -2403,8 +2403,11 @@ def _calculate_q_profile(
     ):
         return None
 
-    # Create a set of psi levels from axis to LCFS
-    psi_levels = np.linspace(psi_axis, psi_lcfs, n_levels + 2)[1:-1]
+    # Matplotlib requires contour levels to be strictly increasing.  The physical
+    # axis-to-LCFS direction may be either sign, so sort only for contouring.
+    psi_lo = min(float(psi_axis), float(psi_lcfs))
+    psi_hi = max(float(psi_axis), float(psi_lcfs))
+    psi_levels = np.linspace(psi_lo, psi_hi, n_levels + 2)[1:-1]
     q_values = []
     psi_values = []
 

@@ -14,6 +14,37 @@ The design goal is **workflow consistency**: all scripts can target the same fil
 
 ---
 
+## Reduced test case and production data
+
+A reduced, self-contained test case is included in the `tests/` directory for installation checks, regression testing, and reviewer-facing validation. The test package includes:
+
+- `tests/dumpgll.00000.h5` — reduced NIMROD dump file
+- `tests/g163518.01900` — GEQDSK equilibrium input
+- `tests/p163518.1900` — kinetic-profile input
+- `tests/nimeq.in`, `tests/oculus.in`, `tests/fluxgrid.in`, `tests/nimrod.in` — NIMROD/FGNIMEQ-related namelists
+- `tests/d3d/4/163518/1/` — filesystem-backed IMAS test entry generated/used by the reduced example
+
+The recommended reviewer-facing test is:
+
+```bash
+make venv
+make install
+make test
+make validate-all
+```
+
+`make test` uses `tests/dumpgll.00000.h5` directly; the sample dump is **not** located in the repository root.
+
+The full production NIMROD data sets are not included in this GitHub repository or in the CPC software archive because of their size. Production dump sequences and NIMROD history files such as `energy.bin`, `logen.bin`, and `nimhist*.bin` are retained in NERSC archival storage. Commands below that use these files are therefore labeled as **production-workflow examples**, not self-contained repository tests.
+
+For a repository-contained structural check of `mhd_linear` that does not require the large production history files, use:
+
+```bash
+make validate-mhd-linear
+```
+
+---
+
 ## Requirements
 
 Install the Python dependencies listed in `requirements.txt`:
@@ -87,18 +118,25 @@ Some scripts also support:
   - `nimeq.in`, `oculus.in`, `fluxgrid.in` → `equilibrium.code.parameters` (code.name=`fgnimeq`)
   - `nimrod.in` → ideally `mhd.code.parameters` (code.name=`nimrod`) with fallback to `core_profiles.code.parameters`
 
-**Usage (typical)**
+**Reduced repository example**
+
+The simplest supported route is the Makefile target:
+
 ```bash
-python input2imas.py GEQDSK PEQDSK \
-  --dd mast --dd-version 4.1.1 --pulse 45272 --run 8 \
-  --backend hdf5 --dbpath /path/to/dbroot
+make test-input
 ```
 
-**Namelist input paths**
+The equivalent command is:
+
 ```bash
-python input2imas.py GEQDSK PEQDSK \
-  --dd mast --dd-version 4.1.1 --pulse 45272 --run 8 \
-  --nimeq nimeq.in --oculus oculus.in --fluxgrid fluxgrid.in --nimrod nimrod.in
+python input2imas.py tests/g163518.01900 tests/p163518.1900 \
+  --dd d3d --dd-version 4.1.1 --pulse 163518 --run 1 \
+  --backend hdf5 --dbpath tests \
+  --nimeq tests/nimeq.in \
+  --oculus tests/oculus.in \
+  --fluxgrid tests/fluxgrid.in \
+  --nimrod tests/nimrod.in \
+  --input nimrod.yaml
 ```
 
 ---
@@ -115,68 +153,80 @@ python input2imas.py GEQDSK PEQDSK \
   - For linear runs: `mhd_linear.code.parameters` (code.name=`nimrod`)
   - For nonlinear runs: also store in `mhd.code.parameters`
 
-#### LCFS / separatrix identification (recent change)
+#### LCFS / separatrix identification
 
-When building 1D profiles, the converter needs **ψ_axis** and **ψ_LCFS** to construct normalized coordinates.
-The logic is:
+When building 1D profiles, the converter needs **ψ_axis** and **ψ_LCFS** to construct normalized coordinates. The logic is:
 
-1. **`contours.h5` (preferred)**  
-   If present, LCFS is determined from the LCFS polyline in the file by sampling the NIMROD ψ(R,Z) on the polyline points.
-2. **`peqdsk` (fallback)**  
-   If present, Te at normalized poloidal flux **ψ_N≈1** is read from the p-file and used to locate ψ_LCFS on the NIMROD fields.
-3. **IMAS occ=0 fallback**  
-   If neither file is available, the converter attempts to use ψ_axis/ψ_boundary from `equilibrium` and/or `core_profiles` (occurrence 0).
-4. **User-provided Te at separatrix (last resort)**  
-   If nothing else is available, a user-provided `--te-sep-ev` is used, with explicit logging. Default: **60 eV**.
+1. **`contours.h5` (preferred)** — if present, LCFS is determined from the LCFS polyline by sampling the NIMROD ψ(R,Z) on the polyline points.
+2. **`peqdsk` (fallback)** — if present, Te at normalized poloidal flux **ψ_N≈1** is read from the p-file and used to locate ψ_LCFS on the NIMROD fields.
+3. **IMAS occ=0 fallback** — if neither file is available, the converter attempts to use ψ_axis/ψ_boundary from `equilibrium` and/or `core_profiles` (occurrence 0).
+4. **User-provided Te at separatrix (last resort)** — if nothing else is available, a user-provided `--te-sep-ev` is used, with explicit logging. Default: **60 eV**.
 
 **Optional inputs (defaults match common filenames)**
 - `--contours contours.h5`
 - `--peqdsk peqdsk`
 - `--te-sep-ev 60.0`
 
-File resolution order is:
-1) explicit CLI value (absolute, or relative to the dump directory), 2) `<dump_dir>/<default_name>`, 3) `./<default_name>`.
+File resolution order is: 1) explicit CLI value (absolute, or relative to the dump directory), 2) `<dump_dir>/<default_name>`, 3) `./<default_name>`.
 
-#### 1D profile coordinate conventions (recent change)
+#### 1D profile coordinate conventions
 
-- **core_profiles.profiles_1d.grid**  
-  Stored primarily as a function of **normalized toroidal flux** via `rho_tor_norm` (0 at axis, 1 at LCFS).  
-  The converter may also store auxiliary normalized poloidal coordinates (`psi_norm`, `rho_pol_norm`) for plotting/debug if the DD supports them.
-
-- **edge_profiles.profiles_1d.grid**  
-  Stored as a function of **normalized poloidal flux** (`psi_norm` / `rho_pol_norm`), with:
-  - 0 at the magnetic axis
-  - 1 at the LCFS
-  - **>1 allowed** to represent **SOL/PF** data (not truncated to 1 and not forced to zeros)
+- **core_profiles.profiles_1d.grid** — stored primarily as a function of **normalized toroidal flux** via `rho_tor_norm` (0 at axis, 1 at LCFS). The converter may also store auxiliary normalized poloidal coordinates (`psi_norm`, `rho_pol_norm`) for plotting/debug if the DD supports them.
+- **edge_profiles.profiles_1d.grid** — stored as a function of **normalized poloidal flux** (`psi_norm` / `rho_pol_norm`), with 0 at the magnetic axis, 1 at the LCFS, and **>1 allowed** to represent SOL/PF data.
 
 To control how far outside the LCFS the 1D grid extends:
-- `--edge-psi-norm-max <float>` (explicit maximum ψ_pol_norm)
-- `--edge-psi-norm-quantile <float>` (robust auto-detection from 2D ψ_pol_norm distribution; default 0.9995)
+- `--edge-psi-norm-max <float>`
+- `--edge-psi-norm-quantile <float>` (default 0.9995)
 
-**Usage (typical)**
+**Reduced repository example**
+
 ```bash
-python dump2imas.py dumpgll.0000*.h5   --dd d3d --dd-version 4.1.1 --pulse 163518 --run 1   --backend hdf5
+make test-dump
 ```
 
-#### Write implementation selection (recent change)
+The reduced dump used by this target is:
 
-`dump2imas.py` now separates the **IMAS backend** from the **writer implementation** used to populate IDS content:
+```text
+tests/dumpgll.00000.h5
+```
 
-- `--backend {hdf5,ascii,netcdf,...}`
-  - Selects the IMAS storage backend.
-- `--writer {auto,h5py,imas}`
+A direct invocation equivalent to the test target is:
+
+```bash
+python dump2imas.py \
+  --dd d3d --dd-version 4.1.1 --pulse 163518 --run 1 \
+  --backend hdf5 --dbpath tests \
+  --occ-base 1 --sanity-print \
+  --peqdsk tests/p163518.1900 \
+  --ggd-unstructured --ggd-nphi 4 \
+  --ggd-connectivity fe_wedge \
+  --ggd-write-full-objects --ggd-reuse-grid \
+  --edge-ggd-values full \
+  tests/dumpgll.00000.h5
+```
+
+#### Write implementation selection
+
+`dump2imas.py` separates the **IMAS backend** from the **writer implementation** used to populate IDS content:
+
+- `--backend {hdf5,ascii,netcdf,...}` selects the IMAS storage backend.
+- `--writer {auto,h5py,imas}` selects the writer:
   - `auto`: use direct HDF5 patching only when the backend is HDF5; otherwise use IMAS-Python objects.
   - `h5py`: force direct HDF5 patching (fast, HDF5-only).
   - `imas`: force native IMAS-Python writing (DD-aware; required for non-HDF5 backends, typically slower for large GGD writes).
 
-Examples:
+Production examples:
 
 ```bash
 # Native IMAS-Python path
-python dump2imas.py dumpgll.*.h5   --dd d3d --dd-version 4.1.1 --pulse 163518 --run 77   --backend hdf5 --writer imas
+python dump2imas.py /path/to/dumpgll.*.h5 \
+  --dd d3d --dd-version 4.1.1 --pulse 163518 --run 77 \
+  --backend hdf5 --writer imas
 
 # Direct HDF5 patch path
-python dump2imas.py dumpgll.*.h5   --dd d3d --dd-version 4.1.1 --pulse 163518 --run 77   --backend hdf5 --writer h5py
+python dump2imas.py /path/to/dumpgll.*.h5 \
+  --dd d3d --dd-version 4.1.1 --pulse 163518 --run 77 \
+  --backend hdf5 --writer h5py
 ```
 
 #### Additional flags (profiles, units, time, and GGD)
@@ -223,8 +273,7 @@ These flags control how `mhd.grid_ggd` is constructed when the nonlinear pathway
 
 #### Unstructured `ggd` mode (recommended for robust downstream consumption)
 
-By default, the converter may rely on **implicit structured axes** (regular R–Z resampling and toroidal replication).
-For workflows that need explicit node coordinates and explicit connectivity (e.g., robust reconstruction of array shapes, ML pipelines, and ParaView/IMAS-ParaView conversion), enable **unstructured GGD**.
+By default, the converter may rely on **implicit structured axes** (regular R–Z resampling and toroidal replication). For workflows that need explicit node coordinates and explicit connectivity (e.g., robust reconstruction of array shapes, ML pipelines, and ParaView/IMAS-ParaView conversion), enable **unstructured GGD**.
 
 - `--ggd-unstructured`
   - Stores explicit per-node coordinates in `grid_ggd.space`.
@@ -277,14 +326,26 @@ For the most robust ParaView workflow, prefer one of the following:
 
 ```bash
 # Single stored grid_ggd, later field slices reference it
-python dump2imas.py dumpgll.*.h5   --dd <device> --dd-version 4.1.1 --pulse <pulse> --run <run>   --backend hdf5 --writer h5py   --ggd-unstructured --ggd-unstructured-fe-nodes   --ggd-connectivity fe_wedge   --ggd-write-full-objects   --ggd-write-once
+python dump2imas.py /path/to/dumpgll.*.h5 \
+  --dd <device> --dd-version 4.1.1 --pulse <pulse> --run <run> \
+  --backend hdf5 --writer h5py \
+  --ggd-unstructured --ggd-unstructured-fe-nodes \
+  --ggd-connectivity fe_wedge \
+  --ggd-write-full-objects \
+  --ggd-write-once
 
 # Copy the first grid_ggd into later slices instead of reconstructing it
-python dump2imas.py dumpgll.*.h5   --dd <device> --dd-version 4.1.1 --pulse <pulse> --run <run>   --backend hdf5 --writer imas   --ggd-unstructured --ggd-unstructured-fe-nodes   --ggd-connectivity fe_wedge   --ggd-write-full-objects   --ggd-reuse-grid --ggd-reuse-grid-via imas
+python dump2imas.py /path/to/dumpgll.*.h5 \
+  --dd <device> --dd-version 4.1.1 --pulse <pulse> --run <run> \
+  --backend hdf5 --writer imas \
+  --ggd-unstructured --ggd-unstructured-fe-nodes \
+  --ggd-connectivity fe_wedge \
+  --ggd-write-full-objects \
+  --ggd-reuse-grid --ggd-reuse-grid-via imas
 ```
 
 Notes:
-- The script inverts the toroidal angle consistent with COCOS=2 to COCOS=17 conversion
+- The script inverts the toroidal angle consistent with COCOS=2 to COCOS=17 conversion.
 - `fe_wedge` is the recommended connectivity for a **3D volumetric torus**.
 - `fe_tri` is a **surface** representation only; it should not be expected to produce volumetric cells in ParaView.
 - `--ggd-write-full-objects` (or equivalently `--ggd-representation full`) is preferred over packed-only output for `ggd2vtk` / `imas2vtu` conversion.
@@ -326,21 +387,41 @@ Gamma2imas-specific controls:
 - `--endian {>,<}`: endianness for Fortran record markers and float payloads
 - `--file-kind {energy,logen}`: override autodetection of file kind (otherwise inferred from filename containing `logen`)
 
-**Usage examples**
-Compute growth rates from `energy.bin` and write to `mhd_linear` occurrence 1:
+#### Production-data examples
+
+`gamma2imas.py` requires a NIMROD linear energy-history file (`energy.bin` or `logen.bin`). Optional frequency calculation additionally requires a NIMROD `nimhist` binary. These production history files are **not included in the reduced GitHub/CPC test package** because of their size and are retained with the production simulation data in NERSC archival storage.
+
+Compute growth rates from a production `energy.bin` file:
+
 ```bash
-python gamma2imas.py --dd mast --dd-version 4.1.1 --pulse 45272 --run 1 --occ 1 energy.bin
+python gamma2imas.py \
+  --dd <device> --dd-version 4.1.1 --pulse <pulse> --run <run> --occ 1 \
+  /path/to/energy.bin
 ```
 
 Compute growth rates from `logen.bin`:
+
 ```bash
-python gamma2imas.py --dd mast --dd-version 4.1.1 --pulse 45272 --run 1 --occ 1 logen.bin
+python gamma2imas.py \
+  --dd <device> --dd-version 4.1.1 --pulse <pulse> --run <run> --occ 1 \
+  /path/to/logen.bin
 ```
 
-Compute growth rate + frequency (second positional file is a history/nimhist binary):
+Compute growth rate + frequency:
+
 ```bash
-python gamma2imas.py --dd mast --dd-version 4.1.1 --pulse 45272 --run 1 --occ 1 energy.bin nimhist01.bin
+python gamma2imas.py \
+  --dd <device> --dd-version 4.1.1 --pulse <pulse> --run <run> --occ 1 \
+  /path/to/energy.bin /path/to/nimhist01.bin
 ```
+
+For a self-contained repository check of the `mhd_linear` structure that does **not** require these production history files, run:
+
+```bash
+make validate-mhd-linear
+```
+
+This check verifies the presence of time slices, toroidal-mode metadata, grid arrays, and finite perturbation arrays in the reduced test entry; it is not a full physics validation of linear growth-rate or frequency extraction.
 
 ---
 
@@ -356,18 +437,19 @@ python gamma2imas.py --dd mast --dd-version 4.1.1 --pulse 45272 --run 1 --occ 1 
   - `oculus_from_imas.in`
   - `fluxgrid_from_imas.in`
 
-**Usage**
+**Reduced repository example**
+
 ```bash
 python nimrodInputRestore.py \
-  --dd mast --dd-version 4.1.1 --pulse 45272 --run 8 \
-  --backend hdf5 --dbpath /path/to/dbroot
+  --dd d3d --dd-version 4.1.1 --pulse 163518 --run 1 \
+  --backend hdf5 --dbpath tests
 ```
 
 #### String reconstruction semantics (important)
 
 When namelists are stored in XML, values are serialized as token streams. For correct round-trip behavior, the shared serializer in `nimrod2imas.py` applies these rules:
 
-1. **Strings containing whitespace are quoted** with double quotes when written to XML  
+1. **Strings containing whitespace are quoted** with double quotes when written to XML.  
    Example stored token: `"shear alf   mult"`
 
 2. When restoring:
@@ -405,11 +487,12 @@ Plots `profiles_1d` from IMAS:
 
 The script also applies human-friendly axis labels (aliases) for common quantities (e.g. `Te`, `ne`, `Ti`, `j_tor`, …).
 
-**Example**
+**Reduced repository example**
+
 ```bash
 python plot_profiles_1d.py \
   --dd d3d --dd-version 4.1.1 --pulse 163518 --run 1 --occ 1 \
-  --ids core_profiles --quantity te --show
+  --dbpath tests --ids core_profiles --quantity te --show
 ```
 
 ---
@@ -421,11 +504,13 @@ Provides R–Z contour plots of:
 - vector perturbations: `b`, `v` with components `r|z|phi`
 - parts: `real`, `imag`, `amp`
 
-**Example**
+**Reduced repository example**
+
 ```bash
 python plot_mhd_linear.py \
-  --dd mast --dd-version 4.1.1 --pulse 45272 --run 8 --occ 1 \
-  --quantity b --component r --part real --time-index 0 --n-tor 5
+  --dd d3d --dd-version 4.1.1 --pulse 163518 --run 1 --occ 1 \
+  --dbpath tests --quantity b --component r --part real \
+  --time-index 0 --n-tor 1
 ```
 
 Optional: `cmasher` colormaps can be used via `--cmap cmr.gothic` if installed.
@@ -443,10 +528,16 @@ Recent updates improved compatibility with the DD4-style full-object GGD represe
 
 When reading newer full-object exports, note that GGD node geometry is stored in cylindrical `(R, φ, Z)` order. `plot_mhd.py` handles this internally, but external readers should not assume `(R, Z, φ)`.
 
-**Example**
+**Reduced repository example**
+
 ```bash
-python plot_mhd.py --entry mast/4/45272/8/   --dd-version 4.1.1 --occ 1 --time-index 0 --phi-index 0 --quantity te
+python plot_mhd.py \
+  --entry tests/d3d/4/163518/1/ \
+  --dd-version 4.1.1 --occ 1 \
+  --time-index 0 --phi-index 0 --quantity te
 ```
+
+The former MAST path examples are not used as repository tests because the corresponding MAST production entry is not distributed with this repository.
 
 ---
 
@@ -457,6 +548,18 @@ Reads `equilibrium` and `core_profiles` from IMAS and regenerates:
 - an Osborne p-file
 
 It also compares original vs reconstructed profiles (max/rms differences) and reconstructs omega-related quantities using midplane geometry derived from GEQDSK.
+
+For the bundled reduced test, use:
+
+```bash
+make validate
+```
+
+To run both the GEQDSK/p-file and `mhd_linear` checks:
+
+```bash
+make validate-all
+```
 
 ---
 
@@ -491,3 +594,20 @@ Some environments require setting `IMAS_VERSION` or passing `dd_version` directl
   Update to the current plotting script so that it correctly interprets cylindrical node geometry ordering and resolves `grid_subset_index` against the actual `grid_subset[].identifier.index` values.
 
 ---
+
+The repository contains a reduced DIII-D test case under `tests/`. The commands intended to be reproducible from a fresh clone are:
+
+```bash
+make venv
+make install
+make test
+make validate-all
+```
+
+These commands use only files distributed in the repository. In particular:
+
+- the reduced NIMROD dump is `tests/dumpgll.00000.h5`;
+- the test IMAS entry is under `tests/d3d/4/163518/1/`;
+- `make validate-mhd-linear` validates the bundled `mhd_linear` structure without requiring `energy.bin`, `logen.bin`, or `nimhist*.bin`.
+
+The full production dump sequences and history files are not included because of their size and are retained in NERSC archival storage. Examples that reference those files are explicitly marked as production-workflow examples above.

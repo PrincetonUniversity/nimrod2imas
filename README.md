@@ -423,6 +423,31 @@ make validate-mhd-linear
 
 This check verifies the presence of time slices, toroidal-mode metadata, grid arrays, and finite perturbation arrays in the reduced test entry; it is not a full physics validation of linear growth-rate or frequency extraction.
 
+### Note on `gamma2imas.py` test data
+
+The reduced NIMROD case distributed in `tests/` is intended to provide a
+small, practical regression test of the input- and dump-conversion workflow.
+The simulation was deliberately run at reduced spatial resolution so that the
+resulting dump file is small enough to distribute with the repository.
+
+For this reason, NIMROD history files such as `energy.bin`, `logen.bin`, and
+`nimhist*.bin` are not included with the reduced test dataset. Growth rates
+and mode frequencies obtained from this intentionally under-resolved
+calculation would not constitute meaningful physics validation.
+
+The `gamma2imas.py` examples therefore describe use with production-quality
+NIMROD simulations, for which the corresponding history files are available.
+The full production simulations and associated diagnostic files are much
+larger and are retained separately in archival HPC storage.
+
+The repository test
+
+    make validate-mhd-linear
+
+provides a lightweight structural validation of the `mhd_linear` content
+generated from the included sample dump without requiring production history
+files.
+
 ---
 
 ### 4) `nimrodInputRestore.py` — IMAS → NIMROD-style inputs
@@ -536,8 +561,6 @@ python plot_mhd.py \
   --dd-version 4.1.1 --occ 1 \
   --time-index 0 --phi-index 0 --quantity te
 ```
-
-The former MAST path examples are not used as repository tests because the corresponding MAST production entry is not distributed with this repository.
 
 ---
 

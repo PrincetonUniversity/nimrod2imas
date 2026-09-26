@@ -132,6 +132,7 @@ def _print_field_help(ts: Any, mi: int):
     print('Normalization (--norm): linear | log | symlog')
     print('  - log requires strictly positive data (typical with --part amp).')
     print('  - symlog supports signed data; adjust --linthresh if needed.')
+    print('Color limits: --vmin, --vmax, --symmetric-limits')
     print('')
 
 
@@ -662,36 +663,107 @@ def _plot_contour(
     levels: int,
     norm: str | None,
     linthresh: float,
+    vmin: float | None,
+    vmax: float | None,
+    symmetric_limits: bool,
     out: str,
     show: bool,
     dpi: int,
 ) -> None:
-    import numpy as np
-    import matplotlib.pyplot as plt
-    from matplotlib.colors import LogNorm, SymLogNorm
+    from matplotlib.colors import LogNorm, Normalize, SymLogNorm
 
     fig, ax = plt.subplots(figsize=(7, 6))
 
-    F_plot = F
+    F_plot = np.asarray(F)
+    finite = np.asarray(F_plot, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        raise SystemExit("No finite values available for contour plot")
+
+    nlevels = max(2, int(levels))
+    requested_vmin = None if vmin is None else float(vmin)
+    requested_vmax = None if vmax is None else float(vmax)
+
+    if symmetric_limits:
+        if norm == "log":
+            raise SystemExit("--symmetric-limits cannot be used with --norm log")
+        candidates = []
+        if requested_vmin is not None:
+            candidates.append(abs(requested_vmin))
+        if requested_vmax is not None:
+            candidates.append(abs(requested_vmax))
+        limit = max(candidates) if candidates else float(np.max(np.abs(finite)))
+        if not np.isfinite(limit) or limit <= 0.0:
+            limit = 1.0
+        plot_vmin = -limit
+        plot_vmax = limit
+    else:
+        plot_vmin = requested_vmin
+        plot_vmax = requested_vmax
+
     mnorm = None
+    contour_levels = nlevels
+    extend = "neither"
 
     if norm == "log":
-        # Mask non-positive values for log scaling
-        F_plot = np.ma.masked_where(np.asarray(F) <= 0, F)
-        vmin = float(np.nanmin(F_plot))
-        vmax = float(np.nanmax(F_plot))
-        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin <= 0 or vmax <= 0:
+        F_plot = np.ma.masked_where(np.asarray(F_plot) <= 0, F_plot)
+        pos = finite[finite > 0]
+        if pos.size == 0:
             raise SystemExit("--norm log requires positive data")
-        mnorm = LogNorm(vmin=vmin, vmax=vmax)
+        if plot_vmin is None:
+            plot_vmin = float(pos.min())
+        if plot_vmax is None:
+            plot_vmax = float(pos.max())
+        if (not np.isfinite(plot_vmin) or not np.isfinite(plot_vmax)
+                or plot_vmin <= 0 or plot_vmax <= plot_vmin):
+            raise SystemExit("For --norm log, require 0 < --vmin < --vmax")
+        mnorm = LogNorm(vmin=plot_vmin, vmax=plot_vmax)
+        contour_levels = np.logspace(np.log10(plot_vmin), np.log10(plot_vmax), nlevels)
+        extend = "both" if (requested_vmin is not None or requested_vmax is not None) else "neither"
 
     elif norm == "symlog":
-        vmax = float(np.nanmax(np.abs(F_plot)))
-        if not np.isfinite(vmax) or vmax == 0:
-            vmax = 1.0
-        mnorm = SymLogNorm(linthresh=linthresh, vmin=-vmax, vmax=vmax)
+        if plot_vmin is None and plot_vmax is None:
+            limit = float(np.max(np.abs(finite)))
+            if not np.isfinite(limit) or limit == 0.0:
+                limit = 1.0
+            plot_vmin, plot_vmax = -limit, limit
+        else:
+            if plot_vmin is None:
+                plot_vmin = float(np.min(finite))
+            if plot_vmax is None:
+                plot_vmax = float(np.max(finite))
+        if plot_vmax <= plot_vmin:
+            raise SystemExit("--vmax must be greater than --vmin")
+        mnorm = SymLogNorm(linthresh=linthresh, vmin=plot_vmin, vmax=plot_vmax)
+        if requested_vmin is not None or requested_vmax is not None or symmetric_limits:
+            contour_levels = np.linspace(plot_vmin, plot_vmax, nlevels)
+            extend = "both"
 
-    cf = ax.contourf(R, Z, F_plot, levels=levels, cmap=cmap, norm=mnorm)
+    else:
+        if plot_vmin is not None or plot_vmax is not None:
+            if plot_vmin is None:
+                plot_vmin = float(np.min(finite))
+            if plot_vmax is None:
+                plot_vmax = float(np.max(finite))
+            if not np.isfinite(plot_vmin) or not np.isfinite(plot_vmax) or plot_vmax <= plot_vmin:
+                raise SystemExit("--vmax must be greater than --vmin")
+            mnorm = Normalize(vmin=plot_vmin, vmax=plot_vmax)
+            contour_levels = np.linspace(plot_vmin, plot_vmax, nlevels)
+            extend = "both"
+
+    cf = ax.contourf(
+        R,
+        Z,
+        F_plot,
+        levels=contour_levels,
+        cmap=cmap,
+        norm=mnorm,
+        extend=extend,
+    )
     fig.colorbar(cf, ax=ax)
+
+    if plot_vmin is not None and plot_vmax is not None:
+        print(f"Color limits: [{plot_vmin:g}, {plot_vmax:g}]")
 
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("R [m]")
@@ -704,6 +776,7 @@ def _plot_contour(
         fig.savefig(out, dpi=dpi, bbox_inches="tight")
         print(f"Wrote {out}")
     plt.close(fig)
+
 
 def main():
     ap = argparse.ArgumentParser(
@@ -758,12 +831,22 @@ def main():
     )
     ap.add_argument("--component", default=None, choices=["r", "z", "phi"], help="Vector component")
 
-    ap.add_argument("--norm", default=None, choices=["log", "symlog"], help="Optional color normalization")
+    ap.add_argument("--norm", default=None, choices=["log", "symlog"],
+                    help="Optional color normalization")
+    ap.add_argument("--linthresh", type=float, default=1e-6,
+                    help="Symlog linear threshold (only for --norm symlog)")
+    ap.add_argument("--levels", type=int, default=50, help="Number of contour levels")
+    ap.add_argument("--vmin", type=float, default=None,
+                    help="Lower color/contour limit (default: data minimum)")
+    ap.add_argument("--vmax", type=float, default=None,
+                    help="Upper color/contour limit (default: data maximum)")
     ap.add_argument(
-        "--linthresh",
-        type=float,
-        default=1e-6,
-        help="Symlog linear threshold (only for --norm symlog)",
+        "--symmetric-limits",
+        action="store_true",
+        help=(
+            "Use limits symmetric about zero. If --vmin/--vmax are supplied, "
+            "the largest absolute supplied limit is used; otherwise the data absolute maximum is used."
+        ),
     )
     ap.add_argument("--levels", type=int, default=50, help="Number of contour levels")
 
@@ -878,6 +961,9 @@ def main():
             levels=int(args.levels),
             norm=args.norm,
             linthresh=float(args.linthresh),
+            vmin=args.vmin,
+            vmax=args.vmax,
+            symmetric_limits=bool(args.symmetric_limits),
             out=args.out,
             show=args.show,
             dpi=int(args.dpi),

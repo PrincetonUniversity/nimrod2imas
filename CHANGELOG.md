@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.7](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.5.6...nimrod2imas-v0.5.7) (2026-09-26)
+
+
+### Bug Fixes
+
+* README.md ([#64](https://github.com/PrincetonUniversity/nimrod2imas/issues/64)) ([3c4dd22](https://github.com/PrincetonUniversity/nimrod2imas/commit/3c4dd22b6bcb1546de878ebb6e93b3ea5a02b715))
+
 ## [0.5.6](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.5.5...nimrod2imas-v0.5.6) (2026-09-15)
 
 

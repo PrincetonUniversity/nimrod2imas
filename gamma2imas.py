@@ -394,6 +394,16 @@ def write_mhd_linear_mode_scalars(
             mhd.time_slice[0].time = 0.0
         except Exception:
             pass
+        # A growth-only entry has no dump converter to initialize the top-level
+        # time array or IDS time mode. Keep the one scalar time slice valid.
+        try:
+            mhd.time = np.asarray([0.0], dtype=float)
+        except Exception:
+            pass
+        try:
+            mhd.ids_properties.homogeneous_time = 1
+        except Exception:
+            pass
 
     # union of keys for allocating missing toroidal_mode entries
     all_keff = sorted(set(growth_stats.keys()) | (set(freq_stats.keys()) if freq_stats else set()))

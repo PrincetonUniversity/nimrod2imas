@@ -12244,6 +12244,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Override max normalized poloidal flux for edge_profiles 1D grid (include SOL/PF). Default: auto from data.")
     p.add_argument("--edge-psi-norm-quantile", dest="edge_psi_norm_quantile", type=float, default=0.9995,
                    help="Quantile used to estimate max psi_pol_norm from 2D data for edge_profiles (robust against outliers).")
+    p.add_argument("--skip-edge-profiles", action="store_true",
+                   help="Skip edge_profiles IDS generation. Useful when only equilibrium/core_profiles and linear mhd IDSs are needed.")
 
     # MHD (GGD) output controls (nonlinear runs)
     p.add_argument(
@@ -12758,7 +12760,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if (not is_nonlinear) and (ifile > 1):
             do_profiles_once = False
 
-        if do_profiles_once:
+        if do_profiles_once and not bool(getattr(args, "skip_edge_profiles", False)):
             ep = factory.new("edge_profiles") if hasattr(factory, "new") else factory("edge_profiles")
             populate_edge_profiles(ep, data, t_index=0, args=args)
             if _ggd_should_write_step(args):

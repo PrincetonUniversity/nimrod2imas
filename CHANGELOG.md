@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.8](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.5.7...nimrod2imas-v0.5.8) (2026-10-05)
+
+
+### Bug Fixes
+
+* Option to skip edge_profiles if they are not needed ([#66](https://github.com/PrincetonUniversity/nimrod2imas/issues/66)) ([f507f58](https://github.com/PrincetonUniversity/nimrod2imas/commit/f507f58b3c0efbfaa6cfcd8ddc52326c6073a663))
+
 ## [0.5.7](https://github.com/PrincetonUniversity/nimrod2imas/compare/nimrod2imas-v0.5.6...nimrod2imas-v0.5.7) (2026-09-26)
 
 
